@@ -820,6 +820,22 @@
 
 ### Added
 
+- **The witness can send, retry and record withheld messages in the new format, under a profile
+  no host can set yet** - under `v2` alone each pass admits every transition it would send in the
+  send ledger and the record, claims it again under the state lock just before the post, posts
+  with the lock released, writes the result by the same rule as the failure hook
+  (`pa_incident_result`, library version 13), retries a pending transition after 120 s, drops it
+  an hour after its admission (at once when its admission stamp is out of form or its ledger line
+  is gone), records a withheld one as a `W` line, opens `alert-path` for a refusal or for a
+  transition undelivered over 15 minutes, and counts the hook's send without the lock when it
+  takes in its spool file (`pa_ledger_charge`, under the transition word `hook-open`). Each pass
+  posts what it admitted itself, a claim is always followed by its post, and an admission no
+  pass ever posted is not dropped at the hour; while the light pass is stale the hourly pass
+  stands in for the hook's records and its own kinds. Under `legacy` none of this runs: a
+  pending transition is left as the previous release leaves it. The profile is forced to
+  `legacy` on every host, so nothing new is sent, and the witness's state files are what the
+  previous release writes.
+
 - **The failure hook can hand a failure to the new message format, under a profile no host can
   set yet** - `deploy/alert.sh` (hook contract 2) can ask the library, in a child process, which
   profile is in force, and only under `v2` a second child records the failure and sends at most
@@ -833,7 +849,8 @@
   resolve (`pa_render`), decides every budget class with the reserve, the pool, the stage-1
   sub-cap and the per-key cap (`pa_budget_admit`), and records an admitted message so that it can
   be retried without being counted again (`pa_incident_admit`, `pa_retry_due`,
-  `pa_ledger_retry`). Only the failure hook's `v2` path above calls them, and nothing new is sent.
+  `pa_ledger_retry`). Only the `v2` paths of the failure hook and the witness above call them,
+  and nothing new is sent.
 
 - **The root witness's light pass: failures judged, reminded and resolved, in record mode** -
   `deploy/witness.sh`, run as root every five minutes by `propolis-witness@light.timer`

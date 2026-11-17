@@ -97,7 +97,15 @@
 # host. The light pass sends it, the hourly pass only while the light pass is over 15 minutes
 # stale; both decide under the lock, and count it in meta and the send ledger before the post, so
 # one that failed or was cut short is not sent again that day, and none goes where the state
-# cannot be kept. Its other network requests are the read check's GETs and the heartbeat URL's
+# cannot be kept. Under profile v2, which this release honours only under the library's test seam
+# (so no host reaches it), each pass also sends the incident messages of its transitions (the
+# send step, below): admitted under the lock in the send ledger and the record, claimed again
+# under the lock just before each post, posted with the lock released, retried after 120 s
+# while pending, withheld by the send budget with a W line. Each pass posts what it admitted
+# itself, the hourly pass its own kinds' transitions. The retries, the hook's records and the
+# daily message are the light pass's; while the light pass is stale the hourly pass stands in
+# for it and takes those too.
+# Its other network requests are the read check's GETs and the heartbeat URL's
 # GET, which carry no message, the GET of the daemon's /ready on loopback, and the read-only
 # database probe and hourly state session.
 #
@@ -147,10 +155,13 @@
 # PROPOLIS_WITNESS_LOCK_WAIT replaces the wait for the state lock; PROPOLIS_WITNESS_DEADLINE
 # replaces the 240 s (light) or 720 s (hourly) after which the pass judges nothing more;
 # PROPOLIS_WITNESS_SOFT_DEADLINE replaces the 160 s by which every optional probe must end;
-# PROPOLIS_WITNESS_SPOOL_MAX replaces the 1024 entries one spool listing reads.
+# PROPOLIS_WITNESS_SPOOL_MAX replaces the 1024 entries one spool listing reads;
+# PROPOLIS_WITNESS_SEND_CUT replaces the 200 s (light) or 720 s (hourly) after which no incident
+# message is posted; PROPOLIS_WITNESS_POST_SECS counts each claim of the send step as taking
+# that many seconds, on the test clock and against the send cut, as posts in a row take time.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 11
+# needs-alert-lib: 13
 
 umask 077
 WITNESS_SELF="${BASH_SOURCE[0]}"
@@ -187,7 +198,7 @@ if [ -z "$ROOT" ]; then
     # The library's own time and privilege seams must not reach a production run either.
     unset PA_TEST_WALL PA_TEST_BOOT PA_TEST_UP PA_TEST_READ_AS_SELF PA_TEST_UID PA_TEST_PROFILE
     unset PROPOLIS_WITNESS_NOW PROPOLIS_WITNESS_LOCK_WAIT PROPOLIS_WITNESS_DEADLINE PROPOLIS_WITNESS_SOFT_DEADLINE
-    unset PROPOLIS_WITNESS_SPOOL_MAX
+    unset PROPOLIS_WITNESS_SPOOL_MAX PROPOLIS_WITNESS_SEND_CUT PROPOLIS_WITNESS_POST_SECS
 fi
 
 # ---- the alert library ----------------------------------------------------------------------
@@ -306,7 +317,8 @@ pa_incident_write pa_incident_prune pa_first_sighting pa_banner_write pa_trusted
 pa_unit_name_ok pa_incident_fold pa_env_get pa_sensor_logs pa_readcheck_binding pa_readcheck_run
 pa_readcheck_merge pa_pg pa_heartbeat_get pa_journal_patterns pa_jcursor_ok pa_vol_project pa_vol_judge
 pa_vol_stores pa_gate pa_daily_due pa_budget_admit pa_render pa_ledger_add pa_ledger_result
-pa_cred_fp"
+pa_cred_fp pa_send pa_incident_admit pa_retry_due pa_ledger_retry pa_incident_result pa_budget_class
+pa_ledger_charge"
 # shellcheck disable=SC2086 # the list is a fixed set of names
 unset -f $WITNESS_LIB_FUNCS
 # Loaded once in a subshell first: under set -u an unbound variable at the library's top level
@@ -359,10 +371,17 @@ LOCK_WAIT=60
 # partial. The ownership checks' `stat` and `readlink` of the daemon binary's path have no limit
 # of their own, as the state files' reads have none (see the hourly pass below). With the lock's
 # 60 s that is 220 s, inside 240 s.
-# After the pass come, once a day, the daily message's post, 40 s, and 30 s for the lock to note
-# its result; then the banner and the heartbeat URL's GET, 15 s, and 10 s for the lock to note
-# its result: 95 s at most, far inside the unit's 15 minutes. The hourly pass posts the daily
-# message only while the light pass is stale, after its own 690 s, which ends by 760 s.
+# Each journal note after the lock is released (note, through logger's 5 s) is counted below.
+# After the pass, under profile v2 alone, come the incident messages (the send step, below): none
+# is claimed past WITNESS_SEND_CUT, 200 s, and a claim's wait for the lock (10 s at most) ends by
+# the cut; what is claimed is posted, and each post takes at most pa_send's 40 s, 10 s for the
+# lock to note its result and two notes, 10 s, so the last ends by 260 s. Then, once a day, the
+# daily message's post, 40 s, 30 s for the lock to note its result and a note, 5 s; then the
+# banner and the heartbeat URL's GET, 15 s, a note, 5 s, and 10 s for the lock to note its
+# result: 365 s at most, far inside the unit's 15 minutes (900 s). The hourly pass posts the
+# incident messages of its own kinds after its own 690 s, and the retries and the daily message
+# only while it stands in for a stale light pass: its incident messages (cut at 720 s) end by
+# 780 s, the daily message by 855 s, and its three notes by 870 s.
 WITNESS_DEADLINE=240
 if [ "$INSTANCE" = hourly ]; then
     # The programs an hourly pass always runs each have their own limit: config-check 300 s; the
@@ -382,7 +401,9 @@ if [ "$INSTANCE" = hourly ]; then
     # push marker and 10 s for the publish marker as the
     # daemon account; the backup sets' listing 10 s and their oldest date 5 s, 10 s for the pull
     # account and its authorized_keys, 5 s for the serve script's text; for one unlisted spool, 25 s for the spool's listing and
-    # 5 s for each name's hash. With the state lock's 120 s the pass ends by 690 s,
+    # 5 s for each name's hash; under profile v2, while it stands in for a stale light pass, the
+    # light pass's unit sample (two spool listings at 10 s, systemctl 20 s and the rotation
+    # guard's journal 3 s, 43 s). With the state lock's 120 s the pass ends by 690 s,
     # inside 720 s. The local reads and writes of the state files have no limit of their own:
     # the library's `cat` and `stat` of each state file, pa_write's `sync`, and the ownership
     # checks' `stat` and `readlink` of each path. On a local disk they take milliseconds; what
@@ -390,9 +411,11 @@ if [ "$INSTANCE" = hourly ]; then
     LOCK_WAIT=120
     WITNESS_DEADLINE=720
 fi
+TEST_CLOCK=0
 if [ -n "$ROOT" ]; then
     if [[ ${PROPOLIS_WITNESS_NOW:-} =~ ^([0-9]{1,12})/([0-9a-f]{8})/([0-9]{1,10})$ ]]; then
         export PA_TEST_WALL="${BASH_REMATCH[1]}" PA_TEST_BOOT="${BASH_REMATCH[2]}" PA_TEST_UP="${BASH_REMATCH[3]}"
+        TEST_CLOCK=1
     fi
     if [[ ${PROPOLIS_WITNESS_LOCK_WAIT:-} =~ ^[1-9][0-9]{0,2}$ ]]; then LOCK_WAIT="$PROPOLIS_WITNESS_LOCK_WAIT"; fi
     if [[ ${PROPOLIS_WITNESS_DEADLINE:-} =~ ^[0-9]{1,3}$ ]]; then WITNESS_DEADLINE="$((10#$PROPOLIS_WITNESS_DEADLINE))"; fi
@@ -416,6 +439,19 @@ WITNESS_SOFT_DEADLINE=160
 [ "$INSTANCE" != hourly ] || WITNESS_SOFT_DEADLINE=570
 if [ -n "$ROOT" ] && [[ ${PROPOLIS_WITNESS_SOFT_DEADLINE:-} =~ ^[0-9]{1,3}$ ]]; then
     WITNESS_SOFT_DEADLINE="$((10#$PROPOLIS_WITNESS_SOFT_DEADLINE))"
+fi
+# No incident message is claimed for its post once this many seconds have gone (the sum is above
+# WITNESS_DEADLINE): what is left stays as it was admitted, and a later pass posts it.
+WITNESS_SEND_CUT=200
+[ "$INSTANCE" != hourly ] || WITNESS_SEND_CUT=720
+if [ -n "$ROOT" ] && [[ ${PROPOLIS_WITNESS_SEND_CUT:-} =~ ^[0-9]{1,3}$ ]]; then
+    WITNESS_SEND_CUT="$((10#$PROPOLIS_WITNESS_SEND_CUT))"
+fi
+# The seconds each claim of the send step counts as taking (a test seam; 0 on a host), and what
+# the claims so far have counted.
+SEND_STEP=0 SEND_SKEW=0
+if [ -n "$ROOT" ] && [[ ${PROPOLIS_WITNESS_POST_SECS:-} =~ ^[0-9]{1,3}$ ]]; then
+    SEND_STEP="$((10#$PROPOLIS_WITNESS_POST_SECS))"
 fi
 
 # ---- what a pass looks at -------------------------------------------------------------------
@@ -878,12 +914,24 @@ load_ids() {
 # ---- applying transitions -------------------------------------------------------------------
 
 # rec_set: puts the current record back in memory and marks the file for writing. Status 1 when
-# it could not be kept, so a spool file behind it is not removed.
+# it could not be kept, so a spool file behind it is not removed. Under profile v2 a transition
+# that would add to would_push is queued for the send step, with the record as it was stored
+# before it (tx_queue).
 rec_set() {
+    local old=""
+    if [ "$SEND_V2" = 1 ] && [ "${PA_TX:--}" != - ] && [ "$PA_INC_AT" -ge 0 ]; then
+        old="${_PA_INC_I[PA_INC_AT]}"
+    fi
     if pa_incident_set; then
         CHANGED=1
+        if [ "$SEND_V2" = 1 ]; then
+            [ "${PA_TX:--}" = - ] || tx_queue "$PA_TX" "$old"
+            PA_TX=-
+        fi
         return 0
     fi
+    # The transition went with its record: a later rec_set of another record must not queue it.
+    PA_TX=-
     note "incident not recorded: the record of ${PA_INC[2]:-?} could not be kept (512 open, or a bad key)"
     return 1
 }
@@ -1331,10 +1379,10 @@ check_counts() {
 # firing the hook spools meanwhile starts a new file under the old name, for the next pass. The
 # claimed copy is removed only once the records are written (spool_finish), and given back under
 # its old name when they are not; one a killed pass left behind is taken in like the hook's own.
-SPOOL_DONE=() SPOOL_BACK=()
+SPOOL_DONE=() SPOOL_BACK=() SPOOL_CHARGE=() SPOOL_PEND=()
 ingest_spool() {
-    local dir name unit f claim text head line t first count cause nr out tx
-    local new was occ hold
+    local dir name unit f claim text head line t first last count cause nr out tx
+    local new was occ hold sent charge kh class tried pend
     local -a names
     for dir in "$PA_STATE/hook" "$PA_RUN/fallback"; do
         [ -d "$dir" ] && [ ! -L "$dir" ] || continue
@@ -1366,8 +1414,8 @@ ingest_spool() {
             fi
             head="${text%%$'\n'*}" line="${text#*$'\n'}"
             line="${line%%$'\n'*}"
-            t="" first="" count="" cause="" nr="" out=""
-            IFS=$'\t' read -r t first _ count _ _ _ cause nr out _ <<< "$line"
+            t="" first="" last="" count="" cause="" nr="" out=""
+            IFS=$'\t' read -r t first last count _ _ _ cause nr out _ <<< "$line"
             if ! [[ $head =~ ^#hook\ v1\ g=[0-9]{1,18}$ ]] || [ "$t" != H ]; then
                 note "hook spool file for $unit is not in the hook's format; removed"
                 rm -f -- "$claim" 2> /dev/null || true
@@ -1375,6 +1423,12 @@ ingest_spool() {
             fi
             pa_ok_field "$cause" || cause=unknown
             [[ $nr =~ ^[0-9]{1,9}$ ]] || nr=-
+            # The v2 hook's send without the lock leaves its result here (sending: claimed, and
+            # perhaps gone): a send the budget must count, whatever room it had.
+            sent=""
+            if [ "$SEND_V2" = 1 ]; then
+                case "$out" in ok | sending | perm:[0-9][0-9][0-9] | transient:[0-9][0-9][0-9]) sent="$out" ;; esac
+            fi
             case "$out" in delivered | undelivered | cooldown | journal) ;; *) out=- ;; esac
             count="$(_pa_num "$count")"
             [ "$count" -ge 1 ] || count=1
@@ -1392,6 +1446,8 @@ ingest_spool() {
             tx=pending
             [ "${S_RESTART[$unit]:-}" != no ] || [ "$hold" = 1 ] || tx=open
             [ "$hold" = 1 ] || ! maint_recent || tx=pending
+            # The operator has had the open: the record is open, so its RESOLVED follows.
+            [ "$sent" != ok ] || tx=open
             new=1 was=""
             if pa_incident_get "unit:$unit"; then
                 was="${PA_INC[7]}"
@@ -1415,9 +1471,47 @@ ingest_spool() {
                     PA_INC[10]="$first"
                 fi
             fi
+            charge=- pend=-
+            if [ -n "$sent" ]; then
+                # Counted as the record's send, its last attempt the hook's firing.
+                PA_INC[14]=$(($(_pa_num "${PA_INC[14]}") + 1)) PA_INC[15]="$PA_STAMP"
+                tried="$last"
+                _pa_stamp_split "$tried" || tried="$PA_STAMP"
+                kh="$(_pa_keyhash "unit:$unit")" || kh=""
+                class=""
+                [ -z "$kh" ] || class="$(pa_budget_class "unit:$unit" "${PA_INC[3]}" "${PA_INC[6]}" "${PA_INC[4]}")"
+                case "$sent" in
+                    ok)
+                        # The operator has had the open: the pass sends no second one.
+                        PA_INC[17]=1 PA_TX=-
+                        ;;
+                    sending)
+                        # A post whose result never came may not have gone: the open of a record
+                        # that is open is made the record's pending transition, its line written
+                        # first as a claim (pending), so a retry after the 120 s floor sends it
+                        # (at most one duplicate). A line that cannot be written leaves
+                        # the open to the pass, as for a refused send.
+                        if [ -n "$kh" ] && [ "${PA_INC[7]}" = open ] && [ "${PA_INC[17]}" != 1 ] \
+                            && [ "${PA_INC[26]:--}" = - ] \
+                            && pa_ledger_charge "$tried" "$class" "$kh" open full pending hook "${PA_INC[1]}"; then
+                            PA_INC[26]=open PA_INC[27]="$PA_LEDGER_STAMP" PA_TX=-
+                            pend="$PA_LEDGER_STAMP"$'\t'"$class"$'\t'"$kh"
+                            where_merge
+                        elif [ "${PA_INC[7]}" != open ] || [ "${PA_INC[17]}" = 1 ]; then
+                            PA_TX=-
+                        fi
+                        ;;
+                esac
+                # The line is written once the record is kept (spool_finish), for any but a claim.
+                if [ -n "$kh" ] && [ "$pend" = - ]; then
+                    charge="$class"$'\t'"$kh"$'\t'"$sent"$'\t'"${PA_INC[1]}"$'\t'"$tried"
+                fi
+            fi
             if rec_set; then
-                SPOOL_DONE+=("$claim") SPOOL_BACK+=("$dir/$SP_BASE")
+                SPOOL_DONE+=("$claim") SPOOL_BACK+=("$dir/$SP_BASE") SPOOL_CHARGE+=("$charge")
+                SPOOL_PEND+=("$pend")
             else
+                spool_unclaim "$pend"
                 spool_give_back "$claim" "$dir/$SP_BASE"
             fi
         done
@@ -1431,21 +1525,50 @@ spool_give_back() {
     mv -n -T -- "$1" "$2" 2> /dev/null || true
 }
 
-# spool_finish OK: the claimed spool files once the records are written (OK 1: removed) or not
-# (OK 0: given back, to be taken in by a pass that can write).
+# spool_finish OK: the claimed spool files once a write of the records holds them (OK 1:
+# removed; the first such write may be an admission's, in the send step) or once none can (OK 0:
+# given back, to be taken in by a pass that can write). A send the hook made without the lock is
+# charged to the send ledger here, its last attempt the hook's firing, once its record is kept and
+# just before its file goes, so a file given back is not charged twice; a line that cannot be
+# written costs the count, which errs toward one more message, never one fewer. That line is an
+# entry of the account and no transition's: its transition word is hook-open, which no record
+# holds as pending, because the same pass can admit that key's own open in the same second (the
+# hook's post was refused, so the open is the pass's to send), and a line found by stamp, key and
+# transition must then be the admission, never this entry. A send whose result never came was
+# charged as a claim when it was taken in (ingest_spool: the record's pending open, under the
+# word open), and a file given back gives that claim back.
 spool_finish() {
-    local i
+    local i class kh result id tried
     for i in "${!SPOOL_DONE[@]}"; do
         if [ "$1" = 1 ]; then
+            if [ "${SPOOL_CHARGE[$i]:--}" != - ]; then
+                IFS=$'\t' read -r class kh result id tried <<< "${SPOOL_CHARGE[$i]}"
+                pa_ledger_charge "$tried" "$class" "$kh" hook-open full "$result" hook "$id" \
+                    || note "the hook's message for $id ($result) could not be counted in the send ledger"
+                where_merge
+            fi
             rm -f -- "${SPOOL_DONE[$i]}" 2> /dev/null || true
         else
+            spool_unclaim "${SPOOL_PEND[$i]:--}"
             spool_give_back "${SPOOL_DONE[$i]}" "${SPOOL_BACK[$i]}"
         fi
     done
-    SPOOL_DONE=() SPOOL_BACK=()
+    SPOOL_DONE=() SPOOL_BACK=() SPOOL_CHARGE=() SPOOL_PEND=()
 }
 
-# remind_all: every open record whose reminder is due gets it (record mode: one more would_push).
+# spool_unclaim CLAIM: the claim ingest_spool wrote for a file it gives back (`stamp class
+# keyhash`, or `-`) is given back as noclaim, a result the budget does not count: the pass that
+# takes the file in again charges it.
+spool_unclaim() {
+    local stamp class kh
+    [ "${1:--}" != - ] || return 0
+    IFS=$'\t' read -r stamp class kh <<< "$1"
+    pa_ledger_result "$stamp" "$class" noclaim hook "$kh" open || true
+    where_merge
+}
+
+# remind_all [FILTER]: every open record whose reminder is due gets it (record mode: one more
+# would_push); with FILTER, a function that judges the record loaded, only the records it takes.
 remind_all() {
     local line key
     local -a keys=()
@@ -1454,6 +1577,10 @@ remind_all() {
         keys+=("$key")
     done
     for key in "${keys[@]}"; do
+        if [ -n "${1:-}" ]; then
+            pa_incident_get "$key" || continue
+            "$1" || continue
+        fi
         # A record opened by a release that kept no schedule (the hook's opens before the
         # witness existed) has none: it gets the one its tier and open time give. One that has
         # had a reminder and has none due has used its schedule, or had the rest skipped.
@@ -1465,6 +1592,333 @@ remind_all() {
         pa_incident_transition "$key" remind > /dev/null 2>&1 && rec_set
     done
     return 0
+}
+
+# ---- the send step (profile v2) -------------------------------------------------------------
+#
+# Only under profile v2, which this release honours only under the library's test seam, so a
+# host's pass never reaches anything here. The order is the one that makes a message at most
+# once per transition and never one that is not claimed:
+#   1. under the lock, in the locked section that applied the transitions (send_admit): the gate
+#      is asked once; each transition still pending from earlier, the hook's among them, is
+#      closed, dropped or listed for a retry (send_expire: closed from a ledger line that holds
+#      its result; dropped when its line is gone, or an hour after its admission unless no pass
+#      ever posted it; listed when pa_retry_due says it is due); each transition that would add
+#      to would_push is admitted or withheld by pa_incident_admit, which writes its pending
+#      ledger line and then the record's pending transition before anything is sent; a withheld
+#      one leaves its W line (none for a resolve whose open never got through);
+#   2. with the lock released (send_post): each message this pass admitted, oldest admission
+#      first, is claimed under the lock (send_claim: the record still holds it and its line is
+#      still the untried admission; pa_ledger_retry moves the line's last attempt to now and adds
+#      no line), rendered from the record as it then is and posted, and its result written under
+#      the lock by pa_incident_result, the rule the failure hook writes its own by; then, by a
+#      pass that retries (SEND_RETRY: the light pass, or the hourly pass standing in for a stale
+#      one), each retry is claimed (once its 120 s floor has passed), posted and its result
+#      written the same way. No claim starts past WITNESS_SEND_CUT and its wait for the lock
+#      ends by it; what is claimed is posted, and what is left stays as it was admitted for a
+#      later pass.
+# The claim is what keeps two passes from posting one transition: a pass whose retry finds the
+# line tried under 120 s ago leaves it to the pass that tried it, and a pass whose own admission
+# was retried meanwhile leaves it to that retry. A pass killed during a post, or between a claim
+# and its post, leaves the transition pending with its line, and a later pass retries it once
+# the floor has passed (within the hour: a first post claimed over an hour after its admission
+# by a pass killed before the post is dropped, the one way a claimed message is lost); the
+# lock is never held during a post. Each pass posts what it admitted itself, the hourly pass its
+# own kinds' transitions: no other pass judges those, so left to the light pass's retry they
+# would be lost when that pass stopped, and a change would go without the cause it changed
+# from. Under the legacy profile none of this runs: rec_set queues nothing, and the pass records
+# as it always has.
+
+SEND_V2=0 SEND_SENDER="" SEND_RETRY=0 SEND_GATE="" SEND_LEDGER_BAD=0
+TXQ=() SENDQ=() RETRYQ=()
+
+# send_init SENDER: the send step is on for this pass when profile v2 is in force (after
+# pa_settings_load); SENDER is the ledger's word for this pass, light or hourly.
+send_init() {
+    SEND_SENDER="$1" SEND_V2=0
+    [ "${PA_PROFILE:-legacy}" != v2 ] || SEND_V2=1
+}
+
+# send_ledger_check: under profile v2, the pass's first read of the send ledger, made under the
+# lock before any other: a ledger no copy of which can be read admits nothing on this pass
+# (SEND_LEDGER_BAD), the daily message included, as the budget's own read decides it under the
+# legacy profile. The read leaves an empty ledger in its place, so the next pass counts from
+# empty; a later read in this pass, which would find that empty ledger, must not undo the
+# decision.
+send_ledger_check() {
+    SEND_LEDGER_BAD=0
+    [ "$SEND_V2" = 1 ] || return 0
+    _pa_ledger_countable || SEND_LEDGER_BAD=1
+}
+
+# tx_queue TX OLD: queues the current record's transition TX (just stored by rec_set) for the
+# send step. OLD is the record's stored line before it: a new incident (none, or a pending or
+# resolved one) makes an open NEW for the budget, and its cause is what a change was from. A
+# record whose stored line was not whole (an empty field: the reader placed the later fields one
+# early, and the store has since written them where they now are) is queued as unknown, never as
+# good. One message per key and pass: an open or a reopen already queued carries a later change
+# or reminder (it is rendered from the record as it then is), and a resolve replaces what was
+# queued.
+tx_queue() {
+    local tx="$1" old="$2" key="${PA_INC[2]}" new=0 was="" whole=1 i e st
+    local -a f=()
+    if [ -n "$old" ]; then
+        [[ $old != *$'\t\t'* && $old != *$'\t' ]] || whole=0
+        IFS=$'\t' read -r -a f <<< "$old"
+    fi
+    st="${f[7]:-}" was="${f[11]:-}"
+    if [ "$tx" = open ]; then
+        case "$st" in open | acked) ;; *) new=1 ;; esac
+    fi
+    e="$key"$'\t'"$tx"$'\t'"$new"$'\t'"${was:--}"$'\t'"$whole"
+    for i in "${!TXQ[@]}"; do
+        IFS=$'\t' read -r -a f <<< "${TXQ[$i]}"
+        [ "${f[0]}" = "$key" ] || continue
+        if [ "$tx" = resolve ]; then
+            TXQ[i]="$e"
+        else
+            case "${f[1]}" in open | reopen) ;; *) TXQ[i]="$key"$'\t'"$tx"$'\t'"$new"$'\t'"${f[3]}"$'\t'"$whole" ;; esac
+        fi
+        return 0
+    done
+    TXQ+=("$e")
+}
+
+# ledger_state STAMP KEYHASH TX: the ledger line of the transition admitted at STAMP: its result,
+# the time of its last attempt (`-` when it has none) and its sender, tab-separated. Status 1 when
+# there is no such line.
+ledger_state() {
+    local t s k x r snd w
+    while IFS=$'\t' read -r t s _ k x _ r snd _ w _; do
+        if [ "$t" = L ] && [ "$s" = "$1" ] && [ "$k" = "$2" ] && [ "$x" = "$3" ]; then
+            printf '%s\t%s\t%s' "${r:--}" "${w:--}" "${snd:--}"
+            return 0
+        fi
+    done < <(pa_state_read send-ledger)
+    return 1
+}
+
+# w_line KEY TX NEW REASON: the withheld transition's line in incidents, `W stamp keyhash tx new
+# inst reason`, which names the key by its hash alone.
+w_line() {
+    local kh
+    kh="$(_pa_keyhash "$1")" || return 0
+    _PA_INC_REST+=("W"$'\t'"$PA_STAMP"$'\t'"$kh"$'\t'"$2"$'\t'"$3"$'\t'"${PA_INC[5]:--}"$'\t'"$4")
+    CHANGED=1
+}
+
+# send_expire: under profile v2 (send_admit calls it then alone), what becomes of each transition
+# still pending from an earlier pass or the hook, in id order:
+# - its ledger line already holds a result that ends it (the message was posted and its result
+#   reached the ledger but not the record): the record is closed from the line as the result
+#   would have closed it, an open, a reopen or a reminder that got through marking the open
+#   delivered;
+# - its ledger line is gone (a damaged ledger replaced by an empty one), which no claim could
+#   ever find: dropped at once;
+# - a pass admitted it and no pass ever posted it (the line still pending, its last attempt the
+#   admission, its sender a pass: a pass claims a line just before it posts): it is never
+#   dropped for its age while the gate is full, since nothing of it has gone, and is listed for a
+#   pass that retries to claim as a first post. The hook posts without that claim, so a line of
+#   its own that looks the same may have gone, and follows the rules below. (A claim made in the
+#   second of the admission leaves the line looking the same: when its result then cannot be
+#   written and no pass retries it within the hour, that message is posted once more, late.);
+# - an hour after its admission, or with an admission stamp out of form: dropped, so the incident
+#   waits for its next reminder and the heartbeat's rule about a transition waiting over 15
+#   minutes stops holding the ping;
+# - due for a retry, with the gate full and retries on for this pass: listed.
+# RETRYQ holds `key tx stamp keyhash first`, first 1 for a post never made; the claim is made just
+# before the post. A record whose line is not whole (an empty field, which no writer makes) is
+# left alone: its fields cannot be placed. Under the legacy profile a record is left as the
+# previous release leaves it.
+send_expire() {
+    local line id key ptx ps kh tried due st gone result snd
+    local -a rows=()
+    for line in "${_PA_INC_I[@]}"; do
+        [[ $line != *$'\t\t'* && $line != *$'\t' ]] || continue
+        IFS=$'\t' read -r _ id key _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ ptx ps _ <<< "$line"
+        [ "${ptx:--}" != - ] || continue
+        [[ $id =~ ^w#([0-9]{1,9})$ ]] || continue
+        # One row a record, never one an id: two records that hold one id (a damaged file) are
+        # each a transition of their own.
+        rows+=("$((10#${BASH_REMATCH[1]}))"$'\t'"$key"$'\t'"$ptx"$'\t'"${ps:--}")
+    done
+    [ "${#rows[@]}" -gt 0 ] || return 0
+    while IFS=$'\t' read -r _ key ptx ps; do
+        kh="$(_pa_keyhash "$key")" || kh=""
+        tried=- gone=0 result=pending snd=-
+        if [ -n "$kh" ]; then
+            if st="$(ledger_state "$ps" "$kh" "$ptx")"; then
+                IFS=$'\t' read -r result tried snd <<< "$st"
+            else
+                gone=1
+            fi
+        fi
+        case "$result" in
+            pending | transient:[0-9][0-9][0-9]) ;;
+            *)
+                pa_incident_get "$key" || continue
+                PA_INC[26]=- PA_INC[27]=- PA_TX=-
+                if [ "$result" = ok ]; then
+                    case "$ptx" in open | reopen | remind) PA_INC[17]=1 ;; esac
+                fi
+                rec_set || true
+                continue
+                ;;
+        esac
+        due="$(pa_retry_due "$ps" "$tried")"
+        if [ "$gone" = 0 ] && [ "$due" = expired ] && [ "$result" = pending ] && [ "$tried" = "$ps" ] \
+            && [ "$SEND_GATE" = full ] && { [ "$snd" = light ] || [ "$snd" = hourly ]; }; then
+            [ "$SEND_RETRY" != 1 ] || RETRYQ+=("$key"$'\t'"$ptx"$'\t'"$ps"$'\t'"$kh"$'\t'1)
+        elif [ "$due" = expired ] || [ "$gone" = 1 ]; then
+            pa_incident_get "$key" || continue
+            PA_INC[26]=- PA_INC[27]=- PA_TX=-
+            rec_set || true
+        elif [ "$due" = due ] && [ "$SEND_RETRY" = 1 ] && [ "$SEND_GATE" = full ] && [ -n "$kh" ]; then
+            RETRYQ+=("$key"$'\t'"$ptx"$'\t'"$ps"$'\t'"$kh"$'\t'0)
+        fi
+    done < <(printf '%s\n' "${rows[@]}" | LC_ALL=C sort -s -t $'\t' -k 1,1n)
+}
+
+# send_admit: step 1 of the send step, under the lock, after the transitions and before the pass
+# writes its records. See the section comment.
+send_admit() {
+    local e key tx new was whole ptx kh
+    local -a f=()
+    SENDQ=() RETRYQ=() SEND_GATE=""
+    if [ "$SEND_V2" = 1 ]; then
+        SEND_GATE="$(pa_gate 2> /dev/null)" || SEND_GATE=""
+        send_expire
+    fi
+    if [ "$SEND_V2" != 1 ] || [ "$SEND_GATE" != full ]; then
+        # The pointer message for a gate short of full is the profile switch's: until then the
+        # transition is only recorded.
+        TXQ=()
+        return 0
+    fi
+    for e in "${TXQ[@]}"; do
+        IFS=$'\t' read -r key tx new was whole <<< "$e"
+        pa_incident_get "$key" || continue
+        if [ "$whole" != 1 ]; then
+            w_line "$key" "$tx" "$new" unknown
+            continue
+        fi
+        if [ "$SEND_LEDGER_BAD" = 1 ]; then
+            w_line "$key" "$tx" "$new" ledger
+            continue
+        fi
+        # An open or a reopen not yet through is the incident's message still: a change or a
+        # reminder admitted now would replace that claim and the open would never be retried, so
+        # it is only recorded, and the retry renders the record as it then is.
+        ptx="${PA_INC[26]:--}"
+        case "$tx:$ptx" in change:open | change:reopen | remind:open | remind:reopen) continue ;; esac
+        PA_WHERE=""
+        pa_incident_admit "$key" "$tx" "$new" full "$SEND_SENDER" > /dev/null || true
+        where_merge
+        case "$PA_ADMIT_VERDICT" in
+            admit)
+                kh="$(_pa_keyhash "$key")" || kh=""
+                SENDQ+=("$key"$'\t'"$tx"$'\t'"${PA_INC[27]}"$'\t'"$PA_ADMIT_AS"$'\t'"$kh"$'\t'"$was")
+                # That write holds the spool files this pass took in: they go now, so a later
+                # write that fails cannot give them back to be counted a second time.
+                [ "${#SPOOL_DONE[@]}" = 0 ] || spool_finish 1
+                ;;
+            withhold:undelivered) ;;
+            *)
+                pa_incident_get "$key" || continue
+                w_line "$key" "$tx" "$new" "${PA_ADMIT_VERDICT#withhold:}"
+                ;;
+        esac
+    done
+    TXQ=()
+}
+
+# send_one KEY TX STAMP CLASS KEYHASH WAS: renders the record of KEY as it now is (read again,
+# without the lock, as the walk reads it) for transition TX, posts it and writes its result. A
+# message the renderer refuses is posted as nothing and its result is norender, which ends the
+# transition. The journal line names the incident by its id, never the target, the topic or the
+# token.
+send_one() {
+    local key="$1" tx="$2" stamp="$3" class="$4" kh="$5" was="$6" id="" result=norender rc=0
+    pa_incident_load
+    if pa_incident_get "$key"; then id="${PA_INC[1]}"; fi
+    [ "$was" != - ] || was=""
+    if [ -n "$id" ] && pa_render full "$tx" "$id" "$was"; then
+        pa_send "$PA_TITLE" "$PA_PRIO" < <(printf '%s\n' "$PA_BODY") || true
+        result="$PA_SEND_RESULT"
+    fi
+    pa_incident_result "$key" "$stamp" "$class" "$kh" "$tx" "$result" "$SEND_SENDER" || rc=$?
+    case "$rc" in
+        2) note "the result of the message for ${id:-an incident} ($result) was not recorded: the state lock was busy" ;;
+        1) note "the result of the message for ${id:-an incident} ($result) was not recorded" ;;
+    esac
+    [ "$result" = ok ] || note "message for ${id:-an incident} not delivered ($result)"
+}
+
+# send_time_left: a claim may still start (WITNESS_SEND_CUT, with what the test seam's claims
+# have counted).
+send_time_left() {
+    [ "$((SECONDS + SEND_SKEW))" -lt "$WITNESS_SEND_CUT" ]
+}
+
+# send_claim KEY TX STAMP KEYHASH NEW: under the lock, the transition TX admitted at STAMP is
+# this pass's to post: the record still holds it with that admission, and its ledger line is the
+# admission still untried (NEW 1: pending, its last attempt the admission) or is due for a retry
+# (NEW 0: pa_retry_due); its line then takes this attempt (pa_ledger_retry: now, this sender, no
+# line added), which is what keeps any other pass from posting it inside 120 s. Another pass, or
+# the hook, that has tried it meanwhile has it. The wait for the lock is 10 s and never past
+# WITNESS_SEND_CUT, so the caller posts whatever is claimed without asking the time again: a
+# claim with no post after it would end the line's standing as never posted and leave it to the
+# hour rule. Status 1 when it is not this pass's, no time is left or the lock was not had.
+send_claim() {
+    local key="$1" tx="$2" stamp="$3" kh="$4" new="$5" st result tried ok=1 wait
+    wait="$((WITNESS_SEND_CUT - SECONDS - SEND_SKEW))"
+    [ "$wait" -le 10 ] || wait=10
+    [ "$wait" -ge 1 ] || return 1
+    pa_lock "$wait" || return 1
+    if [ "$SEND_STEP" -gt 0 ]; then
+        SEND_SKEW=$((SEND_SKEW + SEND_STEP))
+        # Only a clock this script took from PROPOLIS_WITNESS_NOW, whose parts are digits by
+        # its pattern, is moved on.
+        if [ "$TEST_CLOCK" = 1 ]; then
+            PA_TEST_WALL="$((10#$PA_TEST_WALL + SEND_STEP))" PA_TEST_UP="$((10#$PA_TEST_UP + SEND_STEP))"
+            pa_now
+        fi
+    fi
+    pa_incident_load
+    if pa_incident_get "$key" && [ "${PA_INC[26]}" = "$tx" ] && [ "${PA_INC[27]}" = "$stamp" ] \
+        && st="$(ledger_state "$stamp" "$kh" "$tx")"; then
+        IFS=$'\t' read -r result tried _ <<< "$st"
+        if [ "$new" = 1 ]; then
+            [ "$result" = pending ] && [ "$tried" = "$stamp" ] && ok=0
+        else
+            pa_retry_due "$stamp" "$tried" > /dev/null && ok=0
+        fi
+        if [ "$ok" = 0 ]; then
+            pa_ledger_retry "$stamp" "$kh" "$tx" "$SEND_SENDER" || ok=1
+        fi
+    fi
+    pa_unlock
+    return "$ok"
+}
+
+# send_post: step 2 of the send step, with the lock released. See the section comment.
+send_post() {
+    local e key tx stamp class kh was first
+    [ "$SEND_V2" = 1 ] || return 0
+    for e in "${SENDQ[@]}"; do
+        send_time_left || return 0
+        IFS=$'\t' read -r key tx stamp class kh was <<< "$e"
+        send_claim "$key" "$tx" "$stamp" "$kh" 1 || continue
+        send_one "$key" "$tx" "$stamp" "$class" "$kh" "$was"
+    done
+    for e in "${RETRYQ[@]}"; do
+        send_time_left || return 0
+        IFS=$'\t' read -r key tx stamp kh first <<< "$e"
+        case "$first" in 1) ;; *) first=0 ;; esac
+        send_claim "$key" "$tx" "$stamp" "$kh" "$first" || continue
+        # The stored cause before a change is not kept: a retried change says it was not known.
+        send_one "$key" "$tx" "$stamp" - "$kh" -
+    done
 }
 
 # ---- config-check's findings ----------------------------------------------------------------
@@ -3839,12 +4293,28 @@ tie_fold() {
 # is still failing, is its own incident again, and opens as one: what the parent's resolve said
 # for it is no longer true.
 unfold_open() {
+    was_parent "${PA_INC[13]}"
     PA_INC[13]=-
     _pa_flag_drop folded
     PA_INC[9]="$PA_STAMP" PA_INC[16]=open PA_INC[18]=0
-    _pa_counts && PA_INC[29]=$(($(_pa_num "${PA_INC[29]}") + 1))
+    PA_TX=-
+    if _pa_counts; then
+        PA_INC[29]=$(($(_pa_num "${PA_INC[29]}") + 1))
+        PA_TX=open
+    fi
     _pa_schedule
     rec_set
+}
+
+# was_parent ID: under profile v2, the current record keeps ID, the parent it was folded under, as
+# its 35th field (the first after the 34 the record has had), which its open names: the operator
+# heard of the parent and its RESOLVED, and this is the same fault, still there. The legacy
+# profile writes the record as it always has.
+was_parent() {
+    local rest=""
+    [ "$SEND_V2" = 1 ] && [[ ${1:-} =~ ^w#[0-9]{1,9}$ ]] || return 0
+    case "$PA_INC_EXTRA" in *$'\t'*) rest="${PA_INC_EXTRA#*$'\t'}" ;; esac
+    PA_INC_EXTRA="$1${rest:+$'\t'$rest}"
 }
 
 # daemon_up: the unit judged (unit_facts) is up and, for the daemon, ready: /ready answered 200,
@@ -3881,6 +4351,7 @@ folded_pending() {
         return 0
     fi
     [ -z "$hold" ] && parent_gone "$parent" 1800 || return 0
+    was_parent "$parent"
     PA_INC[13]=-
     _pa_flag_drop folded
     if [ "${PA_INC[11]}" = db.unreachable ]; then
@@ -4035,10 +4506,98 @@ hook_counts() {
     done <<< "${J_LINES[hook]}"
 }
 
+# inc_class CLASS: CLASS is one of an incident message's ledger classes.
+inc_class() {
+    case "${1:-}" in reserve | pool | stage1 | late) return 0 ;; esac
+    return 1
+}
+
+# stamp_after STAMP REF: STAMP is later than REF (by uptime within a boot, by the wall clock across
+# boots); an empty REF is earlier than any stamp, and a STAMP out of form is never later.
+stamp_after() {
+    local s
+    _pa_stamp_split "${1:-}" || return 1
+    [ -n "${2:-}" ] && [ "$2" != - ] || return 0
+    s="$(_pa_stamp_span "$2" "$1")" || return 1
+    [ "$s" -gt 0 ]
+}
+
+# ledger_perm REF SINCE: the cause, in the form the renderer reads (http.auth:403,
+# http.not_found:404, http.client:<code>), of the latest incident message a server refused for
+# good (perm:<code>) whose last attempt came after both stamps; nothing when there is none.
+ledger_perm() {
+    local t c r w code cause=""
+    while IFS=$'\t' read -r t _ c _ _ _ r _ _ w _; do
+        [ "$t" = L ] && inc_class "$c" && [[ ${r:-} =~ ^perm:([0-9]{3})$ ]] || continue
+        code="${BASH_REMATCH[1]}"
+        if ! stamp_after "${w:-}" "$1" || ! stamp_after "$w" "$2"; then continue; fi
+        case "$code" in
+            401 | 403) cause="http.auth:$code" ;;
+            404) cause="http.not_found:$code" ;;
+            *) cause="http.client:$code" ;;
+        esac
+    done < <(pa_state_read send-ledger)
+    printf '%s' "$cause"
+}
+
+# ledger_ok_after OPENED: a message of the shell senders got through (ok) on an attempt after
+# OPENED: an incident message, by its last attempt, or the witness's daily message (sender light
+# or hourly), by its stamp, the time it was claimed just before its one post (its line has no
+# attempt field). The daily message goes to the same target, so it is proof that it takes posts.
+ledger_ok_after() {
+    local t s c r m w
+    while IFS=$'\t' read -r t s c _ _ _ r m _ w _; do
+        [ "$t" = L ] && [ "${r:-}" = ok ] || continue
+        if inc_class "$c"; then
+            stamp_after "${w:-}" "$1" && return 0
+        elif [ "$c" = daily ]; then
+            case "${m:-}" in light | hourly) stamp_after "${s:-}" "$1" && return 0 ;; esac
+        fi
+    done < <(pa_state_read send-ledger)
+    return 1
+}
+
+# ledger_undelivered: the cause, in the form the renderer reads, of the oldest transition still
+# pending (one undelivered for more than 15 minutes opens alert-path), from the last answer
+# its ledger line holds: a server's 5xx is http.server:<code>, 429 http.rate:429, 408 and a post
+# with no answer (000) net.timeout and net.connect, a claim never answered unknown. Nothing when
+# none has waited 15 minutes; one that has waited the hour, or whose line is gone, is dropped
+# by the send step and is not counted.
+ledger_undelivered() {
+    local line key ptx ps a kh st r best=-1 cause=""
+    for line in "${_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r _ _ key _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ ptx ps _ <<< "$line"
+        [ "${ptx:--}" != - ] || continue
+        a="$(pa_age "${ps:-}")"
+        [ "$a" -gt 900 ] && [ "$a" -lt 3600 ] && [ "$a" -gt "$best" ] || continue
+        r=pending
+        if kh="$(_pa_keyhash "$key")"; then
+            # A line that is gone can never be claimed: this pass's send step drops the
+            # transition, so it is no message waiting either.
+            st="$(ledger_state "$ps" "$kh" "$ptx")" || continue
+            r="${st%%$'\t'*}"
+        fi
+        # A line that already holds its result is no message waiting: the next send step closes
+        # the record from it.
+        case "$r" in pending | transient:[0-9][0-9][0-9]) ;; *) continue ;; esac
+        best="$a"
+        case "$r" in
+            transient:5[0-9][0-9]) cause="http.server:${r#transient:}" ;;
+            transient:429) cause=http.rate:429 ;;
+            transient:408) cause=net.timeout ;;
+            transient:000) cause=net.connect ;;
+            *) cause=unknown ;;
+        esac
+    done
+    printf '%s' "$cause"
+}
+
 # judge_alert_path: alert-path (alert:shell, PAGE) opens on first sight of a fact: the legacy hook
 # logged that it could not deliver an alert (cause from its reason: nocurl, net.connect or
 # unknown), or a failure hook failed (a failed propolis-alert@ instance whose failure is newer
-# than this key's last open or resolve; its own proc.* cause). It resolves sent2xx on a pass
+# than this key's last open or resolve; its own proc.* cause), and under profile v2 a server that
+# refused an incident message for good (ledger_perm) or a transition undelivered for more than 15
+# minutes (ledger_undelivered). It resolves sent2xx on a pass
 # whose reads all worked, on proof that an alert got through after the open (alert_delivered),
 # with none of the legacy hook's undelivered files left (it removes its file once that unit's
 # alert goes out) and no failure hook failed since the open. Nothing seen is never the proof: a
@@ -4046,13 +4605,20 @@ hook_counts() {
 # delivery holds across a reboot, and a failed hook listed now that failed before the open, in its
 # boot, is the failure the record already holds.
 judge_alert_path() {
-    local key=alert:shell cause="" st=none ref="" u
+    local key=alert:shell cause="" st=none ref="" u since=""
     if pa_incident_get "$key"; then
         st="${PA_INC[7]}"
         case "$st" in
-            open | acked | pending) ref="${PA_INC[9]}" ;;
+            open | acked | pending) ref="${PA_INC[9]}" since="${PA_INC[12]}" ;;
             resolved) ref="${PA_INC[21]}" ;;
         esac
+    fi
+    # Under v2, an incident message the server refused, posted after the open or the resolve (and
+    # after the cause the record holds, so one refusal is one fact), by the witness or the hook;
+    # else a transition undelivered for more than 15 minutes.
+    if [ "$SEND_V2" = 1 ]; then
+        cause="$(ledger_perm "$ref" "$since")"
+        [ -n "$cause" ] || cause="$(ledger_undelivered)"
     fi
     if [ "$((HOOK_A + HOOK_B))" -gt 0 ]; then cause="${HOOK_CAUSE:-unknown}"; fi
     if [ "$AU_RESULT" = ok ]; then
@@ -4104,6 +4670,8 @@ alert_delivered() {
     _pa_stamp_split "$opened" || return 1
     ow="$((10#$_PA_W))"
     if [[ $DELIV_LAST =~ ^[0-9]{1,12}$ ]] && [ "$((10#$DELIV_LAST))" -gt "$ow" ]; then return 0; fi
+    # Under v2, an incident message the server took, posted after the open.
+    if [ "$SEND_V2" = 1 ] && ledger_ok_after "$opened"; then return 0; fi
     # The legacy hook's target is propolis.env's, whatever alert.env gives the shell senders.
     if [ "${PA_D_TARGET:-0}" != 1 ] && [ "$HOOK_C" -gt 0 ] && [ "$((HOOK_A + HOOK_B))" = 0 ]; then return 0; fi
     for line in "${_PA_INC_I[@]}"; do
@@ -5485,6 +6053,81 @@ light_stale() {
     fi
 }
 
+# hourly_sightings: standing in for a stale light pass under profile v2, the first sightings the
+# failure hook left pending are judged by the light pass's rule, from this pass's own sample of
+# the units (collect_sample), so a light timer that has stopped cannot hold a failing unit's page
+# back: a oneshot by its next run, any other unit by pa_first_sighting (with no earlier pass of
+# this one to compare, a unit up for under a minute waits). The light pass's holds apply (the
+# boot grace, a maintenance marker or the ten minutes after one, a sighting flagged maint), and a
+# sighting folded under a parent is the parent's to settle. Healed ones are dropped and counted.
+hourly_sightings() {
+    local line key st u proof judge hold
+    local -a keys=()
+    [ "$SAMPLE_OK" = 1 ] || return 0
+    for line in "${_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r _ _ key _ _ _ _ st _ <<< "$line"
+        [[ $key == unit:* ]] && [ "$st" = pending ] && keys+=("$key")
+    done
+    for key in "${keys[@]}"; do
+        past_deadline && return 0
+        u="${key#unit:}"
+        [ -n "${S_LOAD[$u]:-}" ] || continue
+        pa_incident_get "$key" && [ "${PA_INC[7]}" = pending ] && [ "${PA_INC[13]:--}" = - ] || continue
+        sighted_after_sample && continue
+        unit_facts "$u"
+        if [ "$F_DISABLED" = 1 ]; then
+            pa_incident_transition "$key" drop && rec_set
+            continue
+        fi
+        hold=""
+        [ "$PA_UP" -ge 600 ] || hold=grace
+        if [ "$MAINT" = 1 ] || maint_recent || flagged_maint_recent; then hold=maint; fi
+        if [ "$F_ONESHOT" = 1 ]; then
+            proof="$(proof_for "$u" -)"
+            case "$proof:$F_ACTIVE" in
+                nextrun:* | restart:*) judge=drop ;;
+                *:failed) judge=open ;;
+                *) judge="wait" ;;
+            esac
+        else
+            judge="$(pa_first_sighting "${PA_INC[32]:--}" "$F_NR" "$F_UP" '?')"
+        fi
+        case "$judge" in
+            open) [ -n "$hold" ] || unit_open "$u" "$key" "" "" "" "" "$F_NR" ;;
+            drop)
+                [ "$F_ONESHOT" = 1 ] || HEALED=$((HEALED + 1))
+                pa_incident_transition "$key" drop && rec_set
+                ;;
+        esac
+    done
+    return 0
+}
+
+# standin_own: the record loaded is one the hourly pass reminds while it stands in for a stale
+# light pass (the hook-sighted records and its own kinds): a unit's record the failure hook
+# opened or spooled, or one of the kinds the hourly pass judges (config-check's findings and its
+# stop, the stores, the database's state, the watched files, the push, the backups, the light
+# pass's staleness, and tool-unusable for its own checks).
+# shellcheck disable=SC2329 # called by name, as remind_all's filter
+standin_own() {
+    case "${PA_INC[3]:-}" in
+        finding | cc-stopped | volume-filling | volume-full-soon | db-xid | db-slots | db-locks \
+            | change-pending | push-failing | push-off | push-unscheduled | backup-retention \
+            | backup-offhost)
+            return 0
+            ;;
+        witness-stale) [ "${PA_INC[2]:-}" = witness:light ] && return 0 ;;
+        tool-unusable)
+            case "${PA_INC[2]:-}" in
+                tool:readcheck | tool:volume | tool:pgstate | tool:changes | tool:push | tool:backups) return 0 ;;
+            esac
+            ;;
+    esac
+    [[ ${PA_INC[2]:-} == unit:* ]] || return 1
+    case ",${PA_INC[30]:-}," in *,hookopen,* | *,hookspool,*) return 0 ;; esac
+    return 1
+}
+
 # daily_prepare: under the lock, after this pass's own writes, whether the daily message is due,
 # and if so its rendering, its count in meta and its claimed ledger line. Not where the state
 # cannot be kept (WHERE none): with nothing to remember it by, the next pass would send it again.
@@ -5507,6 +6150,7 @@ daily_prepare() {
         esac
     done < <(pa_state_read meta)
     pa_daily_due "$last_date" "$last" || return 0
+    [ "$SEND_LEDGER_BAD" = 0 ] || return 0
     [ "$(pa_gate)" = full ] || return 0
     pa_budget_admit daily - daily 1 > /dev/null || return 0
     PA_WHERE="$WHERE"
@@ -5559,6 +6203,8 @@ light_pass() {
     local rc u n status=ok healed="" hourly="" t k v ok
     local -a meta=()
     pa_settings_load
+    send_init light
+    SEND_RETRY=1
     PA_ROLE="$(pa_role)"
     if pa_maint_active; then MAINT=1 MAINT_REASON="$PA_MAINT_REASON"; fi
     # The database first: whether it answers decides how the daemon's failure is recorded.
@@ -5606,6 +6252,7 @@ light_pass() {
     done < <(pa_state_read meta)
     hbskip_get
     pa_incident_load
+    send_ledger_check
     load_observe
     sweep_stale
     load_ids
@@ -5645,6 +6292,8 @@ light_pass() {
         [ "$n" = "${#_PA_INC_I[@]}/${#_PA_INC_REST[@]}" ] || CHANGED=1
     fi
     if past_deadline; then DEADLINE_CUT=1; fi
+    # Admitted even past the deadline: a claim costs no time, and one left unposted is retried.
+    send_admit
 
     ok=1
     if [ "$CHANGED" = 1 ]; then
@@ -5699,6 +6348,7 @@ light_pass() {
     if [ "$HB_WHY" = insecure ] && [ "${META_HB_SKIP#*/*/*/}" != insecure ]; then
         note "heartbeat URL not requested: PROPOLIS_WITNESS_HEARTBEAT_URL is not a valid https:// URL"
     fi
+    send_post
     daily_send
 
     PA_WHERE="$WHERE"
@@ -5709,12 +6359,18 @@ light_pass() {
 
 # hourly_pass: the hourly pass. See the header for what it does and in what order. Everything
 # slow (config-check, the read check, systemd) happens before the lock; under it the state files
-# are read afresh and only the hourly pass's own records, observe lines and meta keys change (and,
-# while it stands in for a stale light pass, the daily message's meta keys and ledger line), so
-# what the light pass or the hook wrote while this pass computed is kept.
+# are read afresh and only the hourly pass's own records, observe lines and meta keys change, so
+# what the light pass or the hook wrote while this pass computed is kept. Two things add to that:
+# while it stands in for a stale light pass, the daily message's meta keys and ledger line and,
+# under profile v2, the records the hook made (its spool files, its pending sightings, their
+# reminders), meta healed, and the send step's ledger lines and pending transitions; and under v2
+# the send step's admissions, posts and results of its own kinds' transitions, and, as in any v2
+# pass, a pending transition of any record that has ended, expired or lost its ledger line
+# (send_expire).
 hourly_pass() {
-    local rc n status=ok t k v light="" judged=0
+    local rc n status=ok t k v light="" judged=0 healed="" standin=0
     pa_settings_load
+    send_init hourly
     PA_ROLE="$(pa_role)"
     if pa_maint_active; then MAINT=1 MAINT_REASON="$PA_MAINT_REASON"; fi
     load_table
@@ -5742,6 +6398,11 @@ hourly_pass() {
         push_read
         backup_read
         unlisted_inst_read
+        # Standing in for a stale light pass under v2: the units, for the sightings the hook left
+        # pending and its spool files. Last, so the samples above are as they were.
+        if [ "$SEND_V2" = 1 ] && light_stale "$(_pa_meta_get light_last)" && fits 43; then
+            collect_sample
+        fi
     fi
     past_deadline && status=partial
 
@@ -5768,6 +6429,8 @@ hourly_pass() {
         [ "$t" = M ] || continue
         case "$k" in
             light_last) light="$v" ;;
+            healed) healed="$v" ;;
+            maint_seen) META_MAINT_SEEN="$v" ;;
             cc_fail) CC_FAIL="$v" ;;
             push_sched_since) META_PUSH_SINCE="$v" ;;
             pull_last) META_PULL_LAST="$v" ;;
@@ -5775,6 +6438,7 @@ hourly_pass() {
         esac
     done < <(pa_state_read meta)
     pa_incident_load
+    send_ledger_check
     load_observe
     hourly_ids
     if ! past_deadline; then
@@ -5799,15 +6463,35 @@ hourly_pass() {
             tie_backup
         fi
     fi
+    # Its own kinds' transitions it always admits and posts itself. While the light pass is stale
+    # this pass also stands in for it, for the hook's records and its own kinds: it takes in the
+    # hook's spool files, judges the hook's pending sightings and sends the reminders that are
+    # due, and retries what is pending.
+    if [ "$SEND_V2" = 1 ] && light_stale "$light"; then
+        standin=1 SEND_RETRY=1
+        if ! past_deadline; then
+            load_ids
+            ingest_spool
+            hourly_sightings
+            remind_all standin_own
+        fi
+    fi
+    send_admit
     past_deadline && status=partial
     if [ "$CHANGED" = 1 ]; then
-        pa_incident_write
+        n=0
+        pa_incident_write && n=1
+        spool_finish "$n"
         where_merge
     fi
     pa_state_write observe < <(observe_body)
     where_merge
     local -a meta=(hourly_last "$PA_STAMP" where "${WHERE:-none}")
     [ "$judged" = 0 ] || meta+=(cc_last "$PA_STAMP/$CC_RC/$CC_SECS" cc_fail "$(_pa_num "$CC_FAIL")")
+    # Restarts that healed, counted as the light pass counts them, while this pass stands in.
+    if [ "$standin" = 1 ] && [ "$HEALED" -gt 0 ]; then
+        meta+=(healed "$(($(_pa_num "${healed%%/*}") + HEALED))/$PA_STAMP")
+    fi
     # How many lines the last completed run printed out of form, for the walk.
     [ "$judged" = 0 ] || [ "$CC_DONE" = 0 ] || meta+=(cc_skipped "$CC_BAD")
     # The database's last state, for the walk's ledger row, and the local data directory once read.
@@ -5829,6 +6513,7 @@ hourly_pass() {
     if light_stale "$light"; then daily_prepare; fi
     write_heartbeat "$status"
     pa_unlock
+    send_post
     daily_send
     [ "$CC_DONE" = 1 ] || note "config-check did not complete: ${CC_WHY:-exit $CC_RC}"
     [ "$CC_BAD" = 0 ] || note "config-check printed $CC_BAD finding lines that are not in its form; skipped, and no finding they could be is taken as gone"

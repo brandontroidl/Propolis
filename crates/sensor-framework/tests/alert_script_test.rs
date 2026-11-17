@@ -2255,20 +2255,25 @@ fn shipped_lib_version() -> u32 {
 }
 
 /// The shell code sends the test page, the witness's daily message and, under profile v2 alone,
-/// the failure hook's new-format message: pa_send is called from exactly three places in deploy/,
-/// the hook's test-page function, the witness's daily_send, which only its two passes call, and
-/// the v2 path's one post (_pa_hv2_post), which only the v2 path's own functions call. The
-/// test-page function is run only from the failure hook's test-page path, and the v2 path only
-/// from the hook's v2 child, which follows a decision no run without a test root passes
+/// the failure hook's and the witness's new-format messages: pa_send is called from exactly four
+/// places in deploy/, the hook's test-page function, the witness's daily_send, which only its two
+/// passes call, the v2 path's one post (_pa_hv2_post), which only the v2 path's own functions
+/// call, and the witness's send_one, which only its send_post calls, which only its two passes
+/// call and which posts nothing unless profile v2 is in force
+/// (only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code). The test-page
+/// function is run only from the failure hook's test-page path, and the v2 path only from the
+/// hook's v2 child, which follows a decision no run without a test root passes
 /// (a_run_without_a_test_root_never_reaches_v2_whatever_the_env_files_and_the_seam_say).
 #[test]
-fn pa_send_is_called_only_by_the_test_page_path_the_witness_daily_message_and_the_v2_post() {
+fn pa_send_is_called_only_by_the_test_page_path_the_daily_message_and_the_two_v2_senders() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
     let mut send_calls = Vec::new();
     let mut runs = Vec::new();
     let mut daily = Vec::new();
     let mut posts = Vec::new();
     let mut v2 = Vec::new();
+    let mut one = Vec::new();
+    let mut step = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|e| e != "sh") {
@@ -2277,6 +2282,7 @@ fn pa_send_is_called_only_by_the_test_page_path_the_witness_daily_message_and_th
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let text = std::fs::read_to_string(&path).unwrap();
         let mut function = String::new();
+        let mut in_list = false;
         for line in text.lines() {
             let t = line.trim();
             if let Some(f) = t.strip_suffix("() {")
@@ -2287,8 +2293,26 @@ fn pa_send_is_called_only_by_the_test_page_path_the_witness_daily_message_and_th
             if t.starts_with('#') {
                 continue;
             }
+            // The witness's list of the library functions it needs, a line of names alone inside
+            // its WITNESS_LIB_FUNCS="..." assignment, calls nothing.
+            if name == "witness.sh" && (in_list || t.starts_with("WITNESS_LIB_FUNCS=\"")) {
+                in_list = !t.ends_with('"');
+                if t.trim_start_matches("WITNESS_LIB_FUNCS=\"")
+                    .trim_end_matches('"')
+                    .split_whitespace()
+                    .all(|w| w.starts_with("pa_"))
+                {
+                    continue;
+                }
+            }
             if t.contains("pa_send") && !t.starts_with("pa_send()") {
                 send_calls.push(format!("{name}:{function}"));
+            }
+            if t.contains("send_one ") && !t.starts_with("send_one()") {
+                one.push(format!("{name}:{function}"));
+            }
+            if t.contains("send_post") && !t.starts_with("send_post()") {
+                step.push(format!("{name}:{function}"));
             }
             if t.contains("pa_hook_test_page") && !t.starts_with("pa_hook_test_page()") {
                 runs.push(name.clone());
@@ -2311,9 +2335,21 @@ fn pa_send_is_called_only_by_the_test_page_path_the_witness_daily_message_and_th
         [
             "alert-lib.sh:_pa_hv2_post",
             "alert-lib.sh:pa_hook_test_page",
-            "witness.sh:daily_send"
+            "witness.sh:daily_send",
+            "witness.sh:send_one"
         ],
         "pa_send call sites"
+    );
+    assert!(!one.is_empty());
+    assert!(
+        one.iter().all(|c| c == "witness.sh:send_post"),
+        "send_one call sites: {one:?}"
+    );
+    step.sort();
+    assert_eq!(
+        step,
+        ["witness.sh:hourly_pass", "witness.sh:light_pass"],
+        "send_post call sites"
     );
     assert!(!posts.is_empty());
     for p in &posts {
@@ -4407,11 +4443,12 @@ fn a_result_that_finds_the_lock_busy_leaves_the_transition_pending_and_says_so()
     );
 }
 
-/// Only an open or a reopen that got through marks the incident delivered: a change sent on a
+/// Only an open, a reopen or a reminder that got through marks the incident delivered (the
+/// record's field 17), by the one rule the hook and the witness write a result by: a change sent on a
 /// record whose open never got through leaves it undelivered, and a reopen of a resolved record
 /// inside its reopen window, sent as `(again)`, marks it delivered.
 #[test]
-fn delivered_open_is_set_only_by_an_open_or_a_reopen_that_got_through() {
+fn delivered_open_is_set_only_by_an_open_a_reopen_or_a_reminder_that_got_through() {
     let fx = Fixture::v2();
     fx.show(BACKUP, &show_answer("exit-code", "1", "no", "0"));
     assert_ok(&fx.run(BACKUP, &v2_env(&[("STUB_POST_CODE", "403")])));

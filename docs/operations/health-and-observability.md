@@ -512,6 +512,69 @@ and journal read among them) ends within 160 s of the pass's start;
 one that cannot is unknown for that pass. Only the ownership checks' `stat` and `readlink` of the
 daemon binary's path have no limit of their own, as the reads of the state files have none.
 
+**Under profile v2 (no host can set it in this release; only the tests reach it).** Each
+transition that adds to `would_push` in the default profile is sent as an incident message
+(`deploy/witness.sh#send_admit`, `deploy/witness.sh#send_post`), and nothing else changes:
+
+- Under the state lock, in the same locked section that applied the transitions, the gate is
+  asked once; with it short of full nothing is admitted or sent and the transition is only
+  recorded. Otherwise each transition is put to the send budget
+  (`deploy/alert-lib.sh#pa_incident_admit`): an admitted one gets its `pending` line in the send
+  ledger and then its pending transition in the record, both written before anything is posted;
+  a withheld one gets a `W` line in the incidents file naming the budget's reason (none for a
+  RESOLVED whose open never got through). A record that is not whole, a kind the tables do not
+  know and a send ledger no copy of which can be read are each withheld, never sent. A change or
+  a reminder of an incident whose open or reopen is still pending is only recorded: the retry of
+  that open renders the record as it then is. One message per incident and pass.
+- With the lock released, each admitted message, oldest admission first, is claimed again under
+  the lock just before its post (`deploy/witness.sh#send_claim`): the record must still hold that
+  transition and its ledger line must still be the untried admission, and the line then takes
+  this attempt, so no other pass posts it within 120 s. It is rendered from the record as it then
+  is and posted, and its result is written under the lock by
+  `deploy/alert-lib.sh#pa_incident_result`, the rule the failure hook writes its own by: `ok` and a
+  refusal end the pending transition, a transient answer keeps it, and `ok` marks the incident
+  delivered for an open, a reopen or a reminder, so a late open (the reminder of a withheld
+  open) that gets through lets its RESOLVED follow; a change that gets through does not, so an
+  incident whose open the operator never had sends no RESOLVED.
+- `alert-path` opens on the next light pass when a server refused a message for good
+  (`perm:<code>`, the cause the message names, such as `http.auth:403`) or when a transition has
+  been undelivered for more than 15 minutes (the cause its last answer names: `http.server:<code>`
+  for a 5xx, `net.connect` for no answer). A later incident message or daily message that gets
+  through resolves it (`sent2xx`).
+- Each pending transition, the hook's among them, in id order: at least 120 s after its
+  admission and its last attempt it is claimed again under the lock (its ledger line rewritten,
+  none added, so a retry is never counted twice) and posted. An hour after its admission, at once
+  when its admission stamp is out of form, and at once when its ledger line is gone (a damaged
+  send ledger replaced by an empty one), it is dropped, and the incident waits for its next
+  reminder; a transition dropped for a lost line is no message waiting on the alert path and
+  opens no `alert-path`. In the default profile none of this runs, and a pending transition is
+  left as the previous release leaves it.
+- No claim starts once the pass has run 200 s, and its wait for the lock ends by then; what is
+  claimed is posted, and what is left stays as it was admitted for a later pass. Each post is
+  bounded by the sender's 40 s, each lock wait by 10 s and each journal line by 5 s, so a light
+  pass ends by 365 s with the daily message and the heartbeat URL, inside the unit's 15 minutes.
+- A message the failure hook sent without the lock is charged to the send ledger once, when the
+  pass takes in its spool file, in the class the budget would have given it, its last attempt the
+  hook's firing and its transition word `hook-open`, so it is never taken for the admission of
+  that incident's own open, which the same pass can make in the same second when the hook's post
+  was refused; the file is removed once a write of the records holds it, the first being an
+  admission's when there is one, so a later write that fails cannot have it counted twice. One
+  that got through opens its record and marks it delivered, so no second open follows. One whose
+  result never came (`sending`) may not have gone: its line is a claim (`pending`) and the open
+  of its record is pending, so a retry after the 120 s floor sends it (at most one duplicate).
+- A record folded under a parent that resolved, and still failing half an hour later, opens on
+  its own and its message says `was folded under <id>`.
+- Each pass posts what it admitted itself: the hourly pass its own kinds' transitions, claimed
+  with itself as the sender, since no other pass judges them. An admission no pass ever posted (a
+  pass stopped between admitting and posting) is not dropped at the hour: the next pass that
+  retries posts it.
+  While the light pass is stale (as for the daily message) the hourly pass stands in for it for
+  the hook's records and its own kinds: it samples the units when the whole sample (43 s) fits
+  before its soft deadline, takes in the hook's spool files, judges the first sightings the hook
+  left pending by the light pass's rule, sends the reminders that fall due on the hook's records
+  and its own kinds, posts what it admitted and retries what is pending; its sends stop at 720 s
+  and it ends by 870 s.
+
 **The heartbeat URL.** `PROPOLIS_WITNESS_HEARTBEAT_URL` is the ping URL of an external dead-man
 check, such as a private healthchecks.io check with no public status page. Put it in
 `/etc/propolis/alert.env`, which only root reads and the daemon does not load. It is read from
@@ -521,7 +584,8 @@ process, readable by the `propolis` account through `/proc`. After a light pass 
 and clean, the witness sends it one GET (no body, no redirect, 10 s at most); the check's service
 alerts when the GETs stop. It is skipped while systemd could not be asked, the state lock could not
 be had or no state could be written, while `alert-path` is open, while a transition has waited
-over 15 minutes, or when a check could not tell on that pass and no `tool-unusable` record says so
+over 15 minutes (only profile v2 sends one; under v2 one is dropped an hour after its
+admission), or when a check could not tell on that pass and no `tool-unusable` record says so
 yet; after a skip it resumes only once 30 minutes have passed clean. A pass that could not write
 `meta` keeps its skip in `/run/propolis-witness/hbskip` (0600), and the next pass that can moves it
 into `meta`, so the 30 minutes hold for those passes too. A standing limitation that is already

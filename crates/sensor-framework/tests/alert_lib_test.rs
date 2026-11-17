@@ -377,7 +377,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "12");
+    assert_eq!(version, "13");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);
@@ -11389,15 +11389,22 @@ fn a_role_out_of_its_list_reads_unknown() {
     }
 }
 
-/// The incident renderer, the incident budget and the retry code have one caller outside their
-/// own definitions: the failure hook's v2 path in the library (pa_hook_v2 and the _pa_hv2_
-/// functions it calls). No script in deploy/ renders an incident message, asks the budget about a
-/// class other than the test page's and the daily message's, or admits or retries an incident
-/// message, and no script but the failure hook names pa_hook_v2 or pa_hook_profile: the hook
-/// starts the v2 child once, after the decision child (pa_hook_profile), which a run without a
-/// test root cannot pass (pa_hook_profile_is_legacy_without_a_test_root_whatever_the_env_files_and_the_seam_say).
+/// The incident renderer, the incident budget, the retry code and the result of an incident
+/// message have two callers outside their own definitions: the failure hook's v2 path in the
+/// library (pa_hook_v2 and the _pa_hv2_ functions it calls) and the witness's send step
+/// (send_expire, send_admit, send_claim, send_one, send_post). No other script in deploy/
+/// renders an incident message, asks the budget about a class other than the test page's and the daily message's, or
+/// admits, retries or writes the result of an incident message, and no script but the failure
+/// hook names pa_hook_v2 or pa_hook_profile: the hook starts the v2 child once, after the
+/// decision child (pa_hook_profile), which a run without a test root cannot pass
+/// (pa_hook_profile_is_legacy_without_a_test_root_whatever_the_env_files_and_the_seam_say). The
+/// witness's send step admits, retries, drops and posts only while SEND_V2 is 1, which only
+/// send_init sets, from the profile in force, which is legacy without a test root; its part that
+/// decides whether a pending transition is due or dropped (send_expire) asks pa_retry_due and no
+/// other guarded function. The witness's list of the library functions it needs is the one line
+/// of names this test passes over.
 #[test]
-fn only_the_hooks_v2_path_calls_the_incident_renderer_the_incident_budget_or_the_retry_code() {
+fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
     let mut found = Vec::new();
     let mut hook_lines: Vec<(usize, String)> = Vec::new();
@@ -11406,9 +11413,43 @@ fn only_the_hooks_v2_path_calls_the_incident_renderer_the_incident_budget_or_the
     let allowed_in_lib = |f: &str| {
         matches!(
             f,
-            "pa_incident_admit" | "pa_budget_admit" | "pa_render" | "pa_budget_next" | "pa_hook_v2"
+            "pa_incident_admit"
+                | "pa_budget_admit"
+                | "pa_render"
+                | "pa_budget_next"
+                | "pa_hook_v2"
+                | "pa_incident_result"
         ) || f.starts_with("_pa_hv2_")
     };
+    // Which of the guarded names each part of the witness's send step may use: send_expire, which
+    // only decides whether a pending transition is due, dropped or left, asks pa_retry_due alone.
+    let allowed_in_witness = |f: &str, name: &str| match f {
+        "send_expire" => name == "pa_retry_due",
+        "send_admit" | "send_claim" | "send_one" | "send_post" => true,
+        _ => false,
+    };
+    let witness = std::fs::read_to_string(format!("{dir}/witness.sh")).unwrap();
+    let sets: Vec<&str> = witness
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#') && l.contains("SEND_V2=1"))
+        .collect();
+    assert_eq!(
+        sets,
+        ["[ \"${PA_PROFILE:-legacy}\" != v2 ] || SEND_V2=1"],
+        "SEND_V2 is set only from the profile"
+    );
+    let post = witness
+        .split("\nsend_post() {\n")
+        .nth(1)
+        .and_then(|rest| rest.lines().find(|l| !l.trim_start().starts_with("local ")))
+        .unwrap_or("");
+    assert_eq!(post.trim(), "[ \"$SEND_V2\" = 1 ] || return 0");
+    let admit = witness.split("\nsend_admit() {\n").nth(1).unwrap_or("");
+    assert!(
+        admit.contains("if [ \"$SEND_V2\" != 1 ] || [ \"$SEND_GATE\" != full ]; then"),
+        "send_admit admits nothing under legacy"
+    );
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -11418,6 +11459,7 @@ fn only_the_hooks_v2_path_calls_the_incident_renderer_the_incident_budget_or_the
         seen += 1;
         let text = std::fs::read_to_string(&path).unwrap();
         let mut function = String::new();
+        let mut in_list = false;
         for (n, line) in text.lines().enumerate() {
             let t = line.trim_start();
             if let Some(f) = t.strip_suffix("() {")
@@ -11440,20 +11482,37 @@ fn only_the_hooks_v2_path_calls_the_incident_renderer_the_incident_budget_or_the
             if name == "alert-lib.sh" && allowed_in_lib(&function) {
                 continue;
             }
+            // The witness's list of the library functions it needs, a line of names alone inside
+            // its WITNESS_LIB_FUNCS="..." assignment, calls nothing.
+            if name == "witness.sh" && (in_list || t.starts_with("WITNESS_LIB_FUNCS=\"")) {
+                in_list = !t.ends_with('"');
+                if t.trim_start_matches("WITNESS_LIB_FUNCS=\"")
+                    .trim_end_matches('"')
+                    .split_whitespace()
+                    .all(|w| w.starts_with("pa_"))
+                {
+                    continue;
+                }
+            }
+            let allowed = |f: &str| name == "witness.sh" && allowed_in_witness(&function, f);
             for f in [
                 "pa_incident_admit",
                 "pa_retry_due",
                 "pa_ledger_retry",
+                "pa_incident_result",
                 "_pa_render_incident",
                 "_pa_budget_incident",
             ] {
-                if t.contains(f) {
+                if t.contains(f) && !allowed(f) {
                     found.push(format!("{name}: {t}"));
                 }
             }
             // Each use of a function, wherever it stands on the line (after `$(`, `if`, `!` or
             // an assignment), with the words that follow it: a list of names is no call.
             for f in ["pa_render", "pa_budget_admit", "pa_budget_next"] {
+                if allowed(f) {
+                    continue;
+                }
                 for (at, _) in t.match_indices(f) {
                     let before = t[..at].chars().last();
                     if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -11536,5 +11595,174 @@ fn pa_hook_profile_is_legacy_without_a_test_root_whatever_the_env_files_and_the_
     for bad in ["sensor-ssh", "", "bad unit"] {
         let r = fx.run_env(decide, &[("PA_HOOK_UNIT", bad), seam]);
         assert_eq!(r.get("rc"), "10", "{bad:?}: {}", r.err);
+    }
+}
+
+/// The result of a post is written by one function for the failure hook and the witness alike:
+/// its ledger line takes the result and the sender; the record's pending transition ends unless
+/// the result is transient, and only while it is still that transition (its stamp); ok marks the
+/// incident delivered for an open, a reopen or a reminder (the record's field 17), so an open that was
+/// withheld is delivered by the late reminder that got through and its RESOLVED can follow, while
+/// a change that got through leaves an open the operator never had undelivered. Only the hook's
+/// own sends set the hook's delivered stamp: the witness cannot write there.
+#[test]
+fn the_result_of_a_send_is_one_rule_for_the_hook_and_the_witness() {
+    let fx = Fx::salted(SALT);
+    let s = "999800/abcdef01/4800";
+    let other = "999700/abcdef01/4700";
+    let keys = [
+        "unit:sensor-ssh.service",
+        "unit:sensor-http.service",
+        "unit:sensor-ftp.service",
+        "unit:sensor-dns.service",
+        "unit:sensor-tftp.service",
+        "unit:sensor-smtp.service",
+    ];
+    let kh: Vec<String> = keys.iter().map(|k| keyhash(&fx, k)).collect();
+    let rec = |id: &str, key: &str, tx: &str, since: &str| {
+        inc_rec(&[
+            (1, id),
+            (2, key),
+            (17, "0"),
+            (14, "1"),
+            (26, tx),
+            (27, since),
+        ])
+    };
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!(
+            "#incidents v1 g=1\nN\t20\n{}{}{}{}{}{}",
+            rec("w#3", keys[0], "change", s),
+            rec("w#4", keys[1], "open", s),
+            rec("w#5", keys[2], "remind", s),
+            rec("w#6", keys[3], "open", other),
+            rec("w#7", keys[4], "open", s),
+            rec("w#8", keys[5], "remind", s),
+        ),
+    );
+    let line = |k: &str, tx: &str, id: &str| {
+        format!("L\t{s}\tpool\t{k}\t{tx}\tfull\tpending\tlight\t{id}\t{s}\n")
+    };
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!(
+            "#send-ledger v1 g=1\n{}{}{}{}{}{}",
+            line(&kh[0], "change", "w#3"),
+            line(&kh[1], "open", "w#4"),
+            line(&kh[2], "remind", "w#5"),
+            line(&kh[3], "open", "w#6"),
+            line(&kh[4], "open", "w#7"),
+            line(&kh[5], "remind", "w#8"),
+        ),
+    );
+    let script = format!(
+        "pa_incident_result {k0} {s} pool {h0} change ok light; echo \"a=$? $PA_RESULT_STAMP\"\n\
+         pa_incident_result {k1} {s} pool {h1} open transient:503 hourly; echo \"b=$?\"\n\
+         pa_incident_result {k2} {s} pool {h2} remind perm:403 light; echo \"c=$?\"\n\
+         pa_incident_result {k3} {s} pool {h3} open ok light; echo \"d=$?\"\n\
+         pa_incident_result {k4} {s} pool {h4} open ok hook; echo \"e=$? $PA_RESULT_STAMP\"\n\
+         pa_incident_result {k5} {s} pool {h5} remind ok light; echo \"f=$?\"",
+        k0 = keys[0],
+        k1 = keys[1],
+        k2 = keys[2],
+        k3 = keys[3],
+        k4 = keys[4],
+        k5 = keys[5],
+        h0 = kh[0],
+        h1 = kh[1],
+        h2 = kh[2],
+        h3 = kh[3],
+        h4 = kh[4],
+        h5 = kh[5],
+    );
+    let r = fx.run_env(&script, &NOW);
+    assert_eq!(r.get("a"), "0 -", "{}", r.err);
+    assert_eq!(r.get("b"), "0");
+    assert_eq!(r.get("c"), "0");
+    assert_eq!(r.get("e"), "0 ok");
+    assert_eq!(r.get("f"), "0");
+    let state = fx.read("var/lib/propolis/witness/incidents");
+    let field = |id: &str, n: usize| {
+        state
+            .lines()
+            .find(|l| l.starts_with(&format!("I\t{id}\t")))
+            .map(|l| l.split('\t').nth(n).unwrap_or("").to_string())
+            .unwrap_or_default()
+    };
+    // (delivered_open, pending_tx, pending_since)
+    let got = |id: &str| (field(id, 17), field(id, 26), field(id, 27));
+    let done = || ("1".to_string(), "-".to_string(), "-".to_string());
+    assert_eq!(
+        got("w#3"),
+        ("0".into(), "-".into(), "-".into()),
+        "a change that got through ends it and leaves the open undelivered"
+    );
+    assert_eq!(
+        got("w#8"),
+        done(),
+        "a reminder that got through delivers it"
+    );
+    assert_eq!(
+        got("w#4"),
+        ("0".into(), "open".into(), s.into()),
+        "transient keeps it for the retry"
+    );
+    assert_eq!(
+        got("w#5"),
+        ("0".into(), "-".into(), "-".into()),
+        "a refusal ends it"
+    );
+    assert_eq!(
+        got("w#6"),
+        ("0".into(), "open".into(), other.into()),
+        "another admission's transition is kept"
+    );
+    assert_eq!(got("w#7"), done());
+    let ledger = fx.read("var/lib/propolis/witness/send-ledger");
+    let results: Vec<(String, String)> = ledger
+        .lines()
+        .filter(|l| l.starts_with("L\t"))
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[6].to_string(), f[7].to_string())
+        })
+        .collect();
+    let want: Vec<(String, String)> = [
+        ("ok", "light"),
+        ("transient:503", "hourly"),
+        ("perm:403", "light"),
+        ("ok", "light"),
+        ("ok", "hook"),
+        ("ok", "light"),
+    ]
+    .iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect();
+    assert_eq!(results, want, "{ledger}");
+    // The hook's delivered stamp for the unit: set by the hook's send, never by the witness's.
+    assert!(fx.p("run/propolis-alert/sensor-tftp.service").exists());
+    assert!(!fx.p("run/propolis-alert/sensor-ssh.service").exists());
+    assert!(!fx.p("run/propolis-alert/sensor-dns.service").exists());
+}
+
+/// A message that has already gone, the hook's send without the lock, is charged to the class the
+/// budget would have given its record, whatever room there is: the reserve for a reserve kind at
+/// PAGE on its own key, stage1 for a listener, else the pool.
+#[test]
+fn a_message_that_has_gone_is_charged_to_the_class_its_kind_would_have_had() {
+    let fx = Fx::salted(SALT);
+    for (args, want) in [
+        ("unit:propolis.service daemon-down PAGE intake", "reserve"),
+        ("unit:propolis.service daemon-down ACT intake", "pool"),
+        ("db:local db-unreachable PAGE ledger", "reserve"),
+        ("alert:shell alert-path PAGE alert", "reserve"),
+        ("unit:sensor-ssh.service unit-failed PAGE listen", "stage1"),
+        ("finding:danger:0123456789ab finding PAGE listen", "stage1"),
+        ("unit:shipper.service unit-failed ACT ship", "pool"),
+        ("unit:gateway.service unit-failed ACT gateway", "pool"),
+    ] {
+        let r = fx.run_env(&format!("echo \"c=$(pa_budget_class {args})\""), &NOW);
+        assert_eq!(r.get("c"), want, "{args}: {}", r.err);
     }
 }

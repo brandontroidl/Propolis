@@ -43,7 +43,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=12
+PA_LIB_VERSION=13
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -3535,7 +3535,25 @@ pa_testpage_write() {
 # A line without them is the test page's and the daily message's, written as before. The caller
 # holds the lock.
 pa_ledger_add() {
-    local f line t s body="" a
+    _pa_ledger_put "" "$@"
+}
+
+# pa_ledger_charge TRIED CLASS KEYHASH TX MODE RESULT SENDER ID: pa_ledger_add's line of an
+# incident message, stamped now, whose last attempt is TRIED, an earlier stamp: a send another
+# process made (the failure hook's without the lock), counted when it is learnt of and placed
+# when it was made, so it proves nothing about the time between. Status 2 for a TRIED out of
+# form. The caller holds the lock.
+pa_ledger_charge() {
+    _pa_stamp_split "${1:-}" || return 2
+    [ "$#" = 8 ] || return 2
+    _pa_ledger_put "$@"
+}
+
+# _pa_ledger_put TRIED ARGS...: pa_ledger_add's write, the last attempt of an incident line TRIED
+# (now when it is empty).
+_pa_ledger_put() {
+    local f line t s body="" a tried="${1:-}"
+    shift
     for f in "$@"; do pa_ok_field "$f" || return 2; done
     [ "$#" = 6 ] || [ "$#" = 7 ] || return 2
     pa_now
@@ -3549,7 +3567,7 @@ pa_ledger_add() {
         body+="$line"$'\n'
     done < <(pa_state_read send-ledger)
     body+="L"$'\t'"$PA_STAMP$(printf '\t%s' "$@")"
-    [ "$#" = 6 ] || body+=$'\t'"$PA_STAMP"
+    [ "$#" = 6 ] || body+=$'\t'"${tried:-$PA_STAMP}"
     body+=$'\n'
     PA_LEDGER_STAMP="$PA_STAMP"
     pa_state_write send-ledger < <(printf '%s' "$body")
@@ -3820,7 +3838,18 @@ _pa_admit_known() {
     kind="${PA_INC[3]}"
     _pa_kind_known "$kind" || return 1
     _pa_stage_where "${PA_INC[4]}" > /dev/null || return 1
-    if [ "${PA_INC[6]}" = PAGE ]; then
+    _pa_budget_kind "$key" "$kind" "${PA_INC[6]}" "${PA_INC[4]}"
+    [ "$tx" != resolve ] || [ "${PA_INC[17]}" = 1 ] || return 2
+    return 0
+}
+
+# _pa_budget_kind KEY KIND TIER STAGE: sets _PA_AD_RESERVE (1 for a reserve kind on its own key at
+# tier PAGE) and _PA_AD_LISTENER (1 for a listener: a sensor unit, or a finding of the listen
+# stage), the two facts of a record the incident budget's classes follow.
+_pa_budget_kind() {
+    local key="${1:-}" kind="${2:-}"
+    _PA_AD_RESERVE=0 _PA_AD_LISTENER=0
+    if [ "${3:-}" = PAGE ]; then
         case "$kind:$key" in
             daemon-down:unit:propolis.service | unit-failed:unit:propolis.service \
                 | unit-crashloop:unit:propolis.service | db-unreachable:db:local \
@@ -3829,11 +3858,24 @@ _pa_admit_known() {
     fi
     pa_unit_map "${key#unit:}"
     if { [[ $key == unit:* ]] && [ "$PA_UNIT_LISTENER" = yes ]; } \
-        || { [ "$kind" = finding ] && [ "${PA_INC[4]}" = listen ]; }; then
+        || { [ "$kind" = finding ] && [ "${4:-}" = listen ]; }; then
         _PA_AD_LISTENER=1
     fi
-    [ "$tx" != resolve ] || [ "${PA_INC[17]}" = 1 ] || return 2
-    return 0
+}
+
+# pa_budget_class KEY KIND TIER STAGE: the class an open of this record is charged to when its
+# message has already gone (the failure hook's send without the lock, charged when the witness
+# takes in its spool file): reserve, stage1 or pool by the rule of the budget's classes, whatever
+# room each has, since the slot was used either way.
+pa_budget_class() {
+    _pa_budget_kind "${1:-}" "${2:-}" "${3:-}" "${4:-}"
+    if [ "$_PA_AD_RESERVE" = 1 ]; then
+        printf reserve
+    elif [ "$_PA_AD_LISTENER" = 1 ]; then
+        printf stage1
+    else
+        printf pool
+    fi
 }
 
 # _pa_budget_incident KEY TX NEW: the order of checks for an incident message.
@@ -4045,6 +4087,48 @@ pa_ledger_retry() {
     done < <(pa_state_read send-ledger)
     [ "$found" = 0 ] || return 1
     pa_state_write send-ledger < <(printf '%s' "$body")
+}
+
+# pa_incident_result KEY STAMP CLASS KEYHASH TX RESULT SENDER: the result of the post of
+# transition TX admitted at STAMP (a retry keeps its admission's stamp), the one rule every sender
+# writes it by, under the lock (10 s): its ledger line takes RESULT and SENDER (CLASS `-` matches
+# the line's class whatever it is); the record's pending_tx stays only for a transient result,
+# which a retry may mend, and any other result ends it (a refusal, or a message that could not be
+# put together, would fail the same way again); ok marks the incident delivered for an open, a
+# reopen or a reminder (the incident's own message, which a withheld open's late open is), so its
+# RESOLVED can follow; a change says what changed in an incident the operator is taken to know of,
+# and an open that never got through stays undelivered behind it. A record whose pending
+# transition is no longer this one keeps what it has. The records in memory are the ones read
+# under the lock after it returns. For a send of the failure hook (SENDER hook) on a unit's key, an ok also sets
+# today's hook's delivered stamp for the unit, first and without the lock, as the hook's lockless
+# path does: a later firing that finds the lock busy then holds its own message for the cooldown
+# instead of sending a second open of an incident already delivered; PA_RESULT_STAMP says ok,
+# failed, or `-` when no stamp was due (the witness cannot write there, and does not try).
+# Status 0 when all of it was written, 1 when a part was not, 2 when the lock was not had (the
+# transition then stays pending, to be retried).
+pa_incident_result() {
+    local key="${1:-}" stamp="${2:-}" class="${3:-}" kh="${4:-}" tx="${5:-}" result="${6:-}"
+    local sender="${7:-}" rc=0
+    PA_RESULT_STAMP=-
+    if [ "$result" = ok ] && [ "$sender" = hook ] && [[ $key == unit:* ]]; then
+        if _pa_hv2_touch "${key#unit:}"; then PA_RESULT_STAMP=ok; else PA_RESULT_STAMP=failed; fi
+    fi
+    pa_lock 10 || return 2
+    pa_ledger_result "$stamp" "$class" "$result" "$sender" "$kh" "$tx" || rc=1
+    pa_incident_load
+    if pa_incident_get "$key" && _pa_inc_whole && [ "${PA_INC[26]}" = "$tx" ] && [ "${PA_INC[27]}" = "$stamp" ]; then
+        case "$result" in
+            transient:*) ;;
+            ok)
+                PA_INC[26]=- PA_INC[27]=-
+                case "$tx" in open | reopen | remind) PA_INC[17]=1 ;; esac
+                ;;
+            *) PA_INC[26]=- PA_INC[27]=- ;;
+        esac
+        { pa_incident_set && pa_incident_write; } || rc=1
+    fi
+    pa_unlock
+    return "$rc"
 }
 
 # pa_budget_next CLASS: when enough of the lines the test budget counts have stopped counting for
@@ -5473,38 +5557,19 @@ _pa_hv2_write() {
     return 0
 }
 
-# _pa_hv2_result UNIT KEY STAMP CLASS KEYHASH TX RESULT: the result of the post admitted at STAMP,
-# written under the lock into its ledger line and its record: pending_tx stays only for a
-# transient result, which a retry may mend; any other result ends it (a refusal or a message
-# that could not be put together would fail the same way again); ok marks an open or a reopen
-# delivered. A record whose pending transition is no longer this one keeps what it has. A lock
-# not had in 10 s leaves the transition pending, and one line says so. A message that got through
-# also sets today's stamp for the unit, without the lock, as the lockless path does: a later
-# firing that finds the lock busy then holds its own message for the cooldown instead of sending a
-# second open of an incident already delivered.
+# _pa_hv2_result UNIT KEY STAMP CLASS KEYHASH TX RESULT: the hook's result of the post admitted at
+# STAMP, written by pa_incident_result, with one line for each part of it that could not be kept
+# and one for a message not delivered.
 _pa_hv2_result() {
-    local unit="$1" key="$2" stamp="$3" as="$4" kh="$5" tx="$6" result="$7" rc=0
-    if [ "$result" = ok ] && ! _pa_hv2_touch "$unit"; then
+    local unit="$1" result="$7" rc=0
+    pa_incident_result "$2" "$3" "$4" "$5" "$6" "$result" hook || rc=$?
+    if [ "$PA_RESULT_STAMP" = failed ]; then
         _pa_hv2_log "message for $unit sent; its stamp could not be set, so a failure that finds the state lock busy may send again"
     fi
-    if ! pa_lock 10; then
+    if [ "$rc" = 2 ]; then
         _pa_hv2_log "the result of the message for $unit ($result) was not recorded: the state lock was busy"
         return 0
     fi
-    pa_ledger_result "$stamp" "$as" "$result" hook "$kh" "$tx" || rc=1
-    pa_incident_load
-    if pa_incident_get "$key" && _pa_inc_whole && [ "${PA_INC[26]}" = "$tx" ] && [ "${PA_INC[27]}" = "$stamp" ]; then
-        case "$result" in
-            transient:*) ;;
-            ok)
-                PA_INC[26]=- PA_INC[27]=-
-                case "$tx" in open | reopen) PA_INC[17]=1 ;; esac
-                ;;
-            *) PA_INC[26]=- PA_INC[27]=- ;;
-        esac
-        { pa_incident_set && pa_incident_write; } || rc=1
-    fi
-    pa_unlock
     [ "$rc" = 0 ] || _pa_hv2_log "the result of the message for $unit ($result) was not recorded"
     [ "$result" = ok ] || _pa_hv2_log "message for $unit not delivered ($result)"
     return 0

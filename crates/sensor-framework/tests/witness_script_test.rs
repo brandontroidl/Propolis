@@ -134,13 +134,21 @@ printf 'LISTEN 0      4096       *:%s      *:*    users:(("propolis",pid=4242,fd
 "#;
 
 /// `sync`: fails, as a disk that refuses writes does, for a path that matches a glob listed in
-/// `disk.refuses` beside the units; otherwise the real `sync`.
+/// `disk.refuses` beside the units; otherwise the real `sync`. With `disk.refuses.after` (a count)
+/// that many such writes are let through first, the count lowered by each.
 const SYNC_STUB: &str = r#"#!/usr/bin/env bash
 d="${UNITS%/units}"
 if [ -f "$d/disk.refuses" ]; then
     while IFS= read -r glob; do
         for a in "$@"; do
-            [[ $a != $glob ]] || exit 1
+            [[ $a != $glob ]] && continue
+            n=0
+            [ ! -f "$d/disk.refuses.after" ] || n="$(cat "$d/disk.refuses.after")"
+            if [ "$n" -gt 0 ]; then
+                echo "$((n - 1))" > "$d/disk.refuses.after"
+                break 2
+            fi
+            exit 1
         done
     done < "$d/disk.refuses"
 fi
@@ -201,14 +209,19 @@ const LOGGER_STUB: &str = r#"#!/usr/bin/env bash
 printf 'logger %s\n' "$*" >> "$STUB_LOG"
 "#;
 
-/// The one message the witness posts is the daily message, through a config file with
+/// Under the legacy profile the one message the witness posts is the daily message (under the
+/// test seam's v2 profile, incident messages too), through a config file with
 /// `data-binary`: its argv goes to the stub log as `post ...`, the config file to
 /// `curl.post.conf` and its mode to `curl.post.mode`, its environment to `curl.post.env`, the body
 /// it reads on stdin to `curl.posts` (each followed by a `--` line), and it is answered with the
 /// status in `curl.post` (200 without one). With `curl.post.hold` (the path of the state lock) it
 /// first starts a process that takes that lock and keeps it, its pid in `curl.post.holder`, as
-/// another writer would that holds it past the witness's wait. Its other requests that leave the
-/// host are the read
+/// another writer would that holds it past the witness's wait. With `curl.post.snap` it keeps, at
+/// each post, the send ledger and the incidents as they then are (`curl.snap.ledger`,
+/// `curl.snap.incidents`, each copy followed by a `--` line) and whether the state lock was free
+/// (`curl.snap.lock`); with `curl.post.run` it runs that script at each post, the stub's directory
+/// its argument, as another writer would act while the post is in flight; with `curl.post.sleep`
+/// it sleeps that many seconds before it answers, its pid in `curl.post.pid`. Its other requests that leave the host are the read
 /// check's GETs and the heartbeat URL's. Records the argv of those in the stub log as `curl ...`,
 /// its environment in
 /// `curl.env` and the config file it was handed in `curl.conf`; with no `curl.answer` beside the
@@ -256,6 +269,19 @@ if [ -n "$conf" ] && grep -q '^data-binary' "$conf"; then
         echo "$!" > "$d/curl.post.holder"
         n=0
         while [ ! -e "$d/curl.post.held" ] && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+    fi
+    if [ -f "$d/curl.post.snap" ]; then
+        w="$d/root/var/lib/propolis/witness"
+        { cat "$w/send-ledger" 2> /dev/null; printf -- '--\n'; } >> "$d/curl.snap.ledger"
+        { cat "$w/incidents" 2> /dev/null; printf -- '--\n'; } >> "$d/curl.snap.incidents"
+        if flock -n -x "$w/state.lock" true; then echo free; else echo held; fi >> "$d/curl.snap.lock"
+    fi
+    if [ -f "$d/curl.post.run" ]; then
+        bash "$d/curl.post.run" "$d" < /dev/null > /dev/null 2>&1
+    fi
+    if [ -f "$d/curl.post.sleep" ]; then
+        echo "$$" > "$d/curl.post.pid"
+        sleep "$(cat "$d/curl.post.sleep")"
     fi
     code=200
     [ ! -f "$d/curl.post" ] || code="$(cat "$d/curl.post")"
@@ -665,6 +691,18 @@ impl Fx {
     }
 
     fn run_args(&self, args: &[&str], t: u64) -> Run {
+        let child = self.start(args, t, true);
+        let output = child.wait_with_output().unwrap();
+        Run {
+            code: output.status.code().unwrap_or(-1),
+            out: String::from_utf8_lossy(&output.stdout).into_owned(),
+            err: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    }
+
+    /// A pass started at time `t` and left running, its output kept (`piped`) or dropped.
+    fn start(&self, args: &[&str], t: u64, piped: bool) -> Child {
+        let output = || if piped { Stdio::piped() } else { Stdio::null() };
         let path = format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap());
         // Started under the umask a case asks for (WITNESS_UMASK), as systemd or a shell might.
         let mut command = Command::new("bash");
@@ -689,26 +727,20 @@ impl Fx {
             .env_remove("PA_LOCK_FD")
             .env_remove("PA_CLEANUP")
             .env_remove("PROPOLIS_WITNESS_LOCK_WAIT")
+            .env_remove("PROPOLIS_WITNESS_SEND_CUT")
+            .env_remove("PA_TEST_PROFILE")
             .env_remove("DATABASE_URL")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(output())
+            .stderr(output());
         for (k, v) in &self.env {
             command.env(k, v);
         }
         for k in &self.unset {
             command.env_remove(k);
         }
-        let child = {
-            let _fence = EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner());
-            command.spawn().unwrap()
-        };
-        let output = child.wait_with_output().unwrap();
-        Run {
-            code: output.status.code().unwrap_or(-1),
-            out: String::from_utf8_lossy(&output.stdout).into_owned(),
-            err: String::from_utf8_lossy(&output.stderr).into_owned(),
-        }
+        let _fence = EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner());
+        command.spawn().unwrap()
     }
 
     /// One light pass at time `t`; every pass must exit 0.
@@ -11994,4 +12026,2268 @@ fn only_the_host_that_runs_the_daemon_sends_the_daily_message() {
     fx.private_topic(3600);
     fx.pass(3600);
     assert_eq!(fx.posts().len(), 1, "single box: {}", fx.log());
+}
+
+// ---- the v2 send step ---------------------------------------------------------------------------
+
+impl Fx {
+    /// The v2 profile, through the library's test seam: no host can set it.
+    fn v2(&mut self) {
+        self.setenv("PA_TEST_PROFILE", "v2");
+    }
+
+    /// The send ledger's lines of incident messages (every class but the daily message's and the
+    /// test page's), split into their fields.
+    fn incident_lines(&self) -> Vec<Vec<String>> {
+        self.read("var/lib/propolis/witness/send-ledger")
+            .lines()
+            .filter(|l| l.starts_with("L\t"))
+            .map(|l| l.split('\t').map(str::to_string).collect::<Vec<_>>())
+            .filter(|f| f[2] != "daily" && f[2] != "test")
+            .collect()
+    }
+
+    /// The title of each post, in order.
+    fn titles(&self) -> Vec<String> {
+        self.stub_text("curl.post.conf")
+            .lines()
+            .filter_map(|l| l.strip_prefix("header = \"Title: "))
+            .map(|l| l.trim_end_matches('"').to_string())
+            .collect()
+    }
+
+    /// The withheld transitions recorded, split into their fields.
+    fn w_lines(&self) -> Vec<Vec<String>> {
+        self.read("var/lib/propolis/witness/incidents")
+            .lines()
+            .filter(|l| l.starts_with("W\t"))
+            .map(|l| l.split('\t').map(str::to_string).collect())
+            .collect()
+    }
+}
+
+/// The first 8 hex of sha256 of a key, as the ledger and the W lines name it.
+fn kh8(key: &str) -> String {
+    k12(key)[..8].to_string()
+}
+
+/// The shipper failed, as two light passes in a row see it: an ACT open of a long-running unit,
+/// charged to the pool.
+fn failed_shipper(fx: &Fx) {
+    fx.unit(
+        "shipper.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("ExecMainStatus", "2"),
+        ],
+    );
+}
+
+/// A ledger line of an incident message on KEY as the senders write it, `L stamp class keyhash tx
+/// full result sender id tried`, from `[stamp, class, tx, result, sender, id, tried]`.
+fn inc_line(key: &str, f: [&str; 7]) -> Vec<String> {
+    let [s, class, tx, result, sender, id, tried] = f;
+    let kh = kh8(key);
+    [
+        "L",
+        s,
+        class,
+        kh.as_str(),
+        tx,
+        "full",
+        result,
+        sender,
+        id,
+        tried,
+    ]
+    .iter()
+    .map(|v| v.to_string())
+    .collect()
+}
+
+/// Under v2 with the gate full, the transition that would add to would_push is claimed under the
+/// lock before anything is posted: its pending ledger line and the record's pending transition
+/// are on disk when the post is made, and the lock is free then. The message is what the renderer
+/// gave for the record, and the post's result goes to that ledger line and the record: the
+/// transition ends, the incident is delivered. A pass five minutes on sends nothing more.
+#[test]
+fn under_v2_an_open_is_claimed_under_the_lock_and_posted_without_it() {
+    let mut fx = Fx::new();
+    fx.v2();
+    failed_shipper(&fx);
+    fx.private_topic(0);
+    fx.stub_file("curl.post.snap", "");
+    fx.pass(0);
+    assert!(fx.posts().is_empty(), "one pass opens nothing");
+    fx.pass(300);
+    let titles = fx.titles();
+    assert_eq!(titles.len(), 1, "{}", fx.log());
+    assert!(
+        titles[0].starts_with("ACT host-") && titles[0].contains(" - ship: "),
+        "{titles:?}"
+    );
+    let posts = fx.posts();
+    assert!(posts[0].starts_with("Since "), "{}", posts[0]);
+    let rec = fx.record("unit:shipper.service").unwrap();
+    let id = rec[1].clone();
+    let key = "unit:shipper.service";
+    let s = stamp(300);
+    assert_eq!(
+        fx.incident_lines(),
+        [inc_line(key, [&s, "pool", "open", "ok", "light", &id, &s])]
+    );
+    // (sends, delivered_open, pending_tx, pending_since)
+    assert_eq!(
+        (
+            rec[14].as_str(),
+            rec[17].as_str(),
+            rec[26].as_str(),
+            rec[27].as_str()
+        ),
+        ("1", "1", "-", "-")
+    );
+    let ledger = fx.stub_text("curl.snap.ledger");
+    assert!(
+        ledger.contains(&format!(
+            "\tpool\t{}\topen\tfull\tpending\tlight\t{id}\t",
+            kh8(key)
+        )),
+        "{ledger}"
+    );
+    let at_post = fx.stub_text("curl.snap.incidents");
+    let claimed = at_post
+        .lines()
+        .find(|l| l.contains(&format!("\t{key}\t")))
+        .unwrap_or_else(|| panic!("{at_post}"));
+    let f: Vec<&str> = claimed.split('\t').collect();
+    assert_eq!((f[26], f[27]), ("open", stamp(300).as_str()), "{claimed}");
+    assert_eq!(fx.stub_text("curl.snap.lock"), "free\n");
+    fx.pass(600);
+    assert_eq!(fx.posts().len(), 1);
+}
+
+/// Under the legacy profile, which is all a host can run, the witness claims and sends no
+/// incident message: the open adds to would_push, the send ledger holds the daily message alone,
+/// no record holds a pending transition, and the daily message is the one post.
+#[test]
+fn under_the_legacy_profile_no_incident_message_is_claimed_or_sent() {
+    let fx = Fx::new();
+    failed_shipper(&fx);
+    fx.private_topic(0);
+    fx.pass(0);
+    fx.pass(300);
+    fx.pass(3600);
+    assert_eq!(fx.titles().len(), 1, "{}", fx.log());
+    assert!(fx.titles()[0].ends_with(": daily"));
+    assert!(fx.incident_lines().is_empty());
+    assert!(fx.records().iter().all(|f| f[26] == "-" && f[27] == "-"));
+    assert_eq!(fx.record("unit:shipper.service").unwrap()[29], "1");
+    assert!(fx.w_lines().is_empty());
+}
+
+/// With the gate short of full (here no read check has answered) a v2 pass records the
+/// transition as legacy does and admits nothing: no ledger line, no pending transition, no W line.
+#[test]
+fn under_v2_with_the_gate_short_of_full_nothing_is_admitted_or_sent() {
+    let mut fx = Fx::new();
+    fx.v2();
+    failed_shipper(&fx);
+    fx.pass(0);
+    fx.pass(300);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    assert!(fx.incident_lines().is_empty());
+    assert!(fx.w_lines().is_empty());
+    let rec = fx.record("unit:shipper.service").unwrap();
+    assert_eq!(
+        (rec[7].as_str(), rec[26].as_str(), rec[29].as_str()),
+        ("open", "-", "1")
+    );
+}
+
+/// No post starts once the pass is past its send cut (200 s; a test seam sets it to 0 here): the
+/// admitted transition stays pending with its ledger line. A pass under 120 s after the admission
+/// leaves it alone; the first one after posts it again once, updating that line rather than adding
+/// one, so the retry is not counted twice; then it is done.
+#[test]
+fn no_post_starts_past_the_send_cut_and_what_is_left_is_retried_once_after_the_floor() {
+    let mut fx = Fx::new();
+    fx.v2();
+    failed_shipper(&fx);
+    fx.private_topic(0);
+    fx.pass(0);
+    fx.setenv("PROPOLIS_WITNESS_SEND_CUT", "0");
+    fx.pass(300);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    let key = "unit:shipper.service";
+    let id = fx.record(key).unwrap()[1].clone();
+    let line = |result: &str, tried: u64| {
+        let (s, t) = (stamp(300), stamp(tried));
+        inc_line(key, [&s, "pool", "open", result, "light", &id, &t])
+    };
+    assert_eq!(fx.incident_lines(), [line("pending", 300)]);
+    let rec = fx.record(key).unwrap();
+    assert_eq!(
+        (rec[26].clone(), rec[27].clone()),
+        ("open".into(), stamp(300))
+    );
+    fx.unsetenv("PROPOLIS_WITNESS_SEND_CUT");
+    fx.pass(360);
+    assert!(fx.posts().is_empty(), "under the 120 s floor");
+    fx.pass(420);
+    assert_eq!(fx.posts().len(), 1, "{}", fx.log());
+    assert_eq!(fx.incident_lines(), [line("ok", 420)]);
+    let rec = fx.record(key).unwrap();
+    assert_eq!((rec[17].as_str(), rec[26].as_str()), ("1", "-"));
+    fx.pass(720);
+    assert_eq!(fx.posts().len(), 1);
+}
+
+/// A pass killed while it posts leaves the transition pending with its line: the next pass under
+/// 120 s does not post it again, the first after 120 s does, once.
+#[test]
+fn a_pass_killed_during_a_post_leaves_it_pending_for_one_retry_after_the_floor() {
+    let mut fx = Fx::new();
+    fx.v2();
+    failed_shipper(&fx);
+    fx.private_topic(0);
+    fx.pass(0);
+    fx.stub_file("curl.post.sleep", "30");
+    let mut child = fx.start(&["light"], 300, false);
+    let pid_file = fx.dir.path().join("curl.post.pid");
+    let mut waited = 0;
+    while !pid_file.exists() && waited < 600 {
+        std::thread::sleep(Duration::from_millis(50));
+        waited += 1;
+    }
+    assert!(pid_file.exists(), "the post began: {}", fx.log());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: kill has no memory preconditions; the pid is the stub's own.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    std::fs::remove_file(fx.dir.path().join("curl.post.sleep")).unwrap();
+    assert_eq!(fx.posts().len(), 1);
+    let key = "unit:shipper.service";
+    let id = fx.record(key).unwrap()[1].clone();
+    let s = stamp(300);
+    assert_eq!(
+        fx.incident_lines(),
+        [inc_line(
+            key,
+            [&s, "pool", "open", "pending", "light", &id, &s]
+        )]
+    );
+    assert_eq!(fx.record(key).unwrap()[26], "open");
+    fx.pass(360);
+    assert_eq!(fx.posts().len(), 1, "never twice inside 120 s");
+    fx.pass(420);
+    assert_eq!(fx.posts().len(), 2, "{}", fx.log());
+    let t = stamp(420);
+    assert_eq!(
+        fx.incident_lines(),
+        [inc_line(key, [&s, "pool", "open", "ok", "light", &id, &t])]
+    );
+    fx.pass(600);
+    assert_eq!(fx.posts().len(), 2);
+}
+
+/// Nothing is posted that is not claimed: with a send ledger that takes no write the transition
+/// is withheld (its W line says why), and with incidents that take none it is not claimed either;
+/// in neither case is anything posted.
+#[test]
+fn a_send_ledger_or_a_record_that_cannot_be_written_sends_nothing() {
+    for refused in ["*send-ledger*", "*incidents*"] {
+        let mut fx = Fx::new();
+        fx.v2();
+        failed_shipper(&fx);
+        fx.private_topic(0);
+        fx.pass(0);
+        fx.stub_file("disk.refuses", &format!("{refused}\n"));
+        fx.pass(300);
+        assert!(fx.posts().is_empty(), "{refused}: {}", fx.log());
+        assert!(
+            fx.incident_lines().iter().all(|f| f[6] != "pending"),
+            "{refused}"
+        );
+        if refused == "*send-ledger*" {
+            let w = fx.w_lines();
+            assert_eq!(w.len(), 1, "{refused}");
+            assert_eq!(
+                (w[0][2].as_str(), w[0][3].as_str(), w[0][6].as_str()),
+                (kh8("unit:shipper.service").as_str(), "open", "ledger")
+            );
+        }
+    }
+}
+
+/// The failure hook's claim is the record's pending transition and its ledger line: a pass that
+/// sees the same failure admits nothing more, leaves the claim alone under 120 s, and retries it
+/// once after. A change the pass sees meanwhile is recorded (its new cause, one more would_push)
+/// and not admitted, since the open has not got through; the retry renders the record as it then
+/// is and so delivers the incident with its current cause.
+#[test]
+fn the_hook_and_a_pass_that_see_one_failure_send_one_message_between_them() {
+    let mut fx = Fx::new();
+    fx.v2();
+    failed_shipper(&fx);
+    fx.private_topic(0);
+    let key = "unit:shipper.service";
+    let mut rec = hook_record("w#7", "shipper.service", "ACT", "open", 0, "0");
+    for (i, v) in [
+        (3, "unit-failed"),
+        (4, "ship"),
+        (11, "db.unreachable"),
+        (14, "1"),
+        (15, &stamp(0)),
+        (16, "open"),
+        (26, "open"),
+        (27, &stamp(0)),
+        (30, "hookopen"),
+        (33, "-"),
+    ] {
+        rec = with_field(&rec, i, v);
+    }
+    fx.incidents(&[rec]);
+    let s = stamp(0);
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!(
+            "#send-ledger v1 g=1\n{}\n",
+            inc_line(key, [&s, "pool", "open", "pending", "hook", "w#7", &s]).join("\t")
+        ),
+    );
+    fx.pass(60);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    let r = fx.record(key).unwrap();
+    assert_eq!(
+        (r[11].as_str(), r[26].as_str(), r[27].as_str()),
+        ("proc.exit:2", "open", stamp(0).as_str()),
+        "the change is recorded and the open stays claimed"
+    );
+    assert_eq!(fx.incident_lines().len(), 1, "nothing admitted again");
+    fx.pass(120);
+    assert_eq!(fx.posts().len(), 1, "{}", fx.log());
+    assert!(fx.titles()[0].starts_with("ACT "), "{:?}", fx.titles());
+    assert!(
+        fx.posts()[0].contains("Why: process exited (proc.exit 2)"),
+        "{}",
+        fx.posts()[0]
+    );
+    let t = stamp(120);
+    assert_eq!(
+        fx.incident_lines(),
+        [inc_line(
+            key,
+            [&s, "pool", "open", "ok", "light", "w#7", &t]
+        )]
+    );
+    fx.pass(300);
+    assert_eq!(fx.posts().len(), 1);
+}
+
+/// Unknown never counts as good: a record with an empty field, which the reader would place a
+/// field early, a kind the tables do not know, and a send ledger no copy of which can be read
+/// each send nothing; each leaves a W line that says so.
+#[test]
+fn a_record_not_whole_a_kind_not_known_or_a_ledger_not_countable_sends_nothing() {
+    let due = stamp(0);
+    let open = |key: &str, kind: &str| {
+        let mut r = hook_record("w#1", "shipper.service", "ACT", "open", 0, "-");
+        for (i, v) in [
+            (1, if kind == "frobnicate" { "w#2" } else { "w#3" }),
+            (2, key),
+            (3, kind),
+            (4, "publish"),
+            (11, "push.stale"),
+            (19, due.as_str()),
+            (33, "-"),
+        ] {
+            r = with_field(&r, i, v);
+        }
+        r
+    };
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    let unknown = open("push:timer", "frobnicate");
+    let broken = with_field(&open("push:cron", "push-failing"), 28, "");
+    fx.incidents(&[unknown, broken]);
+    fx.pass(300);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    let mut reasons: Vec<(String, String)> = fx
+        .w_lines()
+        .iter()
+        .map(|w| (w[2].clone(), w[6].clone()))
+        .collect();
+    reasons.sort();
+    let mut want = vec![
+        (kh8("push:timer"), "unknown".to_string()),
+        (kh8("push:cron"), "unknown".to_string()),
+    ];
+    want.sort();
+    assert_eq!(reasons, want);
+
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    failed_shipper(&fx);
+    fx.pass(0);
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        "#send-ledger v9 g=1\nL\tdamaged\n",
+    );
+    fx.pass(300);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    let w = fx.w_lines();
+    assert_eq!(w.len(), 1);
+    assert_eq!(w[0][6], "ledger");
+}
+
+/// Under v2 a transition still pending an hour after its admission is dropped: the incident waits
+/// for its next reminder, and the heartbeat's rule about a transition waiting over 15 minutes
+/// stops holding the ping (alert-path, which a transition undelivered that long opened, holds it
+/// instead). Under the legacy profile the pass leaves the record as the previous release leaves
+/// it, the pending transition and the skipped ping included: nothing in legacy changes.
+#[test]
+fn a_transition_pending_for_an_hour_is_dropped_under_v2_and_left_as_it_was_under_legacy() {
+    // Admitted 3500 s before the first pass.
+    let since = format!("{}/{BOOT}/{}", WALL - 3500, UP - 3500);
+    let pings = |fx: &Fx| fx.log().lines().filter(|l| l.starts_with("curl ")).count();
+    for v2 in [false, true] {
+        let mut fx = Fx::new();
+        if v2 {
+            fx.v2();
+        }
+        fx.write(
+            "etc/propolis/alert.env",
+            "PROPOLIS_WITNESS_HEARTBEAT_URL=https://hc.example.invalid/ping/abc\n",
+        );
+        fx.curl_answers("200|text/plain");
+        let mut rec = hook_record("w#7", "shipper.service", "ACT", "open", 0, "0");
+        for (i, v) in [(26, "open"), (27, since.as_str()), (33, "-")] {
+            rec = with_field(&rec, i, v);
+        }
+        fx.incidents(&[rec]);
+        // Its claim, tried as it was admitted, and answered for now only.
+        let line = inc_line(
+            "unit:shipper.service",
+            [
+                &since,
+                "pool",
+                "open",
+                "transient:503",
+                "hook",
+                "w#7",
+                &since,
+            ],
+        );
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!("#send-ledger v1 g=1\n{}\n", line.join("\t")),
+        );
+        fx.pass(0);
+        assert_eq!(
+            fx.record("unit:shipper.service").unwrap()[26],
+            "open",
+            "{v2}"
+        );
+        fx.pass(100);
+        let r = fx.record("unit:shipper.service").unwrap();
+        if v2 {
+            assert_eq!((r[26].as_str(), r[27].as_str()), ("-", "-"));
+        } else {
+            assert_eq!((r[26].as_str(), r[27].as_str()), ("open", since.as_str()));
+            assert_eq!(
+                fx.meta("hb_skip").as_deref(),
+                Some(format!("{}/pending", stamp(100)).as_str())
+            );
+        }
+        assert!(fx.posts().is_empty(), "{v2}: {}", fx.log());
+        fx.pass(1900);
+        let skip = fx.meta("hb_skip").unwrap_or_default();
+        if v2 {
+            // Undelivered for over 15 minutes, it opened alert-path, which holds the ping
+            // now; the dropped transition itself holds nothing.
+            assert_eq!(fx.record("alert:shell").unwrap()[7], "open");
+            assert!(skip.ends_with("/alert-path"), "{skip}");
+        } else {
+            assert_eq!(pings(&fx), 0, "{}", fx.log());
+            assert_eq!(fx.record("unit:shipper.service").unwrap()[26], "open");
+            assert!(skip.ends_with("/pending"), "{skip}");
+            assert!(fx.record("alert:shell").is_none());
+        }
+    }
+}
+
+/// The hook's spool files for two firings it sent without the lock: the sensor's message got
+/// through, the backup's was claimed (sending) and never answered.
+fn spooled_sends(fx: &Fx) {
+    let s = stamp(0);
+    fx.write(
+        "run/propolis-witness/fallback/hook-sensor-http.service",
+        &format!("#hook v1 g=1\nH\t{s}\t{s}\t1\tsignal\tkilled\t9\tproc.signal:9\t2\tok\n"),
+    );
+    fx.write(
+        "var/lib/propolis/witness/hook/propolis-backup.service",
+        &format!("#hook v1 g=1\nH\t{s}\t{s}\t1\texit-code\texited\t1\tproc.exit:1\t0\tsending\n"),
+    );
+    fx.unit(
+        "propolis-backup.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("Restart", "no"),
+            ("UnitFileState", "static"),
+        ],
+    );
+    fx.unit(
+        "sensor-http.service",
+        &[
+            ("ActiveState", "activating"),
+            ("SubState", "auto-restart"),
+            ("NRestarts", "3"),
+        ],
+    );
+}
+
+/// A message the hook sent without the lock is charged to the send ledger once, when the pass
+/// takes in its spool file: one line per send, in the class the budget would have given the kind
+/// (a listener's stage1, the backup's pool) whatever room there was, its last attempt the hook's
+/// firing (the spool file's last stamp), not the pass. The record carries hookspool; the one that
+/// got through is open and delivered, so its RESOLVED can follow, and the pass sends no second
+/// message for it. The one whose result never came (sending: a post in flight when the pass took
+/// the file, or a hook stopped mid-post) may not have gone, so it is not taken as sent: its line
+/// is pending and the record holds the open as its pending transition (never an open with
+/// delivered_open 0 that nobody retries), and the first pass 120 s on retries it once, rewriting
+/// that line. Under the legacy profile the same files are taken in as before and charge nothing.
+#[test]
+fn the_hooks_send_without_the_lock_is_charged_once_when_its_spool_file_is_taken_in() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    spooled_sends(&fx);
+    fx.pass(300);
+    let http = fx.record("unit:sensor-http.service").unwrap();
+    let backup = fx.record("unit:propolis-backup.service").unwrap();
+    assert!(http[30].split(',').any(|f| f == "hookspool"), "{http:?}");
+    // (state, sends, delivered_open, pending_tx, pending_since)
+    let facts = |r: &[String]| {
+        (
+            r[7].clone(),
+            r[14].clone(),
+            r[17].clone(),
+            r[26].clone(),
+            r[27].clone(),
+        )
+    };
+    let s = |a: &str, b: &str, c: &str, d: &str, e: &str| {
+        (
+            a.to_string(),
+            b.to_string(),
+            c.to_string(),
+            d.to_string(),
+            e.to_string(),
+        )
+    };
+    let (t, fired) = (stamp(300), stamp(0));
+    assert_eq!(facts(&http), s("open", "1", "1", "-", "-"));
+    assert_eq!(facts(&backup), s("open", "1", "0", "open", &t));
+    let mut lines = fx.incident_lines();
+    lines.sort();
+    let mut want = vec![
+        inc_line(
+            "unit:sensor-http.service",
+            [&t, "stage1", "hook-open", "ok", "hook", &http[1], &fired],
+        ),
+        inc_line(
+            "unit:propolis-backup.service",
+            [&t, "pool", "open", "pending", "hook", &backup[1], &fired],
+        ),
+    ];
+    want.sort();
+    assert_eq!(lines, want);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    fx.pass(360);
+    assert!(fx.posts().is_empty(), "under the 120 s floor");
+    fx.pass(420);
+    assert_eq!(fx.posts().len(), 1, "{}", fx.log());
+    assert!(fx.titles()[0].contains(" - backup: "), "{:?}", fx.titles());
+    let backup = fx.record("unit:propolis-backup.service").unwrap();
+    assert_eq!(facts(&backup), s("open", "1", "1", "-", "-"));
+    assert!(
+        fx.incident_lines().contains(&inc_line(
+            "unit:propolis-backup.service",
+            [&t, "pool", "open", "ok", "light", &backup[1], &stamp(420)],
+        )),
+        "{:?}",
+        fx.incident_lines()
+    );
+    fx.pass(720);
+    assert_eq!(fx.incident_lines().len(), 2, "charged once");
+    assert_eq!(fx.posts().len(), 1);
+
+    let fx = Fx::new();
+    fx.private_topic(0);
+    spooled_sends(&fx);
+    fx.pass(300);
+    assert!(fx.incident_lines().is_empty(), "legacy");
+    let http = fx.record("unit:sensor-http.service").unwrap();
+    assert_eq!((http[14].as_str(), http[17].as_str()), ("0", "0"), "legacy");
+}
+
+/// A child folded under a parent that resolved, and still failing half an hour later, opens on
+/// its own: under v2 the record keeps the former parent's id as its 35th field and its open says
+/// it was folded under it. The legacy profile writes no such field.
+#[test]
+fn a_child_that_opens_on_its_own_after_its_parent_resolved_names_the_parent() {
+    for v2 in [true, false] {
+        let mut fx = Fx::new();
+        if v2 {
+            fx.v2();
+        }
+        fx.private_topic(0);
+        fx.database("0|f|");
+        fx.daemon_account();
+        fx.stub_file("journal.daemon", CONNECT_LINE);
+        fx.unit(
+            "propolis.service",
+            &[
+                ("ActiveState", "failed"),
+                ("SubState", "failed"),
+                ("Result", "exit-code"),
+                ("ExecMainStatus", "1"),
+            ],
+        );
+        fx.pass(0);
+        fx.pass(300);
+        fx.stub_file("pg.answer", PG_REFUSED);
+        fx.pass(600);
+        fx.pass(900);
+        let db = fx.record("db:local").unwrap()[1].clone();
+        fx.stub_file("pg.answer", "0|f|");
+        fx.pass(1200);
+        fx.pass(1500);
+        fx.pass(3000);
+        let before = fx.posts().len();
+        fx.pass(3300);
+        let d = fx.record("unit:propolis.service").unwrap();
+        assert_eq!((d[7].as_str(), d[13].as_str()), ("open", "-"), "{v2}");
+        if v2 {
+            assert_eq!(d.get(35).map(String::as_str), Some(db.as_str()), "{d:?}");
+            let posts = fx.posts();
+            assert_eq!(posts.len(), before + 1, "{}", fx.log());
+            assert!(
+                posts[before].contains(&format!(" - was folded under {db}")),
+                "{}",
+                posts[before]
+            );
+        } else {
+            assert_eq!(d.len(), 35, "{d:?}");
+        }
+    }
+}
+
+/// A server that refuses an incident message for good (perm:403) ends its transition and opens
+/// alert-path on the next pass, with the cause the renderer reads (http.auth:403). The refusal is
+/// one fact: passes after it change nothing more. An incident message that gets through after the
+/// open is the proof that the path works again.
+#[test]
+fn a_permanent_refusal_opens_alert_path_and_a_later_delivery_resolves_it() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    failed_shipper(&fx);
+    fx.stub_file("curl.post", "403");
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(fx.posts().len(), 1);
+    let ship = fx.record("unit:shipper.service").unwrap();
+    assert_eq!((ship[17].as_str(), ship[26].as_str()), ("0", "-"));
+    assert_eq!(fx.incident_lines()[0][6], "perm:403");
+    fx.pass(600);
+    let a = fx.record("alert:shell").unwrap();
+    assert_eq!(
+        (a[3].as_str(), a[7].as_str(), a[11].as_str()),
+        ("alert-path", "open", "http.auth:403")
+    );
+    assert_eq!(fx.posts().len(), 2, "its own open goes, and is refused too");
+    let occ = a[31].clone();
+    fx.pass(900);
+    assert_eq!(fx.record("alert:shell").unwrap()[31], occ, "one fact");
+    assert_eq!(fx.posts().len(), 2);
+    // The server takes posts again: a new incident's open gets through, after alert-path opened.
+    fx.stub_file("curl.post", "200");
+    fx.unit(
+        "gateway.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("ExecMainStatus", "2"),
+        ],
+    );
+    fx.pass(1200);
+    fx.pass(1500);
+    assert_eq!(fx.posts().len(), 3, "{}", fx.log());
+    fx.pass(1800);
+    let a = fx.record("alert:shell").unwrap();
+    assert_eq!((a[7].as_str(), a[22].as_str()), ("resolved", "sent2xx"));
+}
+
+/// While the light pass is stale (its last pass over 15 minutes old) the hourly pass stands in
+/// for it: it judges the first sighting the hook left pending by the light pass's rule (here
+/// NRestarts past the sighting's count plus one: still failing), opens it and sends it with
+/// itself as the sender, and sends the open of witness-stale for the light pass, which it opens
+/// on its second stale check. A light pass that runs meanwhile sends neither again.
+#[test]
+fn while_the_light_pass_is_stale_the_hourly_pass_completes_hook_sightings_and_sends() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.curl_answers("403|text/plain");
+    fx.hourly(3600);
+    assert!(fx.posts().is_empty(), "the light pass is fresh");
+    let mut rec = hook_record("w#7", "sensor-http.service", "PAGE", "pending", 3700, "1");
+    rec = with_field(&rec, 33, "-");
+    fx.incidents(&[rec]);
+    fx.unit("sensor-http.service", &[("NRestarts", "5")]);
+    fx.hourly_alone(7200);
+    let titles = fx.titles();
+    assert!(
+        titles
+            .iter()
+            .any(|t| t.starts_with("PAGE host-") && t.contains(" - listen: ")),
+        "{titles:?}\n{}",
+        fx.log()
+    );
+    let http = fx.record("unit:sensor-http.service").unwrap();
+    assert_eq!((http[7].as_str(), http[17].as_str()), ("open", "1"));
+    let t = stamp(7200);
+    assert!(
+        fx.incident_lines().contains(&inc_line(
+            "unit:sensor-http.service",
+            [&t, "stage1", "open", "ok", "hourly", "w#7", &t]
+        )),
+        "{:?}",
+        fx.incident_lines()
+    );
+    let sent = fx.posts().len();
+    fx.pass(7260);
+    assert_eq!(fx.posts().len(), sent, "not sent again by the light pass");
+    fx.hourly_alone(10800);
+    let stale = fx.record("witness:light").unwrap();
+    assert_eq!(stale[7], "open");
+    assert!(
+        fx.titles().iter().any(|t| t.contains(" - witness: ")),
+        "{:?}",
+        fx.titles()
+    );
+    assert!(
+        fx.incident_lines()
+            .iter()
+            .any(|f| f[3] == kh8("witness:light") && f[7] == "hourly"),
+        "{:?}",
+        fx.incident_lines()
+    );
+}
+
+/// The hourly pass posts what it admitted itself, whether or not the light pass runs. Its kinds
+/// are judged by no other pass, so a message left for the light pass to retry would be dropped
+/// after an hour if that pass had stopped, and a change would reach the operator without the
+/// cause it changed from. It claims the line under the lock with itself as the sender, and a
+/// light pass that then finds the line done posts nothing more.
+#[test]
+fn the_hourly_pass_posts_the_transitions_of_its_own_kinds_itself() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[("fail", "stale", "logrotate")]), 0);
+    fx.curl_answers("403|text/plain");
+    fx.hourly(0);
+    assert!(fx.posts().is_empty());
+    fx.hourly(3600);
+    let key = format!("finding:stale:{}", k12("stale"));
+    let f = fx.record(&key).unwrap();
+    let t = stamp(3600);
+    assert_eq!(
+        (f[7].as_str(), f[26].as_str(), f[17].as_str()),
+        ("open", "-", "1"),
+        "{}",
+        fx.log()
+    );
+    let titles = incident_titles(&fx);
+    assert_eq!(titles.len(), 1, "{}", fx.log());
+    assert!(titles[0].starts_with("ACT host-"), "{titles:?}");
+    assert_eq!(
+        fx.incident_lines(),
+        [inc_line(
+            &key,
+            [&t, "pool", "open", "ok", "hourly", &f[1], &t]
+        )]
+    );
+    for at in [3660, 3720, 4020] {
+        fx.pass(at);
+    }
+    assert_eq!(incident_titles(&fx).len(), 1, "{}", fx.log());
+}
+
+/// An admission no pass ever posted is not lost to the hour rule. A pass claims a line just
+/// before it posts, so a line of a pass that is still pending with its last attempt at its
+/// admission was never tried: a pass killed between admitting and posting, with none after it for
+/// over an hour (a host that was down), leaves a message that still goes, once. The failure hook
+/// posts without that claim, so a line of its own that looks the same may have gone, and is
+/// dropped at the hour as before.
+#[test]
+fn an_admission_no_pass_ever_posted_is_posted_late_and_not_dropped_at_the_hour() {
+    for (sender, goes) in [("light", true), ("hourly", true), ("hook", false)] {
+        let mut fx = Fx::new();
+        fx.v2();
+        fx.private_topic(3600);
+        failed_backup(&fx);
+        pending_backup_open(&fx);
+        let key = "unit:propolis-backup.service";
+        let s = stamp(0);
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!(
+                "#send-ledger v1 g=1\n{}\n",
+                inc_line(key, [&s, "pool", "open", "pending", sender, "w#7", &s]).join("\t")
+            ),
+        );
+        fx.pass(3700);
+        let r = fx.record(key).unwrap();
+        assert_eq!(r[26], "-", "{sender}: {}", fx.log());
+        assert_eq!(
+            (incident_titles(&fx).len(), r[17].as_str()),
+            if goes { (1, "1") } else { (0, "0") },
+            "{sender}: {}",
+            fx.log()
+        );
+        if goes {
+            assert_eq!(
+                fx.incident_lines(),
+                [inc_line(
+                    key,
+                    [&s, "pool", "open", "ok", "light", "w#7", &stamp(3700)]
+                )],
+                "{sender}"
+            );
+        }
+        fx.pass(4000);
+        assert_eq!(incident_titles(&fx).len(), usize::from(goes), "{sender}");
+    }
+}
+
+/// The same late first post, claimed by a pass whose claim takes it past the send cut (a test
+/// seam counts 200 s for the claim against a cut of 100 s): that pass posts it. Left unposted, its
+/// line would hold the claim's attempt, it would no longer read as never posted, and the next
+/// pass would drop it at the hour with its one message unsent.
+#[test]
+fn a_late_first_post_claimed_near_the_send_cut_still_goes() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(3600);
+    failed_backup(&fx);
+    pending_backup_open(&fx);
+    let key = "unit:propolis-backup.service";
+    let s = stamp(0);
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!(
+            "#send-ledger v1 g=1\n{}\n",
+            inc_line(key, [&s, "pool", "open", "pending", "light", "w#7", &s]).join("\t")
+        ),
+    );
+    fx.setenv("PROPOLIS_WITNESS_SEND_CUT", "100");
+    fx.setenv("PROPOLIS_WITNESS_POST_SECS", "200");
+    fx.pass(3700);
+    assert_eq!(incident_titles(&fx).len(), 1, "{}", fx.log());
+    let r = fx.record(key).unwrap();
+    assert_eq!((r[17].as_str(), r[26].as_str()), ("1", "-"), "{}", fx.log());
+    fx.unsetenv("PROPOLIS_WITNESS_SEND_CUT");
+    fx.unsetenv("PROPOLIS_WITNESS_POST_SECS");
+    fx.pass(4000);
+    assert_eq!(incident_titles(&fx).len(), 1);
+}
+
+/// A message that got through but whose record could not be written afterwards (its ledger line
+/// says ok, the record still names the transition as pending) is closed from the line on the
+/// next pass, as its result would have closed it: nothing is pending, the open is delivered, and
+/// it is not taken for a message that cannot be delivered, which would open alert-path over one
+/// that arrived.
+#[test]
+fn a_pending_transition_whose_line_holds_its_result_is_closed_from_the_line() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    failed_backup(&fx);
+    pending_backup_open(&fx);
+    let key = "unit:propolis-backup.service";
+    let s = stamp(0);
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!(
+            "#send-ledger v1 g=1\n{}\n",
+            inc_line(key, [&s, "pool", "open", "ok", "light", "w#7", &s]).join("\t")
+        ),
+    );
+    fx.pass(1200);
+    let r = fx.record(key).unwrap();
+    assert_eq!(
+        (r[26].as_str(), r[27].as_str(), r[17].as_str()),
+        ("-", "-", "1"),
+        "{}",
+        fx.log()
+    );
+    assert!(fx.record("alert:shell").is_none(), "{}", fx.log());
+    assert!(incident_titles(&fx).is_empty(), "{:?}", fx.titles());
+}
+
+/// The daily message is the same under either profile: the same body, title, ledger line and
+/// meta keys, beside an incident that v2 also sends as its own message.
+#[test]
+fn the_daily_message_is_the_same_under_either_profile() {
+    let daily = |v2: bool| {
+        let mut fx = Fx::new();
+        if v2 {
+            fx.v2();
+        }
+        // One salt for both, so both have one alias.
+        fx.write(
+            "var/lib/propolis/witness/id-salt",
+            "0123456789abcdef0123456789abcdef\n",
+        );
+        failed_shipper(&fx);
+        fx.private_topic(3600);
+        fx.pass(3300);
+        fx.pass(3600);
+        let titles = fx.titles();
+        let at = titles
+            .iter()
+            .position(|t| t.ends_with(": daily"))
+            .unwrap_or_else(|| panic!("{v2}: {titles:?}"));
+        (
+            titles[at].clone(),
+            fx.posts()[at].clone(),
+            fx.daily_lines(),
+            fx.meta("daily_last"),
+            fx.meta("daily_last_stamp"),
+            titles.len(),
+        )
+    };
+    let (legacy, v2) = (daily(false), daily(true));
+    assert_eq!(legacy.5, 1, "legacy posts the daily message alone");
+    assert_eq!(v2.5, 2, "v2 posts the shipper's open too");
+    assert_eq!(
+        (&legacy.0, &legacy.1, &legacy.2, &legacy.3, &legacy.4),
+        (&v2.0, &v2.1, &v2.2, &v2.3, &v2.4)
+    );
+}
+
+/// The titles of the incident messages posted, in order (every post but the daily message).
+fn incident_titles(fx: &Fx) -> Vec<String> {
+    fx.titles()
+        .into_iter()
+        .filter(|t| !t.ends_with(": daily"))
+        .collect()
+}
+
+/// A hook spool file at `rel` for one firing at time `t` (`count` in all), with that cause and the
+/// hook's last field `out`.
+fn spool_file(fx: &Fx, rel: &str, t: u64, count: u32, cause: &str, out: &str) {
+    let s = stamp(t);
+    fx.write(
+        rel,
+        &format!("#hook v1 g=1\nH\t{s}\t{s}\t{count}\texit-code\texited\t1\t{cause}\t0\t{out}\n"),
+    );
+}
+
+/// The backup run failed, a oneshot of Restart=no: a spooled firing of it opens at once.
+fn failed_backup(fx: &Fx) {
+    backup_unit(fx, &[]);
+}
+
+/// The backup unit as `failed_backup` leaves it, with these properties changed.
+fn backup_unit(fx: &Fx, changes: &[(&str, &str)]) {
+    let mut props = vec![
+        ("ActiveState", "failed"),
+        ("SubState", "failed"),
+        ("Result", "exit-code"),
+        ("Restart", "no"),
+        ("UnitFileState", "static"),
+    ];
+    for (k, v) in changes {
+        props.retain(|(name, _)| name != k);
+        props.push((k, v));
+    }
+    fx.unit("propolis-backup.service", &props);
+}
+
+/// The backup's open, claimed at time 0 by the failure hook and still pending: a record of
+/// `w#7` with its pending ledger line, the post never answered.
+fn pending_backup_open(fx: &Fx) {
+    let key = "unit:propolis-backup.service";
+    let mut rec = hook_record("w#7", "propolis-backup.service", "ACT", "open", 0, "-");
+    for (i, v) in [
+        (14, "1"),
+        (15, stamp(0).as_str()),
+        (16, "open"),
+        (26, "open"),
+        (27, stamp(0).as_str()),
+        (30, "hookopen"),
+        (33, "-"),
+    ] {
+        rec = with_field(&rec, i, v);
+    }
+    fx.incidents(&[rec]);
+    let s = stamp(0);
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!(
+            "#send-ledger v1 g=1\n{}\n",
+            inc_line(key, [&s, "pool", "open", "pending", "hook", "w#7", &s]).join("\t")
+        ),
+    );
+}
+
+/// A send ledger of these incident lines, each `(key, stamp, class, result)`, sent by the light
+/// pass on their admission.
+fn ledger_of(fx: &Fx, lines: &[(&str, String, &str, &str)]) {
+    let mut body = String::from("#send-ledger v1 g=1\n");
+    for (i, (key, s, class, result)) in lines.iter().enumerate() {
+        let id = format!("w#{}", 300 + i);
+        body.push_str(&inc_line(key, [s, class, "open", result, "light", &id, s]).join("\t"));
+        body.push('\n');
+    }
+    fx.write("var/lib/propolis/witness/send-ledger", &body);
+}
+
+/// The hourly pass claims each message it admitted under the lock just before its post, as a retry
+/// is claimed: a light pass that runs while the hourly pass's third post is in flight, 200 s after
+/// the admission, finds each of the hourly pass's transitions done or claimed under 120 s ago, and
+/// posts none of them again. Each ledger line ends with one result, the hourly pass's. (A test
+/// seam moves the hourly pass's clock on by 100 s at each claim, as posts in a row take time.)
+#[test]
+fn a_light_pass_while_the_hourly_pass_posts_sends_none_of_its_transitions_again() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.install_cc();
+    let found = [
+        ("fail", "stale", "logrotate"),
+        ("fail", "ops-failure-hook", "alerting"),
+        ("fail", "backup-timer", "backup"),
+    ];
+    fx.cc(&cc_tsv(&[], &found), 0);
+    fx.curl_answers("403|text/plain");
+    fx.hourly(0);
+    assert!(fx.posts().is_empty());
+    // The third post waits for the light pass.
+    fx.stub_file(
+        "curl.post.run",
+        "d=\"$1\"; n=$(( $(cat \"$d/post.n\" 2> /dev/null || echo 0) + 1 )); echo \"$n\" > \"$d/post.n\"\n\
+         if [ \"$n\" = 3 ]; then : > \"$d/post.third\"; while [ ! -e \"$d/post.go\" ]; do sleep 0.1; done; fi\n",
+    );
+    fx.setenv("PROPOLIS_WITNESS_POST_SECS", "100");
+    // Stale: the light pass last ran 1200 s ago.
+    let mut hourly = fx.start(&["hourly"], 1200, false);
+    let third = fx.dir.path().join("post.third");
+    let mut waited = 0;
+    while !third.exists() && waited < 1200 {
+        std::thread::sleep(Duration::from_millis(50));
+        waited += 1;
+    }
+    assert!(third.exists(), "the third post began: {}", fx.log());
+    fx.unsetenv("PROPOLIS_WITNESS_POST_SECS");
+    fx.pass(1400);
+    fx.stub_file("post.go", "");
+    assert!(hourly.wait().unwrap().success());
+    let titles = fx.titles();
+    assert_eq!(titles.len(), 3, "{titles:?}\n{}", fx.log());
+    let lines = fx.incident_lines();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    for l in &lines {
+        assert_eq!((l[6].as_str(), l[7].as_str()), ("ok", "hourly"), "{l:?}");
+    }
+    for (_, k, _) in found {
+        let r = fx.record(&format!("finding:{k}:{}", k12(k))).unwrap();
+        assert_eq!((r[17].as_str(), r[26].as_str()), ("1", "-"), "{k}");
+    }
+}
+
+/// A change that gets through does not stand for the open that never did: on an incident whose
+/// open was refused (one send, delivered_open 0, nothing pending) a change of cause class that got
+/// through leaves it undelivered, so when the unit heals its RESOLVED is withheld without a W line
+/// (withhold:undelivered), and the operator never hears of the end of an incident whose start was
+/// not delivered.
+#[test]
+fn a_change_that_got_through_after_a_refused_open_sends_no_resolved() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    let mut rec = hook_record("w#7", "shipper.service", "ACT", "open", 0, "-");
+    for (i, v) in [
+        (11, "fs.no_space"),
+        (14, "1"),
+        (15, stamp(0).as_str()),
+        (16, "open"),
+        (33, "-"),
+    ] {
+        rec = with_field(&rec, i, v);
+    }
+    fx.incidents(&[rec]);
+    failed_shipper(&fx);
+    fx.pass(300);
+    let ship = |fx: &Fx| {
+        fx.titles()
+            .into_iter()
+            .filter(|t| t.contains(" - ship: "))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ship(&fx).len(), 1, "the change: {}", fx.log());
+    assert!(ship(&fx)[0].ends_with(" (changed)"), "{:?}", ship(&fx));
+    let r = fx.record("unit:shipper.service").unwrap();
+    assert_eq!((r[17].as_str(), r[26].as_str()), ("0", "-"));
+    fx.unit(
+        "shipper.service",
+        &[("ActiveEnterTimestampMonotonic", &entered(600, 60))],
+    );
+    for t in [600, 900, 1200, 1500] {
+        fx.pass(t);
+    }
+    assert_eq!(fx.record("unit:shipper.service").unwrap()[7], "resolved");
+    assert_eq!(ship(&fx).len(), 1, "{:?}", ship(&fx));
+    let kh = kh8("unit:shipper.service");
+    assert!(
+        fx.w_lines().iter().all(|w| w[2] != kh),
+        "{:?}",
+        fx.w_lines()
+    );
+}
+
+/// Standing in for a stale light pass, the hourly pass reads the units only when what that costs
+/// (two spool listings, the sample and the rotation guard's journal: 43 s) still fits before its
+/// soft deadline: with 30 s left it does not sample, and the sighting stays pending.
+#[test]
+fn the_hourly_pass_samples_the_units_only_when_the_whole_sample_fits_before_its_soft_deadline() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.curl_answers("403|text/plain");
+    fx.hourly(3600);
+    let rec = with_field(
+        &hook_record("w#7", "sensor-http.service", "PAGE", "pending", 3700, "1"),
+        33,
+        "-",
+    );
+    fx.incidents(&[rec]);
+    fx.unit("sensor-http.service", &[("NRestarts", "5")]);
+    fx.setenv("PROPOLIS_WITNESS_SOFT_DEADLINE", "30");
+    clear_log(&fx);
+    fx.hourly_alone(7200);
+    assert!(
+        !fx.log().lines().any(|l| l.contains("ExecMainCode")),
+        "{}",
+        fx.log()
+    );
+    assert_eq!(fx.record("unit:sensor-http.service").unwrap()[7], "pending");
+    assert!(incident_titles(&fx).is_empty(), "{:?}", fx.titles());
+}
+
+/// Standing in for a stale light pass, the hourly pass does the light pass's work for the hook's
+/// records: it takes in a hook spool file, opening the Restart=no unit's failure and sending its
+/// open; and it sends a reminder that falls due on a hook-opened record, here the late open of a
+/// listener whose open was withheld (class late, sender hourly), which marks it delivered.
+#[test]
+fn while_the_light_pass_is_stale_the_hourly_pass_takes_in_spool_files_and_sends_due_reminders() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.curl_answers("403|text/plain");
+    fx.hourly(3600);
+    let spool = "run/propolis-witness/fallback/hook-propolis-backup.service";
+    spool_file(&fx, spool, 3700, 1, "proc.exit:1", "-");
+    failed_backup(&fx);
+    let mut rec = hook_record("w#7", "sensor-http.service", "PAGE", "open", 3700, "1");
+    for (i, v) in [
+        (19, stamp(7000).as_str()),
+        (29, "0"),
+        (30, "hookopen"),
+        (33, "-"),
+    ] {
+        rec = with_field(&rec, i, v);
+    }
+    let w = format!(
+        "W\t{}\t{}\topen\t1\t-\tstage1-cap\n",
+        stamp(3700),
+        kh8("unit:sensor-http.service")
+    );
+    fx.incidents(&[rec, w]);
+    fx.unit(
+        "sensor-http.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+        ],
+    );
+    fx.hourly_alone(7200);
+    assert!(!fx.p(spool).exists(), "taken in");
+    let backup = fx.record("unit:propolis-backup.service").unwrap();
+    assert_eq!((backup[7].as_str(), backup[17].as_str()), ("open", "1"));
+    let t = stamp(7200);
+    let lines = fx.incident_lines();
+    assert!(
+        lines.contains(&inc_line(
+            "unit:propolis-backup.service",
+            [&t, "pool", "open", "ok", "hourly", &backup[1], &t]
+        )),
+        "{lines:?}\n{}",
+        fx.log()
+    );
+    assert!(
+        lines.contains(&inc_line(
+            "unit:sensor-http.service",
+            [&t, "late", "remind", "ok", "hourly", "w#7", &t]
+        )),
+        "{lines:?}"
+    );
+    let http = fx.record("unit:sensor-http.service").unwrap();
+    assert_eq!((http[17].as_str(), http[18].as_str()), ("1", "1"));
+    assert_eq!(incident_titles(&fx).len(), 2, "{:?}", fx.titles());
+}
+
+/// Standing in for a stale light pass, the hourly pass judges pending sightings by the light
+/// pass's rule: one whose unit healed is dropped and counted in meta healed; one under a
+/// maintenance marker, in the ten minutes after a marker was last seen, or in the boot's first ten
+/// minutes stays pending.
+#[test]
+fn the_hourly_pass_standing_in_drops_healed_sightings_and_keeps_the_light_passs_holds() {
+    for case in ["healed", "marker", "after marker", "boot grace"] {
+        let mut fx = Fx::new();
+        fx.v2();
+        fx.install_cc();
+        fx.cc(&cc_tsv(&[], &[]), 0);
+        fx.curl_answers("403|text/plain");
+        fx.hourly(3600);
+        let mut rec = with_field(
+            &hook_record("w#7", "sensor-http.service", "PAGE", "pending", 3700, "1"),
+            33,
+            "-",
+        );
+        match case {
+            "healed" => fx.unit(
+                "sensor-http.service",
+                &[
+                    ("NRestarts", "1"),
+                    ("ActiveEnterTimestampMonotonic", &entered(7200, 3000)),
+                ],
+            ),
+            "marker" => {
+                fx.unit("sensor-http.service", &[("NRestarts", "5")]);
+                fx.write(
+                    "run/propolis-witness/maintenance",
+                    &format!("#maintenance v1 g=1\nX\t{}\t{BOOT}\tmanual\n", WALL + 9000),
+                );
+            }
+            "after marker" => {
+                fx.unit("sensor-http.service", &[("NRestarts", "5")]);
+                set_meta(&fx, "maint_seen", &stamp(6900));
+            }
+            _ => {
+                fx.unit("sensor-http.service", &[("NRestarts", "5")]);
+                // A boot 300 s ago: the record's sighting is of the boot before.
+                fx.setenv(
+                    "PROPOLIS_WITNESS_NOW",
+                    &format!("{}/abcdef02/300", WALL + 7200),
+                );
+                rec = with_field(&rec, 8, &stamp(3700));
+            }
+        }
+        fx.incidents(&[rec]);
+        fx.hourly_alone(7200);
+        let r = fx.record("unit:sensor-http.service");
+        if case == "healed" {
+            assert!(r.is_none(), "{case}: {r:?}");
+            assert!(
+                fx.meta("healed").is_some_and(|h| h.starts_with("1/")),
+                "{case}: {:?}",
+                fx.meta("healed")
+            );
+        } else {
+            assert_eq!(
+                r.map(|r| r[7].clone()).as_deref(),
+                Some("pending"),
+                "{case}"
+            );
+            assert_eq!(fx.meta("healed"), None, "{case}");
+        }
+        assert!(incident_titles(&fx).is_empty(), "{case}: {:?}", fx.titles());
+    }
+}
+
+/// Under the legacy profile the hourly pass never stands in for a stale light pass: it reads no
+/// unit, judges no pending sighting, takes in no spool file and sends no reminder, and meta healed
+/// is left as it was, as the previous release leaves them all.
+#[test]
+fn under_legacy_the_hourly_pass_never_stands_in_for_a_stale_light_pass() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.curl_answers("403|text/plain");
+    fx.hourly(3600);
+    let pending = with_field(
+        &hook_record("w#7", "sensor-http.service", "PAGE", "pending", 3700, "1"),
+        33,
+        "-",
+    );
+    let healed = with_field(
+        &hook_record("w#8", "sensor-ssh.service", "PAGE", "pending", 3700, "1"),
+        33,
+        "-",
+    );
+    let mut due = hook_record("w#9", "shipper.service", "ACT", "open", 3700, "-");
+    for (i, v) in [(19, stamp(7000).as_str()), (30, "hookopen"), (33, "-")] {
+        due = with_field(&due, i, v);
+    }
+    fx.incidents(&[pending, healed, due]);
+    fx.unit("sensor-http.service", &[("NRestarts", "5")]);
+    fx.unit(
+        "sensor-ssh.service",
+        &[
+            ("NRestarts", "1"),
+            ("ActiveEnterTimestampMonotonic", &entered(7200, 3000)),
+        ],
+    );
+    failed_shipper(&fx);
+    let spool = "run/propolis-witness/fallback/hook-propolis-backup.service";
+    spool_file(&fx, spool, 3700, 1, "proc.exit:1", "-");
+    failed_backup(&fx);
+    let before = fx.meta("healed");
+    clear_log(&fx);
+    fx.hourly_alone(7200);
+    assert!(
+        !fx.log().lines().any(|l| l.contains("ExecMainCode")),
+        "{}",
+        fx.log()
+    );
+    assert_eq!(fx.record("unit:sensor-http.service").unwrap()[7], "pending");
+    assert_eq!(fx.record("unit:sensor-ssh.service").unwrap()[7], "pending");
+    let r = fx.record("unit:shipper.service").unwrap();
+    assert_eq!((r[18].as_str(), r[29].as_str()), ("0", "1"), "no reminder");
+    assert!(fx.p(spool).exists(), "not taken in");
+    assert!(fx.record("unit:propolis-backup.service").is_none());
+    assert_eq!(fx.meta("healed"), before);
+}
+
+/// Under the legacy profile a send ledger no copy of which can be read holds the daily message on
+/// that pass, as the previous release holds it: judging alert-path reads no ledger under legacy,
+/// so the budget's own read is the first, finds nothing it can count and admits nothing; the next
+/// pass counts from the empty ledger it left and sends.
+#[test]
+fn under_legacy_a_damaged_send_ledger_holds_the_daily_message_on_that_pass() {
+    let fx = Fx::new();
+    fx.private_topic(2460);
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        "#send-ledger v9 g=1\nL\tdamaged\n",
+    );
+    fx.pass(2460);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    assert!(fx.daily_lines().is_empty());
+    fx.pass(2760);
+    assert_eq!(fx.posts().len(), 1, "{}", fx.log());
+}
+
+/// The same under v2: the pass's first read of the ledger, made before any other, decides that
+/// nothing is admitted on this pass, the daily message included, though that read leaves an empty
+/// ledger behind for a later read; the next pass sends it.
+#[test]
+fn under_v2_a_damaged_send_ledger_holds_the_daily_message_on_that_pass() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(2460);
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        "#send-ledger v9 g=1\nL\tdamaged\n",
+    );
+    fx.pass(2460);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    assert!(fx.daily_lines().is_empty());
+    fx.pass(2760);
+    let titles = fx.titles();
+    assert_eq!(titles.len(), 1, "{}", fx.log());
+    assert!(titles[0].ends_with(": daily"), "{titles:?}");
+}
+
+/// Under the legacy profile an incident message the send ledger says got through is no proof
+/// that alerts get out (no such message is sent under legacy): alert-path stays open, as the
+/// previous release leaves it. Under v2 the same line resolves it.
+#[test]
+fn under_legacy_an_incident_message_in_the_send_ledger_is_no_proof_for_alert_path() {
+    for v2 in [false, true] {
+        let mut fx = Fx::new();
+        if v2 {
+            fx.v2();
+            fx.private_topic(0);
+        }
+        fx.incidents(&[alert_path_record(&stamp(0))]);
+        ledger_of(&fx, &[("unit:shipper.service", stamp(100), "pool", "ok")]);
+        fx.pass(300);
+        fx.pass(600);
+        let a = fx.record("alert:shell").unwrap();
+        if v2 {
+            assert_eq!((a[7].as_str(), a[22].as_str()), ("resolved", "sent2xx"));
+        } else {
+            assert_eq!(a[7], "open", "{}", fx.log());
+        }
+    }
+}
+
+/// Under v2 the daily message is a post of the witness to the target alert-path is about: one that
+/// got through after alert-path opened is the proof that the path works (sent2xx), so an
+/// alert-path whose reminders are spent resolves on a quiet host, and the heartbeat ping it held
+/// is made again once 30 minutes have passed clean.
+#[test]
+fn under_v2_a_daily_message_that_got_through_resolves_alert_path() {
+    let pings = |fx: &Fx| fx.log().lines().filter(|l| l.starts_with("curl ")).count();
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(2460);
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_WITNESS_HEARTBEAT_URL=https://hc.example.invalid/ping/abc\n",
+    );
+    fx.curl_answers("200|text/plain");
+    let mut a = alert_path_record(&stamp(0));
+    for (i, v) in [(11, "http.auth:403"), (18, "3"), (19, "-")] {
+        a = with_field(&a, i, v);
+    }
+    fx.incidents(&[a]);
+    fx.pass(2460);
+    assert_eq!(fx.titles().len(), 1, "{}", fx.log());
+    assert!(fx.titles()[0].ends_with(": daily"));
+    assert_eq!(fx.record("alert:shell").unwrap()[7], "open");
+    fx.pass(2760);
+    let a = fx.record("alert:shell").unwrap();
+    assert_eq!((a[7].as_str(), a[22].as_str()), ("resolved", "sent2xx"));
+    assert_eq!(pings(&fx), 0, "{}", fx.log());
+    fx.pass(4300);
+    assert_eq!(pings(&fx), 1, "{}", fx.log());
+}
+
+/// With 512 open records a new open cannot be kept; its transition goes with it and is never
+/// queued for another record: a pass that then only reschedules an open record's reminder (a
+/// record with no schedule gets one) sends nothing for it.
+#[test]
+fn a_transition_whose_record_could_not_be_kept_is_sent_for_no_other_record() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    let open: Vec<String> = (0..512)
+        .map(|i| {
+            let r = hook_record(&format!("w#{}", i + 100), "x", "ACT", "open", 0, "-")
+                .replace("unit:x", &format!("finding:test:{i:012}"));
+            with_field(&r, 33, "-")
+        })
+        .collect();
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=1\nN\t700\n{}", open.concat()),
+    );
+    spool_file(
+        &fx,
+        "var/lib/propolis/witness/hook/propolis-backup.service",
+        0,
+        1,
+        "proc.exit:1",
+        "-",
+    );
+    failed_backup(&fx);
+    fx.pass(300);
+    assert!(
+        fx.log()
+            .contains("incident not recorded: the record of unit:propolis-backup.service"),
+        "{}",
+        fx.log()
+    );
+    assert!(fx.incident_lines().is_empty(), "{:?}", fx.incident_lines());
+    assert!(fx.posts().is_empty(), "{:?}", fx.titles());
+}
+
+/// The hook's send charged at ingestion has its last attempt at the hook's firing, not at the pass
+/// that took the file in: a message that got through before alert-path opened is no proof that the
+/// path works since, and alert-path stays open.
+#[test]
+fn a_hook_send_made_before_alert_path_opened_does_not_resolve_it() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    let mut a = alert_path_record(&stamp(200));
+    a = with_field(&a, 11, "http.auth:403");
+    fx.incidents(&[a]);
+    spool_file(
+        &fx,
+        "run/propolis-witness/fallback/hook-sensor-http.service",
+        100,
+        1,
+        "proc.signal:9",
+        "ok",
+    );
+    fx.pass(300);
+    fx.pass(600);
+    assert_eq!(fx.record("alert:shell").unwrap()[7], "open", "{}", fx.log());
+}
+
+/// A spool file taken in is removed once a write of the records holds it: an admission's write
+/// holds it, so a later write of the pass that fails cannot give the file back to be counted
+/// again; the next pass raises the occurrences and the sends once.
+#[test]
+fn a_spool_file_taken_in_is_counted_once_when_the_passs_last_write_fails() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    failed_shipper(&fx);
+    fx.pass(0);
+    spool_file(
+        &fx,
+        "run/propolis-witness/fallback/hook-sensor-http.service",
+        100,
+        5,
+        "proc.signal:9",
+        "ok",
+    );
+    // Still failing, so nothing but the spool file moves its record.
+    fx.unit(
+        "sensor-http.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "signal"),
+            ("ExecMainStatus", "9"),
+        ],
+    );
+    // The admission's write of the incidents goes through; the pass's own write after it does not.
+    fx.stub_file("disk.refuses", "*incidents*\n");
+    fx.stub_file("disk.refuses.after", "1");
+    fx.pass(300);
+    std::fs::remove_file(fx.dir.path().join("disk.refuses")).unwrap();
+    fx.pass(600);
+    let http = fx.record("unit:sensor-http.service").unwrap();
+    assert_eq!(
+        (http[14].as_str(), http[31].as_str()),
+        ("1", "5"),
+        "{}",
+        fx.log()
+    );
+    let kh = kh8("unit:sensor-http.service");
+    assert_eq!(
+        fx.incident_lines().iter().filter(|l| l[3] == kh).count(),
+        1,
+        "{:?}",
+        fx.incident_lines()
+    );
+}
+
+/// A pending transition whose ledger line is gone (a damaged ledger replaced by an empty one) can
+/// never be claimed: it is dropped at once, so the incident waits for its reminder, and neither
+/// the heartbeat's rule about a transition pending over 15 minutes nor alert-path is held by it.
+#[test]
+fn a_pending_transition_whose_ledger_line_is_gone_is_dropped_at_once() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_WITNESS_HEARTBEAT_URL=https://hc.example.invalid/ping/abc\n",
+    );
+    fx.curl_answers("200|text/plain");
+    failed_shipper(&fx);
+    fx.stub_file("curl.post", "503");
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(fx.record("unit:shipper.service").unwrap()[26], "open");
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        "#send-ledger v9 g=1\nL\tdamaged\n",
+    );
+    fx.pass(420);
+    let r = fx.record("unit:shipper.service").unwrap();
+    assert_eq!((r[26].as_str(), r[27].as_str()), ("-", "-"), "{}", fx.log());
+    fx.pass(1300);
+    assert!(
+        !fx.meta("hb_skip").unwrap_or_default().ends_with("/pending"),
+        "{:?}",
+        fx.meta("hb_skip")
+    );
+    assert!(fx.record("alert:shell").is_none());
+}
+
+/// A transition undelivered for more than 15 minutes opens alert-path, with the cause its
+/// last answer names (here the server's 503: http.server); once messages get through again it
+/// resolves on that proof.
+#[test]
+fn a_transition_undelivered_for_fifteen_minutes_opens_alert_path() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    failed_shipper(&fx);
+    fx.stub_file("curl.post", "503");
+    for t in [0, 300, 600, 900, 1200] {
+        fx.pass(t);
+    }
+    assert!(fx.record("alert:shell").is_none(), "{}", fx.log());
+    fx.pass(1500);
+    let a = fx.record("alert:shell").unwrap();
+    assert_eq!(
+        (a[7].as_str(), a[11].as_str()),
+        ("open", "http.server:503"),
+        "{a:?}"
+    );
+    fx.stub_file("curl.post", "200");
+    fx.pass(1800);
+    fx.pass(2100);
+    let a = fx.record("alert:shell").unwrap();
+    assert_eq!((a[7].as_str(), a[22].as_str()), ("resolved", "sent2xx"));
+}
+
+/// An open incident whose open never got through (delivered_open 0) and whose proof now holds is
+/// resolved in the records, and its RESOLVED is neither sent nor recorded as withheld.
+#[test]
+fn the_resolve_of_an_incident_never_delivered_is_neither_sent_nor_withheld() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    let mut rec = hook_record("w#7", "shipper.service", "ACT", "open", 0, "-");
+    for (i, v) in [(14, "1"), (17, "0"), (33, "-")] {
+        rec = with_field(&rec, i, v);
+    }
+    fx.incidents(&[rec]);
+    fx.unit(
+        "shipper.service",
+        &[("ActiveEnterTimestampMonotonic", &entered(300, 60))],
+    );
+    for t in [300, 600, 900, 1200] {
+        fx.pass(t);
+    }
+    assert_eq!(fx.record("unit:shipper.service").unwrap()[7], "resolved");
+    assert!(fx.posts().is_empty(), "{:?}", fx.titles());
+    assert!(fx.w_lines().is_empty(), "{:?}", fx.w_lines());
+}
+
+/// One message per incident and pass: a record that opens and changes its cause in the same pass
+/// gets one ledger line, the open's, and one post; one that opens and resolves in the same pass
+/// gets none, and no W line, since its open never got through.
+#[test]
+fn two_transitions_of_one_incident_in_one_pass_send_at_most_one_message() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    let spool = "var/lib/propolis/witness/hook/propolis-backup.service";
+    // The hook's cause is of another class than the one the pass's sample gives.
+    spool_file(&fx, spool, 0, 1, "fs.no_space", "-");
+    backup_unit(&fx, &[("ExecMainStatus", "1")]);
+    fx.pass(300);
+    let r = fx.record("unit:propolis-backup.service").unwrap();
+    assert_eq!(
+        (r[7].as_str(), r[11].as_str()),
+        ("open", "proc.exit:1"),
+        "{}",
+        fx.log()
+    );
+    let lines = fx.incident_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0][4], "open");
+    assert_eq!(fx.posts().len(), 1);
+
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    spool_file(&fx, spool, 0, 1, "proc.exit:1", "-");
+    backup_unit(
+        &fx,
+        &[
+            ("ActiveState", "inactive"),
+            ("SubState", "dead"),
+            ("Result", "success"),
+            ("ExecMainStatus", "0"),
+            ("ExecMainStartTimestampMonotonic", &mono(300, 60)),
+            ("ExecMainExitTimestampMonotonic", &mono(300, 30)),
+            ("InactiveEnterTimestampMonotonic", &entered(300, 30)),
+        ],
+    );
+    fx.pass(300);
+    let r = fx.record("unit:propolis-backup.service").unwrap();
+    assert_eq!(r[7], "resolved", "{}", fx.log());
+    assert!(fx.incident_lines().is_empty(), "{:?}", fx.incident_lines());
+    assert!(fx.posts().is_empty());
+    assert!(fx.w_lines().is_empty(), "{:?}", fx.w_lines());
+}
+
+/// A retry is claimed only while the record still holds that transition with that admission:
+/// another writer that changed it between the admission and the claim (here while the pass's
+/// first post was in flight) has it, and the pass posts nothing for it.
+#[test]
+fn a_retry_whose_record_changed_since_it_was_listed_is_not_posted() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    pending_backup_open(&fx);
+    failed_backup(&fx);
+    failed_shipper(&fx);
+    fx.pass(60);
+    let f = fx.p("var/lib/propolis/witness/incidents");
+    fx.stub_file(
+        "curl.post.run",
+        &format!(
+            "[ -e \"$1/edited\" ] && exit 0; : > \"$1/edited\"\n\
+             f='{}'; awk -F'\\t' -v OFS='\\t' '$1==\"I\" && $3==\"unit:propolis-backup.service\" {{ $28=\"{}\" }} 1' \"$f\" > \"$f.new\" && mv -f \"$f.new\" \"$f\"\n",
+            f.display(),
+            stamp(250)
+        ),
+    );
+    fx.pass(300);
+    let titles = fx.titles();
+    assert_eq!(titles.len(), 1, "{titles:?}");
+    assert!(titles[0].contains(" - ship: "), "{titles:?}");
+    assert_eq!(
+        fx.record("unit:propolis-backup.service").unwrap()[27],
+        stamp(250)
+    );
+}
+
+/// A claim is followed by its post. The claim moves the line's last attempt to now, which keeps
+/// every other pass off the transition for 120 s and ends its standing as never posted, so a pass
+/// that claimed and then did not post would leave a message the hour rule drops unsent. The send
+/// cut is asked before a claim, never between a claim and its post. (A test seam counts 200 s for
+/// each claim against a cut of 100 s.) One retry: claimed and posted. Two admissions in one pass:
+/// the first is claimed and posted, the second is left as it was admitted, never claimed, and the
+/// next pass posts it.
+#[test]
+fn a_transition_claimed_before_the_send_cut_is_always_posted() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    pending_backup_open(&fx);
+    failed_backup(&fx);
+    fx.setenv("PROPOLIS_WITNESS_SEND_CUT", "100");
+    fx.setenv("PROPOLIS_WITNESS_POST_SECS", "200");
+    fx.pass(300);
+    assert_eq!(incident_titles(&fx).len(), 1, "{}", fx.log());
+    let s = stamp(0);
+    assert_eq!(
+        fx.incident_lines(),
+        [inc_line(
+            "unit:propolis-backup.service",
+            [&s, "pool", "open", "ok", "light", "w#7", &stamp(500)]
+        )]
+    );
+
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    two_refused_hook_sends(&fx, "transient:503");
+    fx.setenv("PROPOLIS_WITNESS_SEND_CUT", "100");
+    fx.setenv("PROPOLIS_WITNESS_POST_SECS", "200");
+    fx.pass(300);
+    let titles = incident_titles(&fx);
+    assert_eq!(titles.len(), 1, "{titles:?}\n{}", fx.log());
+    assert!(titles[0].contains(" - backup: "), "{titles:?}");
+    let t = stamp(300);
+    let http = fx.record("unit:sensor-http.service").unwrap();
+    assert_eq!(
+        (http[17].as_str(), http[26].as_str(), http[27].as_str()),
+        ("0", "open", t.as_str()),
+        "{}",
+        fx.log()
+    );
+    assert!(
+        fx.incident_lines().contains(&inc_line(
+            "unit:sensor-http.service",
+            [&t, "stage1", "open", "pending", "light", &http[1], &t]
+        )),
+        "{:?}",
+        fx.incident_lines()
+    );
+    fx.unsetenv("PROPOLIS_WITNESS_SEND_CUT");
+    fx.unsetenv("PROPOLIS_WITNESS_POST_SECS");
+    fx.pass(600);
+    let titles = incident_titles(&fx);
+    assert_eq!(titles.len(), 2, "{titles:?}\n{}", fx.log());
+    let http = fx.record("unit:sensor-http.service").unwrap();
+    assert_eq!((http[17].as_str(), http[26].as_str()), ("1", "-"));
+}
+
+/// The firings of two units the hook sent without the lock, each post answered with `result`: the
+/// backup's spool file in the state directory, taken in first, the sensor's in /run. Both units
+/// are failed and do not restart, so each record opens when its file is taken in and its open is
+/// the pass's to send.
+fn two_refused_hook_sends(fx: &Fx, result: &str) {
+    spool_file(
+        fx,
+        "var/lib/propolis/witness/hook/propolis-backup.service",
+        0,
+        1,
+        "proc.exit:1",
+        result,
+    );
+    spool_file(
+        fx,
+        "run/propolis-witness/fallback/hook-sensor-http.service",
+        0,
+        1,
+        "proc.exit:1",
+        result,
+    );
+    failed_backup(fx);
+    fx.unit(
+        "sensor-http.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("Restart", "no"),
+        ],
+    );
+}
+
+/// What the hook's send without the lock cost the budget is an entry of its own in the send
+/// ledger, never a transition's line. Written in the same pass and second as the admission of
+/// that key's own open (the hook's post was refused, so the open is the pass's to send), with the
+/// same stamp and key, it is not taken for that admission: its transition word is `hook-open`,
+/// which no record ever holds as pending. Two units' firings taken in by one pass: the entry for
+/// the second is written before the second's admission, and both opens are still posted, each
+/// admission line ending ok and each entry keeping the hook's result.
+#[test]
+fn what_the_hooks_send_cost_is_never_taken_for_that_keys_admission() {
+    for result in ["perm:403", "transient:503"] {
+        let mut fx = Fx::new();
+        fx.v2();
+        fx.private_topic(0);
+        two_refused_hook_sends(&fx, result);
+        fx.pass(300);
+        let titles = incident_titles(&fx);
+        assert_eq!(titles.len(), 2, "{result}: {titles:?}\n{}", fx.log());
+        let (t, fired) = (stamp(300), stamp(0));
+        let mut want = Vec::new();
+        for (unit, class) in [
+            ("propolis-backup.service", "pool"),
+            ("sensor-http.service", "stage1"),
+        ] {
+            let key = format!("unit:{unit}");
+            let r = fx.record(&key).unwrap();
+            assert_eq!(
+                (
+                    r[7].as_str(),
+                    r[14].as_str(),
+                    r[17].as_str(),
+                    r[26].as_str()
+                ),
+                ("open", "2", "1", "-"),
+                "{result} {unit}"
+            );
+            want.push(inc_line(
+                &key,
+                [&t, class, "hook-open", result, "hook", &r[1], &fired],
+            ));
+            want.push(inc_line(
+                &key,
+                [&t, class, "open", "ok", "light", &r[1], &t],
+            ));
+        }
+        want.sort();
+        let mut lines = fx.incident_lines();
+        lines.sort();
+        assert_eq!(lines, want, "{result}");
+    }
+}
+
+/// A transition whose ledger line was lost when it had already waited over 15 minutes (a damaged
+/// ledger replaced by an empty one) is dropped by the pass that finds the line gone, and is no
+/// message waiting on the alert path: alert-path does not open over it.
+#[test]
+fn a_transition_whose_line_was_lost_after_15_minutes_opens_no_alert_path() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    failed_backup(&fx);
+    pending_backup_open(&fx);
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        "#send-ledger v1 g=1\n",
+    );
+    fx.pass(1200);
+    let r = fx.record("unit:propolis-backup.service").unwrap();
+    assert_eq!(
+        (r[26].as_str(), r[27].as_str(), r[17].as_str()),
+        ("-", "-", "0"),
+        "{}",
+        fx.log()
+    );
+    assert!(fx.record("alert:shell").is_none(), "{}", fx.log());
+    assert!(incident_titles(&fx).is_empty(), "{:?}", fx.titles());
+}
+
+/// Two records that hold one id (a damaged incidents file) are each a transition of their own:
+/// both pending opens are retried, neither standing in for the other.
+#[test]
+fn two_pending_records_with_one_id_are_both_retried() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    failed_backup(&fx);
+    fx.unit(
+        "sensor-http.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("Restart", "no"),
+        ],
+    );
+    let s = stamp(0);
+    let mut recs = Vec::new();
+    let mut ledger = String::from("#send-ledger v1 g=1\n");
+    for (unit, tier, class) in [
+        ("propolis-backup.service", "ACT", "pool"),
+        ("sensor-http.service", "PAGE", "stage1"),
+    ] {
+        let mut rec = hook_record("w#7", unit, tier, "open", 0, "-");
+        for (i, v) in [
+            (14, "1"),
+            (15, s.as_str()),
+            (16, "open"),
+            (26, "open"),
+            (27, s.as_str()),
+            (30, "hookopen"),
+            (33, "-"),
+        ] {
+            rec = with_field(&rec, i, v);
+        }
+        recs.push(rec);
+        ledger.push_str(
+            &inc_line(
+                &format!("unit:{unit}"),
+                [&s, class, "open", "pending", "hook", "w#7", &s],
+            )
+            .join("\t"),
+        );
+        ledger.push('\n');
+    }
+    fx.incidents(&recs);
+    fx.write("var/lib/propolis/witness/send-ledger", &ledger);
+    fx.pass(300);
+    let titles = incident_titles(&fx);
+    assert_eq!(titles.len(), 2, "{titles:?}\n{}", fx.log());
+    for unit in ["propolis-backup.service", "sensor-http.service"] {
+        let r = fx.record(&format!("unit:{unit}")).unwrap();
+        assert_eq!((r[17].as_str(), r[26].as_str()), ("1", "-"), "{unit}");
+    }
+}
+
+/// A pending transition is retried only with the gate full and only by a pass that sends: with
+/// the gate short of full it stays pending, unsent; an hourly pass while the light pass runs
+/// leaves it to the light pass.
+#[test]
+fn a_pending_transition_is_retried_only_with_the_gate_full_and_by_a_pass_that_sends() {
+    let mut fx = Fx::new();
+    fx.v2();
+    pending_backup_open(&fx);
+    failed_backup(&fx);
+    fx.pass(300);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    assert_eq!(
+        fx.record("unit:propolis-backup.service").unwrap()[26],
+        "open"
+    );
+
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.curl_answers("403|text/plain");
+    pending_backup_open(&fx);
+    failed_backup(&fx);
+    fx.hourly(300);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    let s = stamp(0);
+    assert_eq!(
+        fx.incident_lines(),
+        [inc_line(
+            "unit:propolis-backup.service",
+            [&s, "pool", "open", "pending", "hook", "w#7", &s]
+        )]
+    );
+}
+
+/// A message the hook sent without the lock that a server refused for good or for now is charged
+/// once, and the open is still the pass's to send, which it admits and posts; a refusal for good
+/// opens alert-path on the next pass.
+#[test]
+fn a_hook_send_that_was_refused_is_charged_and_the_pass_sends_its_own_open() {
+    for result in ["perm:403", "transient:503"] {
+        let mut fx = Fx::new();
+        fx.v2();
+        fx.private_topic(0);
+        spool_file(
+            &fx,
+            "var/lib/propolis/witness/hook/propolis-backup.service",
+            0,
+            1,
+            "proc.exit:1",
+            result,
+        );
+        failed_backup(&fx);
+        fx.pass(300);
+        let b = fx.record("unit:propolis-backup.service").unwrap();
+        let key = "unit:propolis-backup.service";
+        let (t, fired) = (stamp(300), stamp(0));
+        let mut lines = fx.incident_lines();
+        lines.sort();
+        let mut want = vec![
+            inc_line(
+                key,
+                [&t, "pool", "hook-open", result, "hook", &b[1], &fired],
+            ),
+            inc_line(key, [&t, "pool", "open", "ok", "light", &b[1], &t]),
+        ];
+        want.sort();
+        assert_eq!(lines, want, "{result}");
+        assert_eq!(fx.posts().len(), 1, "{result}");
+        assert_eq!((b[14].as_str(), b[17].as_str()), ("2", "1"), "{result}");
+        fx.pass(600);
+        let a = fx.record("alert:shell");
+        if result == "perm:403" {
+            let a = a.unwrap();
+            assert_eq!((a[7].as_str(), a[11].as_str()), ("open", "http.auth:403"));
+        } else {
+            assert!(a.is_none(), "{a:?}");
+        }
+    }
+}
+
+/// A child held pending by tie 1 (the daemon down while the database does not answer), folded
+/// under the database's incident and still failing half an hour after that resolved, opens on its
+/// own (folded_pending): under v2 it keeps the parent's id as its 35th field and its open says it
+/// was folded under it.
+#[test]
+fn a_pending_child_that_opens_after_its_parent_resolved_names_the_parent() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    fx.database("0|f|");
+    fx.daemon_account();
+    fx.stub_file("journal.daemon", CONNECT_LINE);
+    fx.stub_file("pg.answer", PG_REFUSED);
+    fx.unit(
+        "propolis.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("ExecMainStatus", "1"),
+        ],
+    );
+    fx.pass(0);
+    fx.pass(300);
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(d[7], "pending", "{d:?}");
+    let db = fx.record("db:local").unwrap()[1].clone();
+    fx.stub_file("pg.answer", "0|f|");
+    let mut t = 600;
+    while t <= 5400 && fx.record("unit:propolis.service").unwrap()[7] == "pending" {
+        fx.pass(t);
+        t += 300;
+    }
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (d[7].as_str(), d[13].as_str()),
+        ("open", "-"),
+        "{}",
+        fx.log()
+    );
+    assert_eq!(d.get(35).map(String::as_str), Some(db.as_str()), "{d:?}");
+    let posts = fx.posts();
+    assert!(
+        posts
+            .iter()
+            .any(|p| p.contains(&format!(" - was folded under {db}"))),
+        "{posts:?}"
+    );
+}
+
+/// The late open: a listener whose open the budget withheld for stage 1's hour (a W line,
+/// no post) is reminded an hour on, and that reminder is admitted in the late class of its own,
+/// posted, and marks the incident delivered, so its RESOLVED can follow.
+#[test]
+fn a_withheld_listener_open_goes_as_its_late_open_an_hour_on() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    ledger_of(
+        &fx,
+        &[
+            ("unit:sensor-ssh.service", stamp(0), "stage1", "ok"),
+            ("unit:sensor-ftp.service", stamp(0), "stage1", "ok"),
+        ],
+    );
+    fx.unit(
+        "sensor-http.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+        ],
+    );
+    fx.pass(0);
+    fx.pass(300);
+    let kh = kh8("unit:sensor-http.service");
+    assert_eq!(fx.record("unit:sensor-http.service").unwrap()[7], "open");
+    assert!(incident_titles(&fx).is_empty(), "{}", fx.log());
+    assert!(
+        fx.w_lines()
+            .iter()
+            .any(|w| w[2] == kh && w[6] == "stage1-cap"),
+        "{:?}",
+        fx.w_lines()
+    );
+    let mut t = 600;
+    while t <= 4500 && incident_titles(&fx).is_empty() {
+        fx.pass(t);
+        t += 300;
+    }
+    let lines: Vec<_> = fx
+        .incident_lines()
+        .into_iter()
+        .filter(|l| l[3] == kh)
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}\n{}", fx.log());
+    assert_eq!(
+        (
+            lines[0][2].as_str(),
+            lines[0][4].as_str(),
+            lines[0][6].as_str()
+        ),
+        ("late", "remind", "ok")
+    );
+    assert_eq!(fx.record("unit:sensor-http.service").unwrap()[17], "1");
+}
+
+/// The witness records each budget verdict it withholds by as a W line, its reason the budget's
+/// word, and posts nothing for it: the pool full for the hour (a non-listener's open), stage 1
+/// full (a listener's open) and the key's own cap (a reminder of a key that had six messages in a
+/// day).
+#[test]
+fn the_witness_writes_a_w_line_for_each_budget_verdict_that_withholds() {
+    for reason in ["pool", "stage1-cap", "key-cap"] {
+        let mut fx = Fx::new();
+        fx.v2();
+        fx.private_topic(0);
+        let key = match reason {
+            "stage1-cap" => "unit:sensor-http.service",
+            _ => "unit:shipper.service",
+        };
+        match reason {
+            "pool" => {
+                let others: Vec<(&str, String, &str, &str)> =
+                    ["push:a", "push:b", "push:c", "push:d"]
+                        .iter()
+                        .map(|k| (*k, stamp(0), "pool", "ok"))
+                        .collect();
+                ledger_of(&fx, &others);
+                failed_shipper(&fx);
+            }
+            "stage1-cap" => {
+                ledger_of(
+                    &fx,
+                    &[
+                        ("unit:sensor-ssh.service", stamp(0), "stage1", "ok"),
+                        ("unit:sensor-ftp.service", stamp(0), "stage1", "ok"),
+                    ],
+                );
+                fx.unit(
+                    "sensor-http.service",
+                    &[
+                        ("ActiveState", "failed"),
+                        ("SubState", "failed"),
+                        ("Result", "exit-code"),
+                    ],
+                );
+            }
+            _ => {
+                let early = format!("{}/{BOOT}/{}", WALL - 7200, UP - 7200);
+                let six: Vec<(&str, String, &str, &str)> =
+                    (0..6).map(|_| (key, early.clone(), "pool", "ok")).collect();
+                ledger_of(&fx, &six);
+                let mut rec = hook_record("w#7", "shipper.service", "ACT", "open", 0, "-");
+                for (i, v) in [(14, "6"), (17, "1"), (19, stamp(200).as_str()), (33, "-")] {
+                    rec = with_field(&rec, i, v);
+                }
+                fx.incidents(&[rec]);
+                failed_shipper(&fx);
+            }
+        }
+        fx.pass(0);
+        fx.pass(300);
+        assert!(
+            incident_titles(&fx).is_empty(),
+            "{reason}: {:?}",
+            fx.titles()
+        );
+        let kh = kh8(key);
+        let w = fx.w_lines();
+        assert!(
+            w.iter().any(|w| w[2] == kh && w[6] == reason),
+            "{reason}: {w:?}\n{}",
+            fx.log()
+        );
+    }
+}
+
+/// A spool file taken in on a pass whose records cannot be written is given back and charges
+/// nothing that counts (a pending charge is given back as noclaim); the pass that can write takes
+/// it in and charges each send once.
+#[test]
+fn a_spool_file_given_back_charges_nothing_and_is_charged_once_when_taken_in() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    spooled_sends(&fx);
+    fx.stub_file("disk.refuses", "*incidents*\n");
+    fx.pass(300);
+    let counted = |fx: &Fx| {
+        fx.incident_lines()
+            .into_iter()
+            .filter(|l| l[6] != "noclaim")
+            .collect::<Vec<_>>()
+    };
+    assert!(counted(&fx).is_empty(), "{:?}", fx.incident_lines());
+    assert!(
+        fx.p("run/propolis-witness/fallback/hook-sensor-http.service")
+            .exists()
+    );
+    assert!(
+        fx.p("var/lib/propolis/witness/hook/propolis-backup.service")
+            .exists()
+    );
+    std::fs::remove_file(fx.dir.path().join("disk.refuses")).unwrap();
+    fx.pass(600);
+    let lines = counted(&fx);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for key in ["unit:sensor-http.service", "unit:propolis-backup.service"] {
+        assert_eq!(
+            lines.iter().filter(|l| l[3] == kh8(key)).count(),
+            1,
+            "{key}: {lines:?}"
+        );
+    }
 }

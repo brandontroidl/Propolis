@@ -377,7 +377,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "10");
+    assert_eq!(version, "11");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);
@@ -819,27 +819,720 @@ fn pa_settings_load_keeps_valid_values_and_ignores_invalid_ones_by_name() {
     assert_eq!(r.get("PA_TARGET"), "0");
 }
 
+/// Every setting of the shell senders, with the file each came from.
+const SETTINGS_ALL: &str = r#"pa_settings_load
+for v in PA_URL PA_TOPIC PA_TOKEN PA_TARGET PA_TARGET_SRC PA_TARGET_SPLIT PA_URL_SRC PA_TOPIC_SRC \
+    PA_D_URL PA_D_TOPIC PA_D_TOKEN PA_D_TARGET PA_INVALID PA_INVALID_IN PA_D_INVALID \
+    PA_ALIAS_SET PA_ALIAS_SRC PA_DAILY_AT PA_DAILY_SRC PA_HB_STATE PA_PROFILE PA_PROFILE_STATE PA_PROFILE_SRC; do
+    printf '%s=%s\n' "$v" "${!v}"
+done
+"#;
+
+/// The URL and the topic make a target only when one file sets both: alert.env's URL with
+/// propolis.env's topic, or the reverse, is no target at all (and no target source), and the
+/// daemon's target, which is propolis.env's alone, is untouched by it.
 #[test]
-fn pa_settings_load_reads_only_propolis_env_so_a_target_never_comes_from_two_files() {
+fn a_target_whose_url_and_topic_come_from_different_files_is_no_target() {
+    let fx = Fx::new();
+    let split = |propolis: &str, alert: &str| {
+        fx.write("etc/propolis/propolis.env", propolis);
+        fx.write("etc/propolis/alert.env", alert);
+        let r = fx.run(SETTINGS_ALL);
+        assert_eq!(r.code, 0, "{}", r.err);
+        r
+    };
+    let r = split(
+        "PROPOLIS_OPS_NTFY_TOPIC=from-propolis\n",
+        "PROPOLIS_OPS_NTFY_URL=https://alert.example\n",
+    );
+    assert_eq!(
+        (r.get("PA_URL"), r.get("PA_TOPIC")),
+        ("https://alert.example".into(), "from-propolis".into())
+    );
+    assert_eq!(r.get("PA_TARGET"), "0");
+    assert_eq!(r.get("PA_TARGET_SRC"), "");
+    assert_eq!(r.get("PA_TARGET_SPLIT"), "1");
+    assert_eq!(
+        (r.get("PA_URL_SRC"), r.get("PA_TOPIC_SRC")),
+        ("alert.env".into(), "propolis.env".into())
+    );
+    assert_eq!(r.get("PA_D_TARGET"), "0");
+
+    let r = split(
+        "PROPOLIS_OPS_NTFY_URL=https://daemon.example\n",
+        "PROPOLIS_OPS_NTFY_TOPIC=from-alert\n",
+    );
+    assert_eq!(r.get("PA_TARGET"), "0");
+    assert_eq!(r.get("PA_TARGET_SRC"), "");
+    assert_eq!(r.get("PA_TARGET_SPLIT"), "1");
+
+    // A whole target in propolis.env and only a URL in alert.env: the shell senders have none,
+    // the daemon keeps its own.
+    let r = split(
+        "PROPOLIS_OPS_NTFY_URL=https://daemon.example\nPROPOLIS_OPS_NTFY_TOPIC=dtopic\n",
+        "PROPOLIS_OPS_NTFY_URL=https://alert.example\n",
+    );
+    assert_eq!(r.get("PA_TARGET"), "0");
+    assert_eq!(r.get("PA_TARGET_SPLIT"), "1");
+    assert_eq!(r.get("PA_D_TARGET"), "1");
+    assert_eq!(r.get("PA_D_URL"), "https://daemon.example");
+
+    // Both in one file: a target, and no split.
+    let r = split(
+        "PROPOLIS_OPS_NTFY_TOPIC=from-propolis\n",
+        "PROPOLIS_OPS_NTFY_URL=https://alert.example\nPROPOLIS_OPS_NTFY_TOPIC=from-alert\n",
+    );
+    assert_eq!(r.get("PA_TARGET"), "1");
+    assert_eq!(r.get("PA_TARGET_SRC"), "alert.env");
+    assert_eq!(r.get("PA_TARGET_SPLIT"), "0");
+}
+
+/// alert.env wins over propolis.env for each setting of the shell senders it assigns: the target,
+/// the alias, the daily time and the heartbeat URL. The token goes with the target's file, so a
+/// token written for propolis.env's server never goes to alert.env's. The daemon's target and
+/// token (PA_D_*) are propolis.env's alone, and today's failure hook is compared with those.
+#[test]
+fn alert_env_wins_over_propolis_env_for_the_shell_senders_and_the_daemon_target_stays_propolis_env()
+{
     let fx = Fx::new();
     fx.write(
         "etc/propolis/propolis.env",
-        "PROPOLIS_OPS_NTFY_TOPIC=from-propolis\n",
+        "PROPOLIS_OPS_NTFY_URL=https://daemon.example\nPROPOLIS_OPS_NTFY_TOPIC=dtopic\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk_daemon\nPROPOLIS_OPS_HOST_ALIAS=north-relay\n\
+         PROPOLIS_OPS_DAILY_AT=07:00\n",
     );
     fx.write(
         "etc/propolis/alert.env",
-        "PROPOLIS_OPS_NTFY_URL=https://alert.example\nPROPOLIS_OPS_NTFY_TOPIC=from-alert\n",
+        "PROPOLIS_OPS_NTFY_URL=https://alert.example/\nPROPOLIS_OPS_NTFY_TOPIC=atopic\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk_alert\nPROPOLIS_OPS_HOST_ALIAS=south-relay\n\
+         PROPOLIS_OPS_DAILY_AT=09:15\n",
     );
-    let r = fx.run(SETTINGS_DUMP);
+    let r = fx.run(&format!(
+        "{SETTINGS_ALL}if pa_hook_differs; then echo differs=1; else echo differs=0; fi\n\
+         echo \"hook_url=$PA_HOOK_URL\""
+    ));
+    assert_eq!(r.code, 0, "{}", r.err);
+    for (k, v) in [
+        ("PA_URL", "https://alert.example"),
+        ("PA_TOPIC", "atopic"),
+        ("PA_TOKEN", "tk_alert"),
+        ("PA_TARGET", "1"),
+        ("PA_TARGET_SRC", "alert.env"),
+        ("PA_D_URL", "https://daemon.example"),
+        ("PA_D_TOPIC", "dtopic"),
+        ("PA_D_TOKEN", "tk_daemon"),
+        ("PA_D_TARGET", "1"),
+        ("PA_ALIAS_SET", "south-relay"),
+        ("PA_ALIAS_SRC", "alert.env"),
+        ("PA_DAILY_AT", "09:15"),
+        ("PA_DAILY_SRC", "alert.env"),
+    ] {
+        assert_eq!(r.get(k), v, "{k}");
+    }
+    assert_eq!(
+        (r.get("differs"), r.get("hook_url")),
+        ("0".into(), "https://daemon.example".into()),
+        "today's hook is compared with the daemon's target, not with alert.env"
+    );
+
+    // alert.env with a target and no token: the post carries none, not propolis.env's.
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://alert.example\nPROPOLIS_OPS_NTFY_TOPIC=atopic\n",
+    );
+    let r = fx.run(SETTINGS_ALL);
+    assert_eq!(r.get("PA_TOKEN"), "");
+    assert_eq!(r.get("PA_D_TOKEN"), "tk_daemon");
+    assert_eq!(
+        (r.get("PA_ALIAS_SET"), r.get("PA_ALIAS_SRC")),
+        ("north-relay".into(), "propolis.env".into())
+    );
+    assert_eq!(r.get("PA_DAILY_SRC"), "propolis.env");
+
+    // alert.env without a target leaves propolis.env's in place for the shell senders too.
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_WITNESS_HEARTBEAT_URL=https://hb.example/x\n",
+    );
+    let r = fx.run(SETTINGS_ALL);
+    assert_eq!(r.get("PA_TARGET_SRC"), "propolis.env");
+    assert_eq!(r.get("PA_TOKEN"), "tk_daemon");
+    assert_eq!(r.get("PA_HB_STATE"), "set");
+
+    // A key alert.env leaves empty is not set there: a template copied with empty lines does not
+    // blank what propolis.env sets.
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=\nPROPOLIS_OPS_NTFY_TOPIC=\nPROPOLIS_OPS_NTFY_TOKEN=\nPROPOLIS_OPS_HOST_ALIAS=\n",
+    );
+    let r = fx.run(SETTINGS_ALL);
+    assert_eq!(r.get("PA_TARGET_SRC"), "propolis.env");
+    assert_eq!(r.get("PA_TOKEN"), "tk_daemon");
+    assert_eq!(r.get("PA_ALIAS_SET"), "north-relay");
+
+    // A value alert.env assigns wins even when it is invalid: the shell senders ignore it and fall
+    // back to no value, never to propolis.env's, and the file is named with it.
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=alert.example\nPROPOLIS_OPS_NTFY_TOPIC=atopic\n",
+    );
+    let r = fx.run(SETTINGS_ALL);
+    assert_eq!(r.get("PA_URL"), "");
+    assert_eq!(r.get("PA_TARGET"), "0");
+    assert_eq!(r.get("PA_INVALID"), "PROPOLIS_OPS_NTFY_URL");
+    assert_eq!(r.get("PA_INVALID_IN"), "PROPOLIS_OPS_NTFY_URL=alert.env");
+    assert_eq!(r.get("PA_D_INVALID"), "");
+    assert_eq!(r.get("PA_D_TARGET"), "1");
+}
+
+/// PROPOLIS_ALERT_PROFILE is read (alert.env over propolis.env) and validated: legacy and v2 are
+/// its values, anything else is invalid and read as legacy. Whatever the file says, this release
+/// runs legacy: only the test seam PA_TEST_PROFILE turns v2 on, and only under a non-empty root,
+/// which no unit and no script passes, so a production run cannot reach it.
+#[test]
+fn the_profile_is_read_and_validated_and_only_the_test_seam_under_a_root_reaches_v2() {
+    let fx = Fx::new();
+    let profile = |propolis: &str, alert: Option<&str>, env: &[(&str, &str)]| {
+        fx.write("etc/propolis/propolis.env", propolis);
+        match alert {
+            Some(a) => fx.write("etc/propolis/alert.env", a),
+            None => {
+                let _ = std::fs::remove_file(fx.p("etc/propolis/alert.env"));
+            }
+        }
+        let r = fx.run_env(SETTINGS_ALL, env);
+        assert_eq!(r.code, 0, "{}", r.err);
+        (
+            r.get("PA_PROFILE"),
+            r.get("PA_PROFILE_STATE"),
+            r.get("PA_PROFILE_SRC"),
+        )
+    };
+    let t = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
+    assert_eq!(profile("", None, &[]), t("legacy", "unset", ""));
+    assert_eq!(
+        profile("PROPOLIS_ALERT_PROFILE=legacy\n", None, &[]),
+        t("legacy", "legacy", "propolis.env")
+    );
+    assert_eq!(
+        profile("PROPOLIS_ALERT_PROFILE=v2\n", None, &[]),
+        t("legacy", "v2", "propolis.env"),
+        "v2 is read, and not in force in this release"
+    );
+    for bad in ["V2", "v3", "legacy2", "\"v2 \"x", "on"] {
+        assert_eq!(
+            profile(&format!("PROPOLIS_ALERT_PROFILE={bad}\n"), None, &[]),
+            t("legacy", "invalid", "propolis.env"),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        profile(
+            "PROPOLIS_ALERT_PROFILE=v2\n",
+            Some("PROPOLIS_ALERT_PROFILE=legacy\n"),
+            &[]
+        ),
+        t("legacy", "legacy", "alert.env"),
+        "alert.env wins"
+    );
+    assert_eq!(
+        profile("", None, &[("PA_TEST_PROFILE", "v2")]),
+        t("v2", "unset", ""),
+        "the seam under a root"
+    );
+    assert_eq!(
+        profile("", None, &[("PA_TEST_PROFILE", "other")]),
+        t("legacy", "unset", ""),
+        "the seam takes only a profile's name"
+    );
+    // pa_init with an empty root, which is how every unit and script runs it: the seam is ignored.
+    let r = fx.run_raw(
+        &format!("set -u -o pipefail\nsource \"$LIB\"\npa_init ''\n{SETTINGS_ALL}"),
+        &[("PA_TEST_PROFILE", "v2")],
+    );
+    assert_eq!(r.get("PA_PROFILE"), "legacy", "{}", r.err);
+}
+
+/// On a collector, and on a host whose role cannot be told, the gate holds pointer unless the
+/// credential a post carries (the token, or without one the user and password in the URL) is
+/// proven unable to read the topic, or there is none. An answer of unknown, a stored answer about
+/// another credential, and a line from before credentials were named all hold pointer; a single
+/// box is not held by this rule.
+#[test]
+fn on_a_collector_the_gate_holds_pointer_unless_the_credential_a_post_carries_is_proven_noread() {
+    let fx = Fx::salted(SALT);
+    let fresh = "999000/abcdef01/4000";
+    let gate = |url: &str, token: &str, tk: &str, cred: &str, role: &str| -> String {
+        let mut env = format!("PROPOLIS_OPS_NTFY_URL={url}\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\n");
+        if !token.is_empty() {
+            env.push_str(&format!("PROPOLIS_OPS_NTFY_TOKEN={token}\n"));
+        }
+        fx.write("etc/propolis/propolis.env", &env);
+        let r = fx.run_env(
+            &format!(
+                "pa_settings_load\nb=\"$(pa_readcheck_binding \"$PA_URL\" \"$PA_TOPIC\")\"\n\
+                 c='{cred}'; [ \"$c\" != cur ] || c=\"$(pa_cred_fp \"$PA_URL\" \"$PA_TOKEN\")\"\n\
+                 tab=$'\\t'\n\
+                 printf '#readcheck v1 g=1\\nR\\t%s\\t{fresh}\\trefused\\t{fresh}\\trefused\\t{tk}\\t403\\t403\\tboth\\t403%s\\n' \
+                 \"$b\" \"${{c:+$tab$c}}\" > \"$PA_STATE/readcheck\"\n\
+                 PA_ROLE={role}; echo \"gate=$(pa_gate)\""
+            ),
+            &NOW,
+        );
+        r.get("gate")
+    };
+    let https = "https://ntfy.invalid";
+    let tok = "tk_x";
+    assert_eq!(
+        gate(https, tok, "unknown", "cur", "collector"),
+        "pointer:token-unknown"
+    );
+    assert_eq!(gate(https, tok, "noread", "cur", "collector"), "full");
+    assert_eq!(
+        gate(https, tok, "reads", "cur", "collector"),
+        "pointer:token-reads"
+    );
+    assert_eq!(
+        gate(https, tok, "noread", "", "collector"),
+        "pointer:token-unknown",
+        "a line that does not say which credential it is about"
+    );
+    assert_eq!(
+        gate(https, tok, "noread", "token:00000000", "collector"),
+        "pointer:token-unknown",
+        "an answer about another token"
+    );
+    assert_eq!(
+        gate(https, tok, "unknown", "cur", "unknown"),
+        "pointer:token-unknown",
+        "a role that cannot be told"
+    );
+    assert_eq!(gate(https, tok, "unknown", "cur", "single"), "full");
+    assert_eq!(
+        gate(https, "", "reads", "token:00000000", "collector"),
+        "full",
+        "no credential: nothing a post carries can read"
+    );
+    let creds = "https://alice:pw@ntfy.invalid";
+    assert_eq!(gate(creds, "", "noread", "cur", "collector"), "full");
+    assert_eq!(
+        gate(creds, "", "unknown", "cur", "collector"),
+        "pointer:token-unknown"
+    );
+    assert_eq!(
+        gate(creds, "", "-", "", "collector"),
+        "pointer:token-unknown",
+        "credentials in the URL that were never asked"
+    );
+    assert_eq!(
+        gate("http://ntfy.invalid", tok, "unknown", "cur", "collector"),
+        "pointer:insecure"
+    );
+}
+
+/// A credential's answer is about the credential it was asked with: the stored line names it by
+/// kind and a salted hash (token:<8 hex>, or url:<8 hex> for a user and password in the URL),
+/// appended as the last field, and names none when nothing was carried, so the line is the one an
+/// older release wrote. On a transient attempt a fresh definite answer about the credential is
+/// kept, never replaced by the stored one; an unknown answer keeps a stored definite one only when
+/// that one is about the same credential.
+#[test]
+fn the_stored_line_names_its_credential_and_a_transient_attempt_keeps_a_fresh_credential_answer() {
+    let fx = Fx::salted(SALT);
+    let k8 = fx.run("pa_token8 tk_x").out;
+    assert!(k8.len() == 8, "{k8}");
+    let old = |tk: &str, cred: &str| {
+        fx.write(
+            "var/lib/propolis/witness/readcheck",
+            &format!(
+                "#readcheck v1 g=3\nR\t{RC_BINDING}\t999000/abcdef01/4000\trefused\t999000/abcdef01/4000\trefused\t{tk}\t403\t403\tboth\t403{cred}\n"
+            ),
+        );
+    };
+    let merge = |class: &str, tk: &str, fp: &str| {
+        fx.run_env(
+            &format!(
+                "pa_now; have=0; _pa_rc_line shell && have=1\n\
+                 PA_RC_CLASS={class} PA_RC_TOKEN={tk} PA_RC_JSON=503 PA_RC_RAW=403 PA_RC_SSE=403\n\
+                 pa_readcheck_merge both {RC_BINDING} \"$have\" '{fp}'"
+            ),
+            &NOW,
+        )
+        .out
+    };
+    let cur = format!("token:{k8}");
+    old("reads", &format!("\t{cur}"));
+    assert_eq!(
+        merge("transient", "noread", &cur),
+        format!(
+            "R\t{RC_BINDING}\t1000000/abcdef01/5000\ttransient\t999000/abcdef01/4000\trefused\tnoread\t403\t403\tboth\t403\t{cur}\n"
+        ),
+        "a fresh noread on a transient attempt is kept"
+    );
+    assert_eq!(
+        merge("transient", "unknown", &cur),
+        format!(
+            "R\t{RC_BINDING}\t1000000/abcdef01/5000\ttransient\t999000/abcdef01/4000\trefused\treads\t403\t403\tboth\t403\t{cur}\n"
+        ),
+        "an unknown answer keeps the stored one about the same token"
+    );
+    assert_eq!(
+        merge("refused", "unknown", "token:00000000"),
+        format!(
+            "R\t{RC_BINDING}\t1000000/abcdef01/5000\trefused\t1000000/abcdef01/5000\trefused\tunknown\t503\t403\tboth\t403\ttoken:00000000\n"
+        ),
+        "a stored answer about another token is not carried over"
+    );
+    old("-", "");
+    assert_eq!(
+        merge("refused", "-", "-"),
+        format!(
+            "R\t{RC_BINDING}\t1000000/abcdef01/5000\trefused\t1000000/abcdef01/5000\trefused\t-\t503\t403\tboth\t403\n"
+        ),
+        "no credential: the line an older release wrote"
+    );
+    let r = fx.run_env(
+        "pa_settings_load; PA_URL=https://alice:pw@ntfy.invalid PA_TOKEN=\n\
+         echo \"url=$(pa_cred_fp \"$PA_URL\" '')\"\necho \"tok=$(pa_cred_fp \"$PA_URL\" tk_x)\"\n\
+         echo \"none=$(pa_cred_fp https://ntfy.invalid '')\"",
+        &NOW,
+    );
+    assert_eq!(r.get("tok"), cur, "a token replaces any user in the URL");
+    assert_eq!(r.get("none"), "-");
+    let url = r.get("url");
+    assert!(
+        url.starts_with("url:") && url.len() == 12 && !url.contains("alice"),
+        "{url}"
+    );
+    // Without a salt nothing can be named, and nothing then matches.
+    let bare = Fx::new();
+    let r = bare
+        .run("rc=0; v=\"$(pa_cred_fp https://ntfy.invalid tk_x)\" || rc=$?; echo \"v=$v rc=$rc\"");
+    assert_eq!(r.get("v"), "? rc=1");
+}
+
+/// Over plain http a credential's read changes no decision (the gate never gives full there), and
+/// the request would carry it in clear: the three anonymous GETs are made and the credential is
+/// not asked, which the run says.
+#[test]
+fn no_request_carrying_a_credential_is_made_over_plain_http() {
+    let fx = Fx::new();
+    fx.with_curl();
+    let show = "pa_readcheck_run \"$U\" '{T}' \"$K\"\necho \"class=$PA_RC_CLASS token=$PA_RC_TOKEN cred=$PA_RC_CRED asked=$PA_RC_CRED_ASKED\"";
+    let show = show.replace("{T}", RC_TOPIC);
+    let deny = "403|text/plain|";
+    let env = |u: &'static str, k: &'static str| {
+        vec![
+            ("U", u),
+            ("K", k),
+            ("RC_JSON", deny),
+            ("RC_RAW", deny),
+            ("RC_SSE", deny),
+            ("RC_TOKEN_ANSWER", "401||"),
+        ]
+    };
+    let r = fx.run_env(&show, &env("http://ntfy.invalid", "tk_x"));
+    assert_eq!(
+        r.get("class"),
+        "refused token=unknown cred=token asked=0",
+        "{}",
+        r.err
+    );
+    assert_eq!(
+        fx.log().lines().filter(|l| l.starts_with("curl ")).count(),
+        3
+    );
+    assert!(!fx.log().contains("header file holds the token"));
+    let r = fx.run_env(&show, &env("http://alice:pw@ntfy.invalid", ""));
+    assert_eq!(r.get("class"), "refused token=unknown cred=url asked=0");
+    assert_eq!(
+        fx.log().lines().filter(|l| l.starts_with("curl ")).count(),
+        6
+    );
+    let r = fx.run_env(&show, &env("https://ntfy.invalid", "tk_x"));
+    assert_eq!(r.get("class"), "refused token=noread cred=token asked=1");
+    assert_eq!(
+        fx.log().lines().filter(|l| l.starts_with("curl ")).count(),
+        10
+    );
+}
+
+/// The banner reads an anonymous refusal as proven where the gate holds pointer only for want of
+/// knowing what a collector's credential reads: the alert words go on to VERIFIED, as for a token
+/// that reads.
+#[test]
+fn the_banner_on_a_collector_whose_credential_is_not_known_still_says_the_refusal_is_proven() {
+    let fx = Fx::salted(SALT);
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!(
+            "PROPOLIS_OPS_NTFY_URL={RC_URL}\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\nPROPOLIS_OPS_NTFY_TOKEN=tk_x\n"
+        ),
+    );
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!(
+            "#readcheck v1 g=1\nR\t{RC_BINDING}\t999000/abcdef01/4000\trefused\t999000/abcdef01/4000\trefused\tunknown\t403\t403\tboth\t403\n"
+        ),
+    );
+    let r = fx.run_env(
+        "PA_ROLE=collector; pa_settings_load; echo \"gate=$(pa_gate)\"; pa_banner",
+        &NOW,
+    );
+    assert_eq!(r.get("gate"), "pointer:token-unknown", "{}", r.err);
+    assert!(
+        r.out
+            .contains("[propolis 13:46 UTC] alerts: NOT VERIFIED (never)\n"),
+        "{}",
+        r.out
+    );
+}
+
+/// A test page proves the shell target: with the target in alert.env, VERIFIED is about that
+/// target and its token, and today's failure hook, which posts to propolis.env's target, reading
+/// propolis.env its own way does not undo it (it does where the shell target is propolis.env's).
+#[test]
+fn verified_follows_the_shell_target_from_alert_env_and_not_todays_hooks_reading() {
+    let fx = Fx::salted(SALT);
+    // The hook reads no indented line: its reading of propolis.env differs from the library's.
+    fx.write(
+        "etc/propolis/propolis.env",
+        "  PROPOLIS_OPS_NTFY_URL=https://daemon.example\nPROPOLIS_OPS_NTFY_TOPIC=dtopic\n",
+    );
+    fx.write(
+        "etc/propolis/alert.env",
+        &format!(
+            "PROPOLIS_OPS_NTFY_URL={RC_URL}\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\nPROPOLIS_OPS_NTFY_TOKEN=tk_x\n"
+        ),
+    );
+    let show = "pa_settings_load\nb=\"$(pa_readcheck_binding \"$PA_URL\" \"$PA_TOPIC\")\"\n\
+                k=\"$(pa_token8 \"$PA_TOKEN\")\"\n\
+                printf '#testpage v1 g=1\\nT\\tabc123\\t999000/abcdef01/4000\\t%s\\t%s\\tok\\t999100/abcdef01/4100\\t0\\n' \"$b\" \"$k\" > \"$PA_STATE/testpage\"\n\
+                pa_settings_load; echo \"v=$(pa_verified)\"";
+    let r = fx.run_env(show, &NOW);
+    assert_eq!(r.get("v"), "VERIFIED 15 min", "{}", r.err);
+    // The same page with the target moved back to propolis.env no longer matches it.
+    std::fs::remove_file(fx.p("etc/propolis/alert.env")).unwrap();
+    let r = fx.run_env("pa_settings_load; echo \"v=$(pa_verified)\"", &NOW);
+    assert_eq!(r.get("v"), "NOT VERIFIED (changed)");
+}
+
+/// A token goes only with the target of its own file: where alert.env sets a token and no target,
+/// the shell senders post to propolis.env's target with propolis.env's token, and the token in
+/// alert.env is named as ignored so the operator does not take it for the one in use.
+#[test]
+fn a_token_in_alert_env_without_a_target_there_is_ignored_and_named_as_ignored() {
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://daemon.example\nPROPOLIS_OPS_NTFY_TOPIC=dtopic\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk_daemon\n",
+    );
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_TOKEN=tk_alert\n",
+    );
+    let show = format!("{SETTINGS_ALL}echo \"PA_TOKEN_IGNORED=$PA_TOKEN_IGNORED\"");
+    let r = fx.run(&show);
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(r.get("PA_TARGET_SRC"), "propolis.env");
+    assert_eq!(
+        r.get("PA_TOKEN"),
+        "tk_daemon",
+        "the token of the target's own file"
+    );
+    assert_eq!(r.get("PA_TOKEN_IGNORED"), "1");
+    // With the whole target in alert.env its token is the one used, and nothing is ignored.
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://alert.example\nPROPOLIS_OPS_NTFY_TOPIC=atopic\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk_alert\n",
+    );
+    let r = fx.run(&show);
+    assert_eq!(r.get("PA_TOKEN"), "tk_alert");
+    assert_eq!(r.get("PA_TOKEN_IGNORED"), "0");
+    std::fs::remove_file(fx.p("etc/propolis/alert.env")).unwrap();
+    let r = fx.run(&show);
+    assert_eq!(r.get("PA_TOKEN_IGNORED"), "0");
+}
+
+/// An alert.env that is a directory, or a link to a file that does not exist, sets nothing: every
+/// setting falls back to propolis.env, the token with the target.
+#[test]
+fn an_alert_env_that_is_a_directory_or_a_dangling_link_falls_back_to_propolis_env() {
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://daemon.example\nPROPOLIS_OPS_NTFY_TOPIC=dtopic\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk_daemon\n",
+    );
+    std::fs::create_dir_all(fx.p("etc/propolis/alert.env")).unwrap();
+    let r = fx.run(SETTINGS_ALL);
     assert_eq!(r.code, 0, "{}", r.err);
     assert_eq!(
-        r.get("PA_URL"),
-        "",
-        "alert.env is not read before the v2 senders exist"
+        (r.get("PA_TARGET_SRC"), r.get("PA_TOKEN")),
+        ("propolis.env".into(), "tk_daemon".into()),
+        "a directory"
     );
-    assert_eq!(r.get("PA_TOPIC"), "from-propolis");
-    assert_eq!(r.get("PA_TARGET"), "0");
-    assert_eq!(r.get("PA_TARGET_SRC"), "");
+    std::fs::remove_dir(fx.p("etc/propolis/alert.env")).unwrap();
+    std::os::unix::fs::symlink(
+        fx.p("etc/propolis/missing.env"),
+        fx.p("etc/propolis/alert.env"),
+    )
+    .unwrap();
+    let r = fx.run(SETTINGS_ALL);
+    assert_eq!(
+        (r.get("PA_TARGET_SRC"), r.get("PA_TOKEN")),
+        ("propolis.env".into(), "tk_daemon".into()),
+        "a dangling link"
+    );
+}
+
+/// A transient attempt keeps a stored token class only while the stored line is about the
+/// credential the attempt was made with. A line that names another credential, or none (every
+/// line an older release wrote), is not carried over: the attempt's credential is stored with the
+/// class unknown, so the light pass stops asking until the hourly pass and the gate holds pointer
+/// meanwhile. An unknown answer with no credential named keeps nothing either.
+#[test]
+fn a_transient_attempt_over_a_line_about_another_credential_stores_unknown_with_the_current_one() {
+    let fx = Fx::salted(SALT);
+    let k8 = fx.run("pa_token8 tk_x").out;
+    let cur = format!("token:{k8}");
+    let old = format!(
+        "#readcheck v1 g=3\nR\t{RC_BINDING}\t999000/abcdef01/4000\trefused\t999000/abcdef01/4000\trefused\tnoread\t403\t403\tboth\t403\n"
+    );
+    let merge = |class: &str, fp: &str| {
+        fx.write("var/lib/propolis/witness/readcheck", &old);
+        fx.run_env(
+            &format!(
+                "pa_now; have=0; _pa_rc_line shell && have=1\n\
+                 PA_RC_CLASS={class} PA_RC_TOKEN=unknown PA_RC_JSON=503 PA_RC_RAW=403 PA_RC_SSE=403\n\
+                 pa_readcheck_merge both {RC_BINDING} \"$have\" '{fp}'"
+            ),
+            &NOW,
+        )
+        .out
+    };
+    assert_eq!(
+        merge("transient", &cur),
+        format!(
+            "R\t{RC_BINDING}\t1000000/abcdef01/5000\ttransient\t999000/abcdef01/4000\trefused\tunknown\t403\t403\tboth\t403\t{cur}\n"
+        ),
+        "an older line names no credential: its noread is not kept for this one"
+    );
+    assert_eq!(
+        merge("refused", ""),
+        format!(
+            "R\t{RC_BINDING}\t1000000/abcdef01/5000\trefused\t1000000/abcdef01/5000\trefused\tunknown\t503\t403\tboth\t403\n"
+        ),
+        "a credential that cannot be named keeps no stored answer"
+    );
+}
+
+/// The stored token class is kept through an unknown answer only when the token GET got no
+/// answer (000, 429, a 5xx). A definite answer that is not a refusal (a redirect, a 404) stores
+/// unknown, and the gate on a collector then holds pointer.
+#[test]
+fn a_definite_token_answer_that_is_not_a_refusal_replaces_a_stored_noread() {
+    let fx = Fx::salted(SALT);
+    fx.with_curl();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!(
+            "PROPOLIS_OPS_NTFY_URL={RC_URL}\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\nPROPOLIS_OPS_NTFY_TOKEN=tk_x\n"
+        ),
+    );
+    let run = |answer: &str| {
+        let script = format!(
+            "pa_settings_load; pa_now\n\
+             cur=\"$(pa_cred_fp \"$PA_URL\" \"$PA_TOKEN\")\"\n\
+             printf '#readcheck v1 g=1\\nR\\t{RC_BINDING}\\t999000/abcdef01/4000\\trefused\\t999000/abcdef01/4000\\trefused\\tnoread\\t403\\t403\\tboth\\t403\\t%s\\n' \"$cur\" > \"$PA_STATE/readcheck\"\n\
+             pa_readcheck_run \"$PA_URL\" \"$PA_TOPIC\" \"$PA_TOKEN\"\n\
+             have=0; _pa_rc_line shell && have=1\n\
+             line=\"$(pa_readcheck_merge both {RC_BINDING} \"$have\" \"$cur\")\"\n\
+             printf '#readcheck v1 g=2\\n%s\\n' \"$line\" > \"$PA_STATE/readcheck\"\n\
+             IFS=$'\\t' read -r -a f <<< \"$line\"\n\
+             echo \"tk=${{f[6]}}\"; PA_ROLE=collector; echo \"gate=$(pa_gate)\""
+        );
+        let deny = "403|text/plain|";
+        fx.run_env(
+            &script,
+            &[
+                NOW[0],
+                NOW[1],
+                NOW[2],
+                ("RC_JSON", deny),
+                ("RC_RAW", deny),
+                ("RC_SSE", deny),
+                ("RC_TOKEN_ANSWER", answer),
+            ],
+        )
+    };
+    for answer in ["302||", "404||"] {
+        let r = run(answer);
+        assert_eq!(r.get("tk"), "unknown", "{answer}: {}", r.err);
+        assert_eq!(r.get("gate"), "pointer:token-unknown", "{answer}");
+    }
+    for answer in ["503||", "000||", "429||"] {
+        let r = run(answer);
+        assert_eq!(r.get("tk"), "noread", "{answer}: {}", r.err);
+        assert_eq!(r.get("gate"), "full", "{answer}");
+    }
+}
+
+/// With no target for the shell senders (a URL in alert.env and the topic left in propolis.env,
+/// or a topic alert.env sets that is not valid) the daemon and today's failure hook still post to
+/// propolis.env's target: the banner says what is known of that topic, READABLE included, and
+/// where it is not known that today's hook still posts, never `journal only`.
+#[test]
+fn the_banner_without_a_shell_target_judges_the_topic_todays_hook_still_posts_to() {
+    let fx = Fx::salted(SALT);
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!("PROPOLIS_OPS_NTFY_URL={RC_URL}\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\n"),
+    );
+    let line = |class: &str, role: &str| {
+        fx.write(
+            "var/lib/propolis/witness/readcheck",
+            &format!(
+                "#readcheck v1 g=1\nR\t{RC_BINDING}\t999000/abcdef01/4000\t{class}\t999000/abcdef01/4000\t{class}\t-\t200\t200\t{role}\t200\n"
+            ),
+        );
+    };
+    let alerts = || {
+        let r = fx.run_env("pa_banner", &NOW);
+        assert_eq!(r.code, 0, "{}", r.err);
+        r.out
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .trim_start_matches("[propolis 13:46 UTC] ")
+            .to_string()
+    };
+    for alert in [
+        "PROPOLIS_OPS_NTFY_URL=https://other.invalid\n",
+        "PROPOLIS_OPS_NTFY_URL=https://other.invalid\nPROPOLIS_OPS_NTFY_TOPIC=not a topic\n",
+    ] {
+        fx.write("etc/propolis/alert.env", alert);
+        for role in ["both", "daemon"] {
+            line("readable", role);
+            assert_eq!(
+                alerts(),
+                "alerts: topic READABLE by anyone",
+                "{alert} {role}"
+            );
+        }
+        line("redirect", "both");
+        assert_eq!(alerts(), "alerts: topic not proven private (redirect)");
+        line("refused", "both");
+        assert_eq!(
+            alerts(),
+            "alerts: no shell target; failure hook still posts"
+        );
+    }
+    // Nothing that posts: the journal is where failure alerts go.
+    fx.write("etc/propolis/propolis.env", "");
+    assert_eq!(alerts(), "alerts: NO PUSH TARGET (journal only)");
 }
 
 #[test]
@@ -5239,22 +5932,25 @@ fn pa_readcheck_merge_keeps_a_definite_answer_through_a_transient_attempt() {
 /// the merged line keeps `reads`, and the gate on a collector stays pointer:token-reads.
 #[test]
 fn a_token_get_without_an_answer_keeps_a_stored_reads_and_the_collector_gate_stays_pointer() {
-    let fx = Fx::new();
+    let fx = Fx::salted(SALT);
     fx.write(
         "etc/propolis/propolis.env",
-        &format!("PROPOLIS_OPS_NTFY_URL={RC_URL}\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\n"),
+        &format!(
+            "PROPOLIS_OPS_NTFY_URL={RC_URL}\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\nPROPOLIS_OPS_NTFY_TOKEN={RC_TOKEN}\n"
+        ),
     );
+    let fp = format!("token:{}", fx.run(&format!("pa_token8 {RC_TOKEN}")).out);
     fx.write(
         "var/lib/propolis/witness/readcheck",
         &format!(
-            "#readcheck v1 g=3\nR\t{RC_BINDING}\t999000/abcdef01/4000\trefused\t999000/abcdef01/4000\trefused\treads\t403\t403\tboth\t403\n"
+            "#readcheck v1 g=3\nR\t{RC_BINDING}\t999000/abcdef01/4000\trefused\t999000/abcdef01/4000\trefused\treads\t403\t403\tboth\t403\t{fp}\n"
         ),
     );
     let r = fx.run_env(
         &format!(
             "pa_now; have=0; _pa_rc_line shell && have=1\n\
              PA_RC_CLASS=refused PA_RC_TOKEN=unknown PA_RC_JSON=403 PA_RC_RAW=403 PA_RC_SSE=403\n\
-             line=\"$(pa_readcheck_merge both {RC_BINDING} \"$have\")\"\n\
+             line=\"$(pa_readcheck_merge both {RC_BINDING} \"$have\" {fp})\"\n\
              echo \"line=$line\"\n\
              printf '#readcheck v1 g=4\\n%s\\n' \"$line\" > \"$PA_STATE/readcheck\"\n\
              pa_settings_load; PA_ROLE=collector; echo \"gate=$(pa_gate)\""
@@ -5264,7 +5960,7 @@ fn a_token_get_without_an_answer_keeps_a_stored_reads_and_the_collector_gate_sta
     assert_eq!(
         r.get("line"),
         format!(
-            "R\t{RC_BINDING}\t1000000/abcdef01/5000\trefused\t1000000/abcdef01/5000\trefused\treads\t403\t403\tboth\t403"
+            "R\t{RC_BINDING}\t1000000/abcdef01/5000\trefused\t1000000/abcdef01/5000\trefused\treads\t403\t403\tboth\t403\t{fp}"
         ),
         "{}",
         r.err
@@ -5435,8 +6131,13 @@ fn pa_gate_gives_full_only_when_every_rule_holds_and_names_the_rule_that_failed(
         ),
         "pointer:stale"
     );
-    // Rule 7: on a collector, a token that cannot read the topic.
-    let reads = line(RC_BINDING, fresh, fresh, "refused", "reads");
+    // Rule 7: on a collector, a token that cannot read the topic. The stored answer is the one
+    // about the token configured now.
+    let https = format!("{https}PROPOLIS_OPS_NTFY_TOKEN={RC_TOKEN}\n");
+    fx.write("var/lib/propolis/witness/id-salt", &format!("{SALT}\n"));
+    let fp = format!("token:{}", fx.run(&format!("pa_token8 {RC_TOKEN}")).out);
+    let reads = line(RC_BINDING, fresh, fresh, "refused", "reads")
+        .replace("\t403\n", &format!("\t403\t{fp}\n"));
     assert_eq!(
         gate(&https, Some(&reads), "PA_ROLE=collector"),
         "pointer:token-reads"
@@ -5464,11 +6165,14 @@ fn pa_gate_gives_full_only_when_every_rule_holds_and_names_the_rule_that_failed(
     assert_eq!(
         gate(
             &https,
-            Some(&line(RC_BINDING, fresh, fresh, "refused", "noread")),
+            Some(
+                &line(RC_BINDING, fresh, fresh, "refused", "noread")
+                    .replace("\t403\n", &format!("\t403\t{fp}\n"))
+            ),
             "unset PA_ROLE"
         ),
         "full",
-        "the role matters only when the token reads"
+        "the role matters only when the token is not proven unable to read"
     );
     // Rule 8: https.
     assert_eq!(
@@ -5479,6 +6183,7 @@ fn pa_gate_gives_full_only_when_every_rule_holds_and_names_the_rule_that_failed(
         ),
         "pointer:insecure"
     );
+    let good = good.replace("\t403\n", &format!("\t403\t{fp}\n"));
     assert_eq!(gate(&https, Some(&good), ""), "full");
 }
 
@@ -7147,7 +7852,9 @@ fn the_read_check_takes_credentials_written_in_the_url_off_every_request() {
         assert_eq!(r.get("class"), "refused", "{}", r.err);
         let confs = std::fs::read_to_string(fx.scratch().join("confs")).unwrap();
         let files: Vec<&str> = confs.split("---\n").filter(|c| !c.is_empty()).collect();
-        assert_eq!(files.len(), 4, "{confs}");
+        // Over plain http the token is not asked: it would travel in clear and decide nothing.
+        let want = if url.starts_with("http://") { 3 } else { 4 };
+        assert_eq!(files.len(), want, "{confs}");
         let base = if url.ends_with("/base") {
             "http://ntfy.example.invalid/base/t/"
         } else {

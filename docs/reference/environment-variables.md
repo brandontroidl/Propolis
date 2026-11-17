@@ -428,14 +428,42 @@ not a plain absolute path). Its hourly pass reads `PROPOLIS_FEED_ENABLED` (defau
 env files, and `PROPOLIS_BACKUP_DIR` and `PROPOLIS_BACKUP_KEEP` from the backup unit's
 `Environment` property (a drop-in of `propolis-backup.service` is where they are set), each the
 last assignment, the defaults `/var/backups/propolis` and 7 when unset or out of range.
-`PROPOLIS_OPS_HOST_ALIAS` and `PROPOLIS_OPS_DAILY_AT` are read from `/etc/propolis/propolis.env`
-only, by the witness and by `propolis-status`; the daemon and today's failure hook do not read
-them.
+
+**Which file each setting of the shell senders comes from.** The shell senders (the witness's
+daily message and `propolis-status --test-page`) read `PROPOLIS_OPS_NTFY_URL`,
+`PROPOLIS_OPS_NTFY_TOPIC`, `PROPOLIS_OPS_NTFY_TOKEN`, `PROPOLIS_OPS_HOST_ALIAS`,
+`PROPOLIS_OPS_DAILY_AT`, `PROPOLIS_ALERT_PROFILE` and `PROPOLIS_WITNESS_HEARTBEAT_URL` from
+`/etc/propolis/alert.env` when that file gives the key a value, and otherwise from
+`/etc/propolis/propolis.env` (`deploy/alert-lib.sh#pa_settings_load`). A key `alert.env` leaves
+empty counts as unset there, so a copied template with empty lines does not blank what
+`propolis.env` sets. A value `alert.env` gives wins even when it is invalid: it is then ignored
+and named by config-check (`alert-setting-invalid`), and the shell senders do not fall back to
+`propolis.env`'s. Rules for the target:
+
+- The URL and the topic make a target only when one file sets both. A URL in one file and the
+  topic in the other is no target for the shell senders (config-check `alert-target-split`, the
+  walk's `target split across files`).
+- The token is not read from `alert.env` first like the other keys: it is read from the file that
+  holds the target, so a token written for one server is never sent to the other. A token in
+  `alert.env` beside no target there is ignored, and `--setup`, the walk, the `alert` view and
+  config-check (`alert-setting-invalid:PROPOLIS_OPS_NTFY_TOKEN`) say so: set the URL and topic in
+  `alert.env` too, or move the token to `propolis.env`.
+- The daemon and today's failure hook (`deploy/alert.sh`) read `propolis.env` alone; the hook
+  reads `alert.env` only on its test-page path, to send the page to the shell senders' target. With a target in `alert.env` the shell senders post to it while the daemon and the
+  hook keep posting to `propolis.env`'s, and the anonymous-read check is made of both targets.
+
+`alert.env` is `0600 root:root`, no unit loads it and the sensors are denied it by mount; nothing
+from it is printed or stored but the URL's scheme and host, the topic's length and whether a token
+is set, and hashes of them (the readcheck and testpage bindings, the salted token and credential
+fingerprints). `PROPOLIS_OPS_HOST_ALIAS`, `PROPOLIS_OPS_DAILY_AT` and `PROPOLIS_ALERT_PROFILE` are read
+by the witness and by `propolis-status` only; the daemon and today's failure hook do not read
+them, and setting them in `alert.env` keeps the daemon's change-pending notice out of it.
 
 | Variable | Req | Default | Min/bounds | Notes |
 |---|---|---|---|---|
 | `PROPOLIS_OPS_HOST_ALIAS` | no | `host-` and 4 hex digits from the id salt (`deploy/alert-lib.sh#pa_alias`) | 3 to 32 of `a-z`, `0-9` and `-`, starting with a letter; never the host name (`hostname` or `hostname -s`, in any case) and never holding `propolis` or `honey`; any other value is refused for the fallback, and `sudo propolis-status --setup` and the walk say so; where `hostname` cannot answer, the kernel's host name is compared instead, and with no name to compare no alias is taken | the name the test page and the daily message give this host on the channel, so a phone can tell hosts apart without learning their names. The fallback changes when `/var/lib/propolis/witness/id-salt` is deleted; set an alias on every host of a split deployment. Takes effect at the witness's next pass, no restart needed; where the `propolis` daemon runs (a single box, a control node), `propolis.env` is also its `EnvironmentFile`, so editing it opens the change-pending notice and the walk's older-configuration line until `propolis` is next restarted, which can wait |
 | `PROPOLIS_OPS_DAILY_AT` | no | `08:41` | `HH:MM` on the 24-hour clock, or `off`. A value that starts with `off`, `false`, `no`, `n`, `0`, `none`, `never`, `stop`, `disable` or `disabled`, in any letter case, alone or with a blank or a punctuation mark after the word (a comment, a quote), is read as `off`, so that a message an operator tried to stop does stop (`deploy/alert-lib.sh#_pa_daily_off`); an empty value is the default; any other value keeps `08:41`, and `--setup` and the walk say so (the message goes only to a topic proven private, so one more message reveals nothing, while one that silently stopped would read as a host that is down) | the host's local time (its own zone, `/etc/localtime`) after which the witness of a single box or control node (a collector or gateway-only host sends none) sends its one daily message, at most once a local day and at least 20 hours after the last; `off` sends none, ever. A time after `23:50` may skip days: the light pass runs every five minutes, and the message waits for a pass between that time and midnight. Takes effect at the witness's next pass, no restart needed; where the `propolis` daemon runs (a single box, a control node), `propolis.env` is also its `EnvironmentFile`, so editing it opens the change-pending notice and the walk's older-configuration line until `propolis` is next restarted, which can wait. See [the daily message](../operations/health-and-observability.md#the-daily-message) |
+| `PROPOLIS_ALERT_PROFILE` | no | `legacy` | `legacy` or `v2`; any other value is read as `legacy` and named by config-check (`alert-setting-invalid`) and the walk | the shell senders' profile. Read and checked in this release but not in force: whatever the file says, this release sends as `legacy` (today's failure alerts unchanged, plus the daily message and the test page). `v2` is shown by the walk and config-check as set but not in force |
 | `PROPOLIS_WITNESS_HEARTBEAT_URL` | no | none (no request) | `https://` only; any other value is never requested, one journal line says so, and the walk reads `heartbeat URL refused (not an https URL)` | the ping URL of an external dead-man check (a private check with no public status page): one GET after each light pass that was complete and clean, every five minutes; skipped while a check could not tell and nothing records it, `alert-path` is open, a transition has waited over 15 minutes, the state lock could not be had or state could not be written, and for 30 minutes after a skip. Skipping is the signal; there is no failure URL. The URL is a secret: it reaches curl only through a file only root can read and is never logged, stored or shown. Set it in `alert.env`, which only root reads and the daemon does not load: `propolis.env` is the daemon's `EnvironmentFile`, so a URL there is also in the environment of the internet-facing daemon process, which the `propolis` account can read through `/proc` |
 
 ---

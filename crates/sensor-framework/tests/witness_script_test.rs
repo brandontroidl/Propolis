@@ -264,6 +264,16 @@ if [ -n "$conf" ] && grep -q '^data-binary' "$conf"; then
 fi
 printf 'curl %s\n' "$args" >> "$STUB_LOG"
 env | sed 's/^/curl-env /' >> "$d/curl.env"
+# Which header file, if any, went with which URL: the pairing a token must not cross.
+if [ -n "$conf" ]; then
+    hdr="nohdr"
+    set -- $args
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = -H ] && [ -f "${2#@}" ]; then hdr="$(tr '\n' ' ' < "${2#@}")"; fi
+        shift
+    done
+    printf '%s %s\n' "$(sed -n 's/^url = "\(.*\)"$/\1/p' "$conf")" "$hdr" >> "$d/curl.pairs"
+fi
 [ -z "$conf" ] || cat "$conf" >> "$d/curl.conf"
 [ -z "$conf" ] || stat -c %a "$conf" > "$d/curl.confmode"
 [ -f "$d/curl.answer" ] || exit 7
@@ -3761,10 +3771,10 @@ fn the_hourly_read_check_stores_its_answer_and_a_changed_topic_is_checked_by_the
     let rc = fx.read("var/lib/propolis/witness/readcheck");
     assert!(
         rc.contains(&format!(
-            "R\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\tnoread\t403\t403\tboth\t403\n",
+            "R\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\tnoread\t403\t403\tboth\t403\ttoken:",
             s = stamp(0)
         )),
-        "{rc}"
+        "the answer names the token it is about: {rc}"
     );
     let calls: Vec<String> = fx
         .log()
@@ -4751,6 +4761,380 @@ fn a_stored_shell_line_for_a_target_both_roles_share_is_checked_again_as_both() 
             s = stamp(300)
         )],
         "{rc}"
+    );
+}
+
+/// The read-check binding of URL and TOPIC: the first 16 hex of sha256(URL LF TOPIC LF).
+fn binding_of(url: &str, topic: &str) -> String {
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg("printf '%s\\n%s\\n' \"$1\" \"$2\" | sha256sum | cut -c1-16")
+        .arg("_")
+        .arg(url)
+        .arg(topic)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// With alert.env giving the shell senders a target of their own, the read check runs on both:
+/// the hourly pass stores a line of role shell for alert.env's target and one of role daemon for
+/// propolis.env's, where the daemon and today's failure hook post. A changed alert.env topic is
+/// checked by the next light pass and voids only the shell line; once alert.env is gone the two
+/// targets are one again and a single line of role both replaces them.
+#[test]
+fn with_two_targets_the_read_check_runs_on_both_and_a_change_voids_only_its_own_line() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://alert.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=a1ert-topic\n",
+    );
+    let shell = binding_of("https://alert.example.invalid", "a1ert-topic");
+    fx.curl_answers("403|text/plain");
+    fx.hourly(0);
+    let curls = |fx: &Fx| fx.log().lines().filter(|l| l.starts_with("curl ")).count();
+    assert_eq!(curls(&fx), 6, "three GETs for each target");
+    let rc = fx.read("var/lib/propolis/witness/readcheck");
+    let lines: Vec<String> = rc
+        .lines()
+        .filter(|l| l.starts_with("R\t"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            format!(
+                "R\t{shell}\t{s}\trefused\t{s}\trefused\t-\t403\t403\tshell\t403",
+                s = stamp(0)
+            ),
+            format!(
+                "R\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\t-\t403\t403\tdaemon\t403",
+                s = stamp(0)
+            ),
+        ],
+        "{rc}"
+    );
+    let conf = std::fs::read_to_string(fx.dir.path().join("curl.conf")).unwrap();
+    assert!(conf.contains("https://alert.example.invalid/a1ert-topic/json"));
+    assert!(conf.contains("https://ntfy.example.invalid/t0p1c-secret/json"));
+    fx.pass(300);
+    assert_eq!(
+        curls(&fx),
+        6,
+        "the light pass asks nothing while both are bound"
+    );
+
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://alert.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=n3w-topic\n",
+    );
+    fx.curl_answers("200|application/x-ndjson");
+    fx.pass(600);
+    assert_eq!(curls(&fx), 9, "only the changed target is asked");
+    let rc = fx.read("var/lib/propolis/witness/readcheck");
+    assert!(
+        rc.contains(&format!(
+            "R\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\t-\t403\t403\tdaemon\t403\n",
+            s = stamp(0)
+        )),
+        "the daemon's line is untouched: {rc}"
+    );
+    assert!(
+        rc.contains(&format!(
+            "R\t{}\t{s}\treadable\t{s}\treadable\t-\t200\t200\tshell\t200\n",
+            binding_of("https://alert.example.invalid", "n3w-topic"),
+            s = stamp(600)
+        )),
+        "{rc}"
+    );
+    assert!(
+        fx.read("run/motd.d/propolis")
+            .contains("alerts: topic READABLE by anyone"),
+        "{}",
+        fx.read("run/motd.d/propolis")
+    );
+
+    std::fs::remove_file(fx.p("etc/propolis/alert.env")).unwrap();
+    fx.curl_answers("403|text/plain");
+    fx.pass(900);
+    let rc = fx.read("var/lib/propolis/witness/readcheck");
+    let lines: Vec<&str> = rc.lines().filter(|l| l.starts_with("R\t")).collect();
+    assert_eq!(
+        lines,
+        vec![format!(
+            "R\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\t-\t403\t403\tboth\t403",
+            s = stamp(900)
+        )],
+        "{rc}"
+    );
+    assert_eq!(fx.posts().len(), 0, "nothing is posted, to either target");
+}
+
+/// A both line stored before alert.env named a target of its own still stands for the daemon's
+/// target, which it is bound to: the first light pass after the targets part asks only the new
+/// shell target and keeps what was known of the daemon's.
+#[test]
+fn the_first_pass_after_the_targets_part_keeps_the_daemons_answer_from_the_both_line() {
+    let fx = Fx::new();
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!(
+            "#readcheck v1 g=1\nR\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\t-\t403\t403\tboth\t403\n",
+            s = stamp(0)
+        ),
+    );
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://alert.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=a1ert-topic\n",
+    );
+    fx.curl_answers("200|application/x-ndjson");
+    fx.pass(300);
+    assert_eq!(
+        fx.log().lines().filter(|l| l.starts_with("curl ")).count(),
+        3
+    );
+    let rc = fx.read("var/lib/propolis/witness/readcheck");
+    assert!(
+        rc.contains(&format!(
+            "R\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\t-\t403\t403\tdaemon\t403\n",
+            s = stamp(0)
+        )),
+        "{rc}"
+    );
+    assert!(rc.contains("\treadable\t-\t200\t200\tshell\t200\n"), "{rc}");
+
+    // With a token in propolis.env the both line carries that token's answer, which says
+    // nothing of the daemon's target, checked without one: the daemon line keeps no token class
+    // and names no credential.
+    let fx = Fx::new();
+    let env = fx.read("etc/propolis/propolis.env");
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!("{env}PROPOLIS_OPS_NTFY_TOKEN=tk_first-value\n"),
+    );
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!(
+            "#readcheck v1 g=1\nR\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\tnoread\t403\t403\tboth\t403\ttoken:0123abcd\n",
+            s = stamp(0)
+        ),
+    );
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://alert.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=a1ert-topic\n",
+    );
+    fx.curl_answers("200|application/x-ndjson");
+    fx.pass(300);
+    let rc = fx.read("var/lib/propolis/witness/readcheck");
+    assert!(
+        rc.contains(&format!(
+            "R\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\t-\t403\t403\tdaemon\t403\n",
+            s = stamp(0)
+        )),
+        "{rc}"
+    );
+}
+
+/// The stored answer about a credential names it (kind and salted hash), never the credential:
+/// a light pass asks again when the token a post carries is not the one the answer is about, as it
+/// does for a changed target, and not while it is the same.
+#[test]
+fn a_changed_token_is_checked_again_by_the_light_pass_and_the_line_names_no_token() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk_first-value\n",
+    );
+    fx.curl_answers("403|text/plain");
+    fx.hourly(0);
+    let cred = |fx: &Fx| -> String {
+        let rc = fx.read("var/lib/propolis/witness/readcheck");
+        let line = rc
+            .lines()
+            .find(|l| l.starts_with("R\t"))
+            .unwrap()
+            .to_string();
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 12, "{line}");
+        f[11].to_string()
+    };
+    let first = cred(&fx);
+    assert!(
+        first.starts_with("token:")
+            && first.len() == 14
+            && first[6..].bytes().all(|b| b.is_ascii_hexdigit()),
+        "{first}"
+    );
+    let curls = |fx: &Fx| fx.log().lines().filter(|l| l.starts_with("curl ")).count();
+    assert_eq!(curls(&fx), 4);
+    fx.pass(300);
+    assert_eq!(curls(&fx), 4, "the same token: nothing asked");
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk_second-value\n",
+    );
+    fx.pass(600);
+    assert_eq!(
+        curls(&fx),
+        8,
+        "a changed token is asked within one light pass"
+    );
+    let second = cred(&fx);
+    assert!(second.starts_with("token:") && second != first, "{second}");
+    let rc = fx.read("var/lib/propolis/witness/readcheck");
+    for secret in ["tk_first-value", "tk_second-value", "t0p1c-secret"] {
+        assert!(!rc.contains(secret), "{secret} stored");
+        assert!(!fx.log().contains(secret), "{secret} on a command line");
+    }
+}
+
+/// With two targets on two servers, each with its own token, a token goes only to the server of
+/// its own file: the read check of propolis.env's target carries no header at all (the daemon's
+/// target is asked anonymously), and alert.env's token goes only with alert.env's host.
+#[test]
+fn with_two_targets_each_token_goes_only_to_the_server_of_its_own_file() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://daemon.ntfy.invalid\nPROPOLIS_OPS_NTFY_TOPIC=d-topic\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk_daemon\n",
+    );
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://alert.ntfy.invalid\nPROPOLIS_OPS_NTFY_TOPIC=a-topic\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk_alert\n",
+    );
+    fx.curl_answers("403|text/plain");
+    fx.hourly(0);
+    let pairs = fx.stub_text("curl.pairs");
+    let daemon: Vec<&str> = pairs
+        .lines()
+        .filter(|l| l.starts_with("https://daemon.ntfy.invalid/"))
+        .collect();
+    assert_eq!(daemon.len(), 3, "{pairs}");
+    assert!(daemon.iter().all(|l| l.ends_with(" nohdr")), "{pairs}");
+    let with_alert: Vec<&str> = pairs.lines().filter(|l| l.contains("tk_alert")).collect();
+    assert_eq!(with_alert.len(), 1, "{pairs}");
+    assert!(
+        with_alert[0].starts_with("https://alert.ntfy.invalid/a-topic/json"),
+        "{pairs}"
+    );
+    assert!(!pairs.contains("tk_daemon"), "{pairs}");
+}
+
+/// A line an older release wrote names no credential. With a token set and the server giving no
+/// answer, the first light pass stores the token it was asked with (class unknown), so the next
+/// light pass finds the line about the current credential and asks nothing until the hourly pass.
+#[test]
+fn a_line_that_names_no_credential_is_asked_once_by_a_light_pass_while_the_server_does_not_answer()
+{
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk_first-value\n",
+    );
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!(
+            "#readcheck v1 g=1\nR\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\tnoread\t403\t403\tboth\t403\n",
+            s = stamp(0)
+        ),
+    );
+    fx.write(
+        "var/lib/propolis/witness/id-salt",
+        "0123456789abcdef0123456789abcdef\n",
+    );
+    let curls = |fx: &Fx| fx.log().lines().filter(|l| l.starts_with("curl ")).count();
+    fx.pass(300);
+    let asked = curls(&fx);
+    assert!(asked > 0, "the line names no credential: asked once");
+    let rc = fx.read("var/lib/propolis/witness/readcheck");
+    let line = rc.lines().find(|l| l.starts_with("R\t")).unwrap();
+    let f: Vec<&str> = line.split('\t').collect();
+    assert_eq!(f.len(), 12, "{line}");
+    assert_eq!(f[6], "unknown", "{line}");
+    assert!(f[11].starts_with("token:"), "{line}");
+    fx.pass(600);
+    assert_eq!(curls(&fx), asked, "the second light pass asks nothing");
+}
+
+/// Without an id salt a credential cannot be named, which is no reason to ask: a light pass over
+/// a line bound to the target makes no read check, whatever credential the line names, and once
+/// the salt exists the next light pass asks, since the line is not about the token set now.
+#[test]
+fn a_light_pass_without_a_salt_asks_nothing_and_asks_once_the_salt_exists() {
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk_first-value\n",
+    );
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!(
+            "#readcheck v1 g=1\nR\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\tnoread\t403\t403\tboth\t403\ttoken:0123abcd\n",
+            s = stamp(0)
+        ),
+    );
+    let _ = std::fs::remove_file(fx.p("var/lib/propolis/witness/id-salt"));
+    fx.curl_answers("403|text/plain");
+    let curls = |fx: &Fx| fx.log().lines().filter(|l| l.starts_with("curl ")).count();
+    // The read check runs before the lock, and the pass writes the salt under it.
+    fx.pass(300);
+    assert_eq!(curls(&fx), 0, "no salt: nothing asked");
+    assert!(
+        fx.read("var/lib/propolis/witness/id-salt").len() > 30,
+        "the pass wrote the salt"
+    );
+    fx.pass(600);
+    assert_eq!(
+        curls(&fx),
+        4,
+        "the line names no credential: asked once the salt exists"
+    );
+}
+
+/// The legacy hook posts to propolis.env's target, whatever alert.env gives the shell senders: on
+/// a host whose propolis.env names no target its failure alerts go to the journal, so a failure
+/// alert logged with no undelivered line beside it is the delivery alert-path waits for, even with
+/// a target in alert.env; with a target in propolis.env it is not.
+#[test]
+fn alert_path_counts_a_journal_alert_as_delivered_by_propolis_envs_target_not_alert_envs() {
+    let c_line = "{\"__CURSOR\":\"s=1\",\"_SYSTEMD_UNIT\":\"propolis-alert@sensor-ssh.service.service\",\
+        \"MESSAGE\":\"sensor-ssh.service entered the failed state on edge\"}\n";
+    let run = |daemon_target: bool| {
+        let fx = Fx::new();
+        let env: String = fx
+            .read("etc/propolis/propolis.env")
+            .lines()
+            .filter(|l| daemon_target || !l.starts_with("PROPOLIS_OPS_NTFY_"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        fx.write("etc/propolis/propolis.env", &env);
+        fx.write(
+            "etc/propolis/alert.env",
+            "PROPOLIS_OPS_NTFY_URL=https://alert.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=a1ert-topic\n",
+        );
+        fx.incidents(&[alert_path_record(&stamp(0))]);
+        fx.stub_file("journal.hook", c_line);
+        fx.pass(300);
+        fx.record("alert:shell").unwrap()
+    };
+    let f = run(false);
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "sent2xx"));
+    let f = run(true);
+    assert_eq!(
+        f[7], "open",
+        "propolis.env names a target: the journal is no delivery"
     );
 }
 

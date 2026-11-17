@@ -76,7 +76,7 @@ ExecPaths=/usr/local/bin/sensor-ssh /usr/lib -/usr/lib64
 # Secrets this sensor must never read. /etc/propolis is 0755 and each env file 0600 under its own
 # service user, so file permissions already deny the daemon's env file (database URL, console
 # password, vendor keys, ntfy token), every other unit's, the watcher's copy, the alert.env
-# reserved for the root alert senders (a target and its token; no unit loads it,
+# read by the root alert senders alone (a target and its token; no unit loads it,
 # deploy/alert-lib.sh names it) and the split deployment's mTLS keys; a chmod slip would not, and
 # config-check.sh only reports one after the fact. These mounts hold regardless of mode. The
 # sensor's own env file is deliberately not listed: systemd reads EnvironmentFile= as root

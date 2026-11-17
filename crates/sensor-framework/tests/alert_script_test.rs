@@ -477,6 +477,60 @@ fn a_failure_posts_to_the_ops_topic_with_the_journal_in_the_body_only() {
     );
 }
 
+/// Today's failure hook reads propolis.env alone, always: an alert.env naming another target,
+/// another token and the v2 profile changes nothing it sends or logs, with the library installed
+/// or not; and neither the hook nor the daemon's source names alert.env.
+#[test]
+fn todays_failure_hook_and_the_daemon_never_read_alert_env() {
+    let alert_env = "PROPOLIS_OPS_NTFY_URL=https://other.example\nPROPOLIS_OPS_NTFY_TOPIC=other-topic\n\
+                     PROPOLIS_OPS_NTFY_TOKEN=tk_other\nPROPOLIS_ALERT_PROFILE=v2\n";
+    for lib in [false, true] {
+        let plain = Fixture::with_ntfy();
+        let fx = Fixture::with_ntfy();
+        let (plain, fx) = if lib {
+            (plain.with_lib(), fx.with_lib())
+        } else {
+            (plain, fx)
+        };
+        std::fs::write(fx.root.join("etc/propolis/alert.env"), alert_env).unwrap();
+        assert_ok(&plain.run("sensor-ssh.service", &[]));
+        assert_ok(&fx.run("sensor-ssh.service", &[]));
+        assert_eq!(
+            todays_part(&fx.log()),
+            todays_part(&plain.log()),
+            "lib {lib}"
+        );
+        let log = fx.log();
+        assert!(log.contains("https://ntfy.example/propolis-ops"), "{log}");
+        for other in ["other.example", "other-topic", "tk_other"] {
+            assert!(!log.contains(other), "{other} in: {log}");
+        }
+    }
+    assert!(!shipped_hook().contains("alert.env"));
+    let mut dirs = vec![PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../propolis/src"
+    ))];
+    let mut read = 0;
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                dirs.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                read += 1;
+                let text = std::fs::read_to_string(&p).unwrap();
+                assert!(
+                    !text.contains("alert.env"),
+                    "{} names alert.env",
+                    p.display()
+                );
+            }
+        }
+    }
+    assert!(read > 10, "the daemon's sources were read: {read}");
+}
+
 #[test]
 fn a_delivered_alert_still_suppresses_repeats_of_a_crash_loop_for_the_cooldown() {
     let fx = Fixture::with_ntfy();

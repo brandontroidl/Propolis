@@ -2509,8 +2509,11 @@ fn a_cursor_without_an_offset_or_a_time_is_unknown_not_a_failure() {
     assert_eq!(r.marked(), None, "{}", r.out);
 }
 
+/// On a collector the failure hook reads propolis.env alone, so under legacy an alert.env's
+/// target reaches only the test page: the walk warns that failure alerts from here use it only
+/// under v2.
 #[test]
-fn an_alert_env_on_a_collector_is_named_as_inert_under_legacy() {
+fn an_alert_env_on_a_collector_is_named_as_used_for_failure_alerts_only_under_v2() {
     let fx = Fx::collector();
     let ssh = fx.p("var/log/propolis/ssh/events.jsonl");
     fx.cursor("var/lib/propolis/shipper/cursors", &ssh, 100, NOW - 60);
@@ -2522,8 +2525,9 @@ fn an_alert_env_on_a_collector_is_named_as_inert_under_legacy() {
     assert_eq!(r.code, 1, "{}", r.out);
     assert_eq!(r.state("alert"), "WARN", "{}", r.out);
     assert!(
-        r.row("alert")
-            .contains("alert.env present, profile legacy: it acts only under v2"),
+        r.row("alert").contains(
+            "alert.env present, profile legacy: failure alerts from here use it only under v2"
+        ),
         "{}",
         r.out
     );
@@ -4142,8 +4146,9 @@ fn the_gate_field_and_the_alert_rail_follow_the_stored_read_check() {
     let r = fx.walk();
     assert_eq!(r.state("alert"), "ok", "{}", r.out);
     assert!(
-        r.row("alert")
-            .contains("shell and daemon topic refused (checked 07:50:00), token reads"),
+        r.row("alert").contains(
+            "shell and daemon topic refused (checked 07:50:00), credential not named (older line)"
+        ),
         "{}",
         r.out
     );
@@ -6718,10 +6723,15 @@ fn the_banner_over_plain_http_says_so_even_where_the_token_reads() {
     );
     fx.setenv("RC_TOKEN_ANSWER", "200|application/x-ndjson");
     let r = fx.run(&["--setup"]);
-    assert!(
-        r.out.contains("gate        pointer:token-reads"),
-        "{}",
-        r.out
+    // Over plain http the token is not asked, so the gate's word is the scheme's.
+    assert!(r.out.contains("gate        pointer:insecure"), "{}", r.out);
+    assert_eq!(banner_alerts(&fx), "topic not proven private (plain http)");
+    // A reading token stored by an earlier release, before http was left unasked, still gives
+    // the gate the token's word, and the banner still names the scheme.
+    let rc = std::fs::read_to_string(fx.p("var/lib/propolis/witness/readcheck")).unwrap();
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &rc.replace("\tunknown\t", "\treads\t"),
     );
     assert_eq!(banner_alerts(&fx), "topic not proven private (plain http)");
 }
@@ -7054,4 +7064,641 @@ fn setup_and_the_walk_do_not_contradict_the_daily_setting_the_target_or_the_alia
         "{}",
         r.out
     );
+}
+
+// ---- alert.env: a target of the shell senders' own -----------------------------------------------
+
+/// A target in alert.env on the fixture's server, under another path and topic, with a token of
+/// its own.
+const ALERT_ENV: &str = "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid/alerts\n\
+                         PROPOLIS_OPS_NTFY_TOPIC=a1ert-topic\nPROPOLIS_OPS_NTFY_TOKEN=tk_alert\n";
+
+/// With alert.env naming a target of its own, --setup names it as alert.env's and checks it, and
+/// checks the daemon's target in propolis.env as well, on a daemon line with its own answer; it
+/// stores one line of role shell and one of role daemon. The walk says where test pages and the
+/// daily message go and shows the answer for each topic. Neither topic nor token is printed.
+#[test]
+fn setup_and_the_walk_show_both_targets_when_alert_env_names_its_own() {
+    let fx = Fx::single();
+    fx.write("etc/propolis/alert.env", ALERT_ENV);
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains(
+            "target      ntfy from alert.env: URL https://ntfy.example.invalid, topic set (11 chars), token set\n"
+        ),
+        "{}\n{}",
+        r.out,
+        r.err
+    );
+    assert!(
+        r.out.contains(
+            "daemon      propolis.env's target, where the daemon and today's failure hook post: URL https://ntfy.example.invalid, topic set (12 chars)\n"
+        ),
+        "{}",
+        r.out
+    );
+    assert_eq!(
+        r.out.matches("checked now: json 403 (text/plain)").count(),
+        2,
+        "{}",
+        r.out
+    );
+    let stored = std::fs::read_to_string(fx.p("var/lib/propolis/witness/readcheck")).unwrap();
+    let roles: Vec<&str> = stored
+        .lines()
+        .filter(|l| l.starts_with("R\t"))
+        .map(|l| l.split('\t').nth(9).unwrap())
+        .collect();
+    assert_eq!(roles, ["shell", "daemon"], "{stored}");
+    let traces = fx.readable_traces(&r);
+    for secret in ["a1ert-topic", "tk_alert", TOPIC, TOKEN_SECRET] {
+        assert!(
+            !traces.contains(secret),
+            "{secret} left where it can be read"
+        );
+    }
+    let w = fx.walk();
+    assert!(
+        w.out.contains(
+            "        shell target from alert.env: test pages and the daily message go there; the daemon and today's failure hook post to propolis.env's target\n"
+        ),
+        "{}",
+        w.out
+    );
+    let row = w.row("alert");
+    assert!(
+        row.contains("shell topic refused") && row.contains("daemon topic refused"),
+        "{row}"
+    );
+}
+
+/// A test page goes to the target the shell senders read, alert.env's when it names one, with
+/// alert.env's token, never to propolis.env's, where today's failure hook posts; typed back it
+/// makes VERIFIED for that target.
+#[test]
+fn a_test_page_goes_to_the_alert_env_target_and_verifies_it() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    fx.write("etc/propolis/alert.env", ALERT_ENV);
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(r.code, 0, "{}\n{}\n{}", r.out, r.err, fx.log());
+    let conf = fx.side("conf");
+    let post = conf
+        .split("--- ")
+        .find(|c| c.contains("data-binary"))
+        .unwrap_or_else(|| panic!("{conf}"));
+    assert!(
+        post.lines()
+            .any(|l| l == "url = \"https://ntfy.example.invalid/alerts/a1ert-topic\""),
+        "{post}"
+    );
+    assert!(
+        post.lines()
+            .any(|l| l == "header = \"Authorization: Bearer tk_alert\""),
+        "{post}"
+    );
+    assert!(
+        !post.contains(TOPIC) && !post.contains(TOKEN_SECRET),
+        "{post}"
+    );
+    let code = fx.testpage()[1].clone();
+    let r = fx.run(&["--ack-test", &code]);
+    assert_eq!(r.out, "VERIFIED: the test page reached you\n", "{}", r.err);
+    assert!(
+        alerts_verified(&fx).starts_with("VERIFIED 0 min (shell)"),
+        "{}",
+        alerts_verified(&fx)
+    );
+}
+
+/// A URL in one file and a topic in the other is no target for the shell senders: --setup, the
+/// walk and --test-page say the target is split across files, and nothing is sent; today's failure
+/// hook, which reads propolis.env alone, still posts to the target written there.
+#[test]
+fn setup_the_walk_and_the_test_page_say_when_the_target_is_split_across_files() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid/alerts\n",
+    );
+    let r = fx.run(&["--setup"]);
+    assert_eq!(r.code, 1, "{}", r.out);
+    assert!(
+        r.out.contains(
+            "find PROPOLIS_OPS_NTFY_URL in alert.env and PROPOLIS_OPS_NTFY_TOPIC in propolis.env, and use a target only when one file sets both; today's failure hook still posts"
+        ),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out.contains(
+            "fix (config-check alert-target-split): set both in /etc/propolis/alert.env, or both in /etc/propolis/propolis.env"
+        ),
+        "{}",
+        r.out
+    );
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(r.code, 1);
+    assert_eq!(
+        r.out,
+        "no push target: PROPOLIS_OPS_NTFY_URL and PROPOLIS_OPS_NTFY_TOPIC are set in different files: nothing sent (see sudo propolis-status --setup)\n"
+    );
+    assert!(fx.posts().is_empty());
+    let w = fx.walk();
+    let alerts = w
+        .out
+        .lines()
+        .find(|l| l.starts_with("ALERTS  "))
+        .unwrap_or_default();
+    assert!(alerts.contains("(target split across files)"), "{alerts}");
+    assert!(
+        w.row("alert").contains("target split across files"),
+        "{}",
+        w.out
+    );
+}
+
+/// PROPOLIS_ALERT_PROFILE is read: a value other than legacy or v2 is named as ignored, and v2
+/// is named as set but not in force in this release. Nothing else changes, and --setup still
+/// prints no profile line.
+#[test]
+fn the_walk_names_a_mistyped_profile_and_a_v2_that_is_not_in_force() {
+    let fx = Fx::single();
+    let base = fx.walk();
+    fx.env_line("PROPOLIS_ALERT_PROFILE=v3");
+    let w = fx.walk();
+    assert!(
+        w.out.contains(
+            "        invalid value ignored: PROPOLIS_ALERT_PROFILE in propolis.env is neither legacy nor v2 (legacy is used)\n"
+        ),
+        "{}",
+        w.out
+    );
+    fx.env_drop("PROPOLIS_ALERT_PROFILE=");
+    fx.write("etc/propolis/alert.env", "PROPOLIS_ALERT_PROFILE=v2\n");
+    let w = fx.walk();
+    let line = "        profile v2 set in alert.env: not in force in this release, which sends as legacy\n";
+    assert!(w.out.contains(line), "{}", w.out);
+    assert_eq!(w.out.replace(line, ""), base.out, "nothing else changes");
+    assert_eq!(w.code, base.code);
+    let r = fx.run(&["--setup"]);
+    assert!(
+        !r.out.lines().any(|l| l.starts_with("profile")),
+        "{}",
+        r.out
+    );
+}
+
+/// Over plain http the credential a post carries is not asked whether it can read the topic: the
+/// request would carry it in clear and its answer would change nothing. --setup says so.
+#[test]
+fn setup_over_plain_http_says_the_credential_was_not_asked() {
+    let fx = Fx::single();
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL=");
+    fx.env_line("PROPOLIS_OPS_NTFY_URL=http://ntfy.example.invalid");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains(
+            "token       not asked: over plain http its answer would change nothing, and the request would carry the token in clear\n"
+        ),
+        "{}",
+        r.out
+    );
+    assert!(
+        !fx.log()
+            .lines()
+            .any(|l| l.starts_with("curl ") && l.contains("[-H]")),
+        "{}",
+        fx.log()
+    );
+}
+
+/// What the library prints for `script` under the fixture's root (its salt included).
+fn lib_out(fx: &Fx, script: &str) -> String {
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(format!("set -u\n. \"$LIB\"\npa_init \"$ROOT\"\n{script}"))
+        .env("LIB", LIB)
+        .env("ROOT", &fx.root)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// The fixture's readcheck with these lines (after the header).
+fn readcheck_lines(fx: &Fx, lines: &str) {
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!("#readcheck v1 g=2\n{lines}"),
+    );
+}
+
+/// A token alert.env sets beside no target of its own is not used: the test page goes to
+/// propolis.env's target with propolis.env's token, and --setup and the stage view say the token
+/// in alert.env is ignored, so it is not taken for the one in use.
+#[test]
+fn a_token_in_alert_env_without_a_target_there_is_shown_as_ignored_and_not_sent() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_TOKEN=tk_alert\n",
+    );
+    let note = "token in alert.env ignored: alert.env sets no target; a token goes only with the target of its own file";
+    let r = fx.run(&["--setup"]);
+    assert!(r.out.contains(note), "{}", r.out);
+    let view = fx.run(&["alert"]);
+    assert!(view.out.contains(note), "{}", view.out);
+    assert!(fx.walk().out.contains(note));
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(r.code, 0, "{}\n{}", r.out, r.err);
+    let conf = fx.side("conf");
+    let post = conf
+        .split("--- ")
+        .find(|c| c.contains("data-binary"))
+        .unwrap_or_else(|| panic!("{conf}"));
+    assert!(
+        post.lines()
+            .any(|l| l == format!("header = \"Authorization: Bearer {TOKEN_SECRET}\"")),
+        "{post}"
+    );
+    assert!(!post.contains("tk_alert"), "{post}");
+}
+
+/// With two targets, --setup asks propolis.env's target without any credential: only alert.env's
+/// target is asked with a header, the one its own token goes with.
+#[test]
+fn setup_asks_the_daemons_target_without_a_header_and_only_the_shell_target_with_one() {
+    let fx = Fx::single();
+    fx.write("etc/propolis/alert.env", ALERT_ENV);
+    let r = fx.run(&["--setup"]);
+    assert!(r.out.contains("anon read   checked now"), "{}", r.out);
+    let calls: Vec<String> = fx
+        .log()
+        .lines()
+        .filter(|l| l.starts_with("curl ") && l.contains("[-K]"))
+        .map(str::to_string)
+        .collect();
+    let urls: Vec<String> = fx
+        .side("conf")
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("url = \"")
+                .map(|u| u.trim_end_matches('"').to_string())
+        })
+        .collect();
+    assert_eq!(calls.len(), urls.len(), "{calls:?} {urls:?}");
+    let mut with_header = Vec::new();
+    for (call, url) in calls.iter().zip(&urls) {
+        if call.contains("[-H]") {
+            with_header.push(url.clone());
+        }
+    }
+    assert_eq!(
+        with_header,
+        ["https://ntfy.example.invalid/alerts/a1ert-topic/json?poll=1&since=1s"],
+        "{calls:?} {urls:?}"
+    );
+}
+
+/// With alert.env's valid target, a URL in propolis.env that is not valid concerns the daemon and
+/// today's failure hook, which use it as written: --setup names it in propolis.env with their
+/// wording, never as one the shell senders ignore, and the alert rail warns of it until
+/// propolis.env is valid.
+#[test]
+fn an_invalid_propolis_env_url_beside_an_alert_env_target_is_named_for_the_daemon_and_the_hook() {
+    let fx = Fx::single();
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL=");
+    fx.env_line("PROPOLIS_OPS_NTFY_URL=ntfy.example.invalid");
+    fx.write("etc/propolis/alert.env", ALERT_ENV);
+    let r = fx.run(&["--setup"]);
+    assert!(
+        !r.out
+            .contains("the shell senders ignore PROPOLIS_OPS_NTFY_URL"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out.contains(
+            "PROPOLIS_OPS_NTFY_URL in propolis.env is not valid (an http:// or https:// URL with a host and no blanks): the daemon and today's failure hook use it as written"
+        ),
+        "{}",
+        r.out
+    );
+    let note = "PROPOLIS_OPS_NTFY_URL in propolis.env invalid (the daemon and today's failure hook use it as written)";
+    let w = fx.walk();
+    assert_eq!(w.state("alert"), "WARN", "{}", w.out);
+    assert!(w.row("alert").contains(note), "{}", w.out);
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL=");
+    fx.env_line("PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid");
+    assert!(!fx.walk().row("alert").contains(note));
+}
+
+/// The walk's note on each stored answer about a credential: one about another token than the one
+/// set now says the credential changed since; a line from before credentials were named says so
+/// where a credential is set and shows the stored class where none is; and a daemon line made from
+/// a both line, whose target is asked without a token, claims nothing of a credential.
+#[test]
+fn the_walk_says_whether_a_stored_credential_answer_is_about_the_credential_set_now() {
+    let fx = Fx::single();
+    let old = lib_out(&fx, "pa_token8 tk_older");
+    let s = stamp_ago(600);
+    let line = |tk: &str, cred: &str, role: &str| {
+        format!(
+            "R\t8f24b729c8ebd3c1\t{s}\trefused\t{s}\trefused\t{tk}\t403\t403\t{role}\t403{cred}\n"
+        )
+    };
+    readcheck_lines(&fx, &line("noread", &format!("\ttoken:{old}"), "both"));
+    let row = fx.walk().row("alert");
+    assert!(row.contains("credential changed since"), "{row}");
+    assert!(!row.contains("token noread"), "{row}");
+
+    readcheck_lines(&fx, &line("noread", "", "both"));
+    let row = fx.walk().row("alert");
+    assert!(row.contains("credential not named (older line)"), "{row}");
+    assert!(!row.contains("token noread"), "{row}");
+
+    fx.env_drop("PROPOLIS_OPS_NTFY_TOKEN=");
+    let row = fx.walk().row("alert");
+    assert!(
+        row.contains("token noread"),
+        "no credential: the class: {row}"
+    );
+
+    // Two targets: the daemon's line is the both line's, converted.
+    fx.env_line(&format!("PROPOLIS_OPS_NTFY_TOKEN={TOKEN_SECRET}"));
+    fx.write("etc/propolis/alert.env", ALERT_ENV);
+    let k = lib_out(&fx, &format!("pa_token8 {TOKEN_SECRET}"));
+    readcheck_lines(&fx, &(line("noread", &format!("\ttoken:{k}"), "both")));
+    let row = fx.walk().row("alert");
+    assert!(!row.contains("credential changed since"), "{row}");
+    assert!(row.contains("daemon topic refused"), "{row}");
+    // The daemon line a pass makes of that both line, beside the shell line of alert.env's target.
+    let shell_bind = lib_out(
+        &fx,
+        "pa_readcheck_binding https://ntfy.example.invalid/alerts a1ert-topic",
+    );
+    let kt = lib_out(&fx, "pa_token8 tk_alert");
+    readcheck_lines(
+        &fx,
+        &format!(
+            "R\t{shell_bind}\t{s}\trefused\t{s}\trefused\tnoread\t403\t403\tshell\t403\ttoken:{kt}\n{}",
+            line("-", "", "daemon")
+        ),
+    );
+    let row = fx.walk().row("alert");
+    assert!(row.contains("daemon topic refused"), "{row}");
+    assert!(!row.contains("credential"), "{row}");
+}
+
+/// Between alert.env naming a new target and the next light pass, the both line is still bound
+/// to propolis.env's target: the walk says only the shell topic is not checked, and gives the
+/// daemon topic's answer.
+#[test]
+fn before_the_first_light_pass_with_two_targets_the_walk_keeps_the_daemons_answer() {
+    let fx = Fx::single();
+    fx.write("etc/propolis/alert.env", ALERT_ENV);
+    let row = fx.walk().row("alert");
+    assert!(
+        row.contains("shell topic not checked for the current target"),
+        "{row}"
+    );
+    assert!(row.contains("daemon topic refused"), "{row}");
+    assert!(!row.contains("shell and daemon topic"), "{row}");
+}
+
+/// Fails the first `n` mktemp calls (counted in `$STUB_LOG.mktemp`) and runs the real one after.
+const MKTEMP_FAIL_FIRST_STUB: &str = r#"#!/usr/bin/env bash
+n="$(cat -- "$STUB_LOG.mktemp" 2> /dev/null || echo 0)"
+n=$((n + 1))
+printf '%s' "$n" > "$STUB_LOG.mktemp"
+printf 'mktemp %s\n' "$n" >> "$STUB_LOG"
+[ "$n" -gt "${MKTEMP_FAIL_FIRST:-0}" ] || exit 1
+PATH="${PATH#*:}" exec mktemp "$@"
+"#;
+
+/// With two targets, a --setup whose check of propolis.env's target cannot run keeps the daemon's
+/// answer from the both line, which was asked with propolis.env's token: the daemon's target is
+/// asked without one, so the daemon line it keeps carries neither the token's class nor its
+/// credential, and the walk claims no credential change for the daemon topic.
+#[test]
+fn setup_that_cannot_ask_the_daemons_target_keeps_no_token_answer_on_the_daemon_line() {
+    let mut fx = Fx::single();
+    fx.write("etc/propolis/alert.env", ALERT_ENV);
+    let s = stamp_ago(600);
+    let k = lib_out(&fx, &format!("pa_token8 {TOKEN_SECRET}"));
+    readcheck_lines(
+        &fx,
+        &format!(
+            "R\t8f24b729c8ebd3c1\t{s}\trefused\t{s}\trefused\tnoread\t403\t403\tboth\t403\ttoken:{k}\n"
+        ),
+    );
+    // The daemon's check runs first: its temporary files are the first ones asked for.
+    write_exec(&fx.bin.join("mktemp"), MKTEMP_FAIL_FIRST_STUB);
+    fx.setenv("MKTEMP_FAIL_FIRST", "1");
+    let r = fx.run(&["--setup"]);
+    let stored = std::fs::read_to_string(fx.p("var/lib/propolis/witness/readcheck")).unwrap();
+    let lines: Vec<Vec<&str>> = stored
+        .lines()
+        .filter(|l| l.starts_with("R\t"))
+        .map(|l| l.split('\t').collect())
+        .collect();
+    let shell_bind = lib_out(
+        &fx,
+        "pa_readcheck_binding https://ntfy.example.invalid/alerts a1ert-topic",
+    );
+    assert!(
+        lines.iter().any(|f| f[1] == shell_bind && f[9] == "shell"),
+        "the shell target was checked now: {stored}\n{}\n{}",
+        r.out,
+        fx.log()
+    );
+    let daemon: Vec<&Vec<&str>> = lines.iter().filter(|f| f[9] == "daemon").collect();
+    assert_eq!(daemon.len(), 1, "{stored}");
+    let d = daemon[0];
+    assert_eq!(d[1], "8f24b729c8ebd3c1", "{stored}");
+    assert_eq!(d[3], "refused", "{stored}");
+    assert_eq!(d[6], "-", "no token class on the daemon line: {stored}");
+    assert_eq!(d.len(), 11, "no credential on the daemon line: {stored}");
+    assert!(!stored.contains(&k), "{stored}");
+    let row = fx.walk().row("alert");
+    assert!(row.contains("daemon topic refused"), "{row}");
+    assert!(!row.contains("credential changed since"), "{row}");
+}
+
+/// After an alert.env target or token change, NOT VERIFIED (changed) is cleared by a new page:
+/// today's hook reading propolis.env otherwise is no reason against one, since the page proves
+/// alert.env's target.
+#[test]
+fn a_changed_alert_env_target_is_told_to_send_a_page_whatever_todays_hook_reads() {
+    let fx = Fx::single();
+    fx.write("etc/propolis/alert.env", ALERT_ENV);
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL=");
+    fx.env_line("  PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid");
+    let bind = lib_out(
+        &fx,
+        "pa_readcheck_binding https://ntfy.example.invalid/alerts a1ert-topic",
+    );
+    let old = lib_out(&fx, "pa_token8 tk_older");
+    fx.write(
+        "var/lib/propolis/witness/testpage",
+        &format!(
+            "#testpage v1 g=1\nT\tabc123\t{}\t{bind}\t{old}\tok\t{}\t0\n",
+            stamp_ago(3600),
+            stamp_ago(3000)
+        ),
+    );
+    let v = fx.setup_verified();
+    assert!(v.starts_with("verified    NOT VERIFIED (changed)"), "{v}");
+    assert!(v.ends_with("Run: sudo propolis-status --test-page"), "{v}");
+}
+
+/// The alias and the daily time set only in alert.env are named as alert.env's by --setup; a
+/// daily time there of neither form is named in alert.env; and with alert.env present the fix
+/// for a fallback alias points there.
+#[test]
+fn setup_names_alert_env_as_the_source_of_the_alias_and_the_daily_time() {
+    let fx = Fx::single();
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_DAILY_AT=07:30\nPROPOLIS_OPS_HOST_ALIAS=north-relay\n",
+    );
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains("daily       07:30 local (from alert.env)"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out
+            .contains("alias       north-relay (PROPOLIS_OPS_HOST_ALIAS in alert.env)"),
+        "{}",
+        r.out
+    );
+    fx.write("etc/propolis/alert.env", "PROPOLIS_OPS_DAILY_AT=25:99\n");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out
+            .contains("(PROPOLIS_OPS_DAILY_AT in alert.env is neither HH:MM nor off"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out.contains(
+            "To name it: PROPOLIS_OPS_HOST_ALIAS=<3 to 32 of a-z 0-9 -, starting with a letter, not the host name> in /etc/propolis/alert.env"
+        ),
+        "{}",
+        r.out
+    );
+}
+
+/// --setup's next step for a target split across files, and for a topic alert.env sets that is
+/// not valid, which wins over propolis.env's with no fallback.
+#[test]
+fn setup_gives_the_fix_for_a_split_target_and_for_an_invalid_alert_env_topic() {
+    let fx = Fx::single();
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid/alerts\n",
+    );
+    let v = fx.setup_verified();
+    assert!(
+        v.ends_with("Set PROPOLIS_OPS_NTFY_URL and PROPOLIS_OPS_NTFY_TOPIC both in /etc/propolis/alert.env, or both in /etc/propolis/propolis.env"),
+        "{v}"
+    );
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid/alerts\nPROPOLIS_OPS_NTFY_TOPIC=not a topic\n",
+    );
+    let v = fx.setup_verified();
+    assert!(
+        v.ends_with("Set PROPOLIS_OPS_NTFY_TOPIC in /etc/propolis/alert.env to 1 to 64 letters, digits, _ or -, written plainly on one line"),
+        "{v}"
+    );
+}
+
+/// With an alert.env target and a plain-http propolis.env target whose topic the hook reads
+/// otherwise (an indented line), the daemon block of --setup says both: the answer proves nothing
+/// over plain http, and today's hook reads the topic otherwise.
+#[test]
+fn setup_shows_the_plain_http_and_the_hooks_reading_under_the_daemon_target() {
+    let fx = Fx::single();
+    fx.write("etc/propolis/alert.env", ALERT_ENV);
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL=");
+    fx.env_drop("PROPOLIS_OPS_NTFY_TOPIC=");
+    fx.env_line("PROPOLIS_OPS_NTFY_URL=http://ntfy.example.invalid");
+    fx.env_line(&format!("  PROPOLIS_OPS_NTFY_TOPIC={TOPIC}"));
+    let r = fx.run(&["--setup"]);
+    let daemon: Vec<&str> = r
+        .out
+        .lines()
+        .skip_while(|l| !l.starts_with("daemon      propolis.env's target"))
+        .take_while(|l| l.starts_with("daemon ") || l.starts_with("            "))
+        .collect();
+    assert!(
+        daemon
+            .iter()
+            .any(|l| l.contains("over plain http this answer proves nothing")),
+        "{}",
+        r.out
+    );
+    assert!(
+        daemon
+            .iter()
+            .any(|l| l.contains("today's failure hook reads PROPOLIS_OPS_NTFY_TOPIC otherwise")),
+        "{}",
+        r.out
+    );
+}
+
+/// A collector with a target in alert.env and none in propolis.env: the walk says the test pages
+/// go to alert.env's target and that today's failure hook writes to the journal.
+#[test]
+fn a_collector_with_an_alert_env_target_says_its_failure_hook_writes_to_the_journal() {
+    let fx = Fx::collector();
+    fx.write("etc/propolis/alert.env", ALERT_ENV);
+    let w = fx.walk();
+    assert!(
+        w.out.contains(
+            "propolis.env names no target, so today's failure hook writes to the journal"
+        ),
+        "{}",
+        w.out
+    );
+}
+
+/// On a collector whose credential's read gets no answer (a 503), the gate holds pointer: --setup
+/// says it is not proven that the credential cannot read the topic, and exits 1.
+#[test]
+fn a_collector_whose_token_read_gets_no_answer_is_held_at_pointer_by_setup() {
+    let mut fx = Fx::collector();
+    fx.write("etc/propolis/alert.env", ALERT_ENV);
+    fx.setenv("RC_TOKEN_ANSWER", "503|text/plain");
+    let r = fx.run(&["--setup"]);
+    assert_eq!(r.code, 1, "{}", r.out);
+    assert!(
+        r.out.contains(
+            "gate        pointer:token-unknown  - it is not proven that the credential this host holds cannot read the topic"
+        ),
+        "{}",
+        r.out
+    );
+}
+
+/// With the shell target split across files there is no gate to give: --setup's gate line reads
+/// none:notarget even when the daemon's target answered readable and the answer could not be
+/// stored, since that answer is the daemon's, not the shell senders'.
+#[test]
+fn setup_without_a_shell_target_gives_no_gate_from_the_daemons_unstored_answer() {
+    let mut fx = Fx::single();
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid/alerts\n",
+    );
+    fx.refuse_writes_of("readcheck");
+    fx.setenv("RC_JSON", "200|application/x-ndjson");
+    let r = fx.run(&["--setup"]);
+    assert!(r.out.contains("gate        none:notarget"), "{}", r.out);
+    assert!(!r.out.contains("gate        pointer:readable"), "{}", r.out);
 }

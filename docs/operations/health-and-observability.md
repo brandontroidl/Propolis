@@ -546,12 +546,19 @@ Each hourly pass, all slow work first and without the state lock:
   ntfy server for the alert topic (its `json`, `raw` and `sse` read paths, each asking only for
   the last second, so nothing stored is fetched), and one more with the token when one is set.
   A user and password written into the URL are taken off those three, and without a token one
-  more request carries them, to learn whether they can read the topic.
+  more request carries them, to learn whether they can read the topic. Over plain `http://` no
+  request carries a credential: the gate never gives `full` there whatever the answer, and the
+  request would carry the credential in clear.
   The topic and the token go to curl in files only root can read, never on a command line. A
   401 or 403 on all three is `refused`; a readable answer, a login page, a redirect, a 404 or
   anything else is recorded by that name; a 429, a 5xx or no answer at all changes nothing
-  already decided. The answer is stored in `/var/lib/propolis/witness/readcheck` with a hash of
-  the URL and topic, so a changed target is checked again by the next light pass;
+  already decided, except that a definite answer about the credential got in the same attempt is
+  kept. The answer is stored in `/var/lib/propolis/witness/readcheck` with a hash of the URL and
+  topic, and with a salted hash naming the credential it is about, so a changed target, token or
+  URL user is checked again by the next light pass. With a target in `/etc/propolis/alert.env`
+  the check is made of both targets, the shell senders' (line of role `shell`) and
+  `propolis.env`'s, where the daemon and today's failure hook post (role `daemon`); a change of
+  either voids only its own line;
 - checks the light pass: its timer active and enabled, and a pass completed within 20 minutes;
 - samples the free space and inodes of every store's filesystem (see [volume](#volume));
 - on a single box or control node, reads whether a crontab line or an enabled timer runs the
@@ -658,10 +665,15 @@ without asking the server: `full` only when the stored answer is for the target 
 `refused`, was decided within 24 hours, an attempt was made within 3 hours, the URL is `https://`
 (over plain HTTP anyone on the path could answer 403 and read the rest), and, on a collector or a
 host whose role cannot be told, the credential a post carries (its token, or without one a user
-and password written into the URL) was not found able to read the topic. A credential's GET that
-got no answer keeps what was known of it, so a timeout cannot lift a collector out of pointer
-mode. The daily message is sent only while the gate is `full`, and only from the host that runs
-the daemon. The
+and password written into the URL) is proven unable to read the topic, or there is none. The
+gate reads the stored line of the shell senders' own target (role `shell`, or `both`), never the
+daemon's, so a refusal of one target never makes the other's gate full. Proven means a stored
+`noread` about that very credential: an answer of unknown, an answer about another token (one
+changed since the check), and a line from before credentials were named all hold pointer
+(`pointer:token-unknown`), as does a credential that reads (`pointer:token-reads`). A
+credential's GET that got no answer keeps what was known of the same credential, so a timeout
+cannot lift a collector out of pointer mode. The daily message is sent only while the gate is
+`full`, and only from the host that runs the daemon. The
 `alert` rail warns while the gate is not `full`, and while the daemon's own topic (in
 `propolis.env`, where today's failure hook sends this host's name and the failed unit) is not
 proven private on the same terms (refused within 24 hours, an attempt within 3 hours, over
@@ -686,7 +698,12 @@ hours, an attempt within 3 hours, over `https://`), what the last test page prov
 where the daemon is enabled; `topic not proven private (plain http)` for a refusal over plain
 HTTP, which anyone on the path could have given, `topic check is stale` when the refusal or the
 last attempt is too old, `topic not checked yet` while there is no answer for the target in use,
-and `NO PUSH TARGET (journal only)` without a target.
+and `NO PUSH TARGET (journal only)` without a target. Where the shell senders have no target
+(a URL and topic split across files, or a value `alert.env` sets that is not valid) and
+`propolis.env` still names one, the daemon and today's failure hook post there: the line then
+gives that topic's answer (`topic READABLE by anyone`, or not proven private) and otherwise
+`no shell target; failure hook still posts` while the hook's own reader finds a URL and a topic
+(`deploy/alert-lib.sh#_pa_banner_daemon`).
 
 **Setup, the test page and VERIFIED.** `sudo propolis-status --setup` says what reaches you and
 why: the alias the test page and the daily message name this host by (today's failure alerts name
@@ -694,7 +711,14 @@ it by its host name), the push target (never the topic or the token), the anonym
 made then and there with its answer in words, the gate, which governs the daily message, what the
 daemon and today's failure hook, which are not gated, reveal on a topic that does not refuse
 anonymous reads or over plain http, where the alias comes from, when the daily message goes, and
-the private heartbeat URL it recommends. `sudo propolis-status --test-page` sends one test page
+the private heartbeat URL it recommends. With a target in `/etc/propolis/alert.env` the target
+line names `alert.env`, and a `daemon` line names `propolis.env`'s target, where the daemon and
+today's failure hook still post, with its own anonymous-read answer; a URL in one file and the
+topic in the other is no target, and `--setup` says the target is split across files. Over
+plain http the token line reads `not asked`. The walk says `shell target from alert.env: test
+pages and the daily message go there` and lists the answer for each topic, and names a mistyped
+`PROPOLIS_ALERT_PROFILE`, or `v2`, which this release does not put in force.
+`sudo propolis-status --test-page` sends one test page
 through the failure-alert unit (at most three a day), and `sudo propolis-status --ack-test <code>`
 types back the code it carried ([commands](../reference/commands.md#status-walk)). Apart from
 today's failure alerts, which the hook sends as before, the shell code sends only the test page
@@ -704,15 +728,18 @@ and [the daily message](#the-daily-message).
 failure-alert unit, to the target and with the token now in the files, reached a phone whose owner
 typed the code back, at most 30 days ago, and since then no message was refused for good, no
 `alert-path` incident opened and the failure hook left no alert undelivered. The page proves the
-unit, the network and the target as the shell senders read `propolis.env`; today's failure hook
-reads that file with a rule of its own (the last line that starts with `KEY=`), so VERIFIED also
-requires the hook to read the same URL, topic and token, and none of them to be ignored as
-invalid (`deploy/alert-lib.sh#pa_hook_differs`). Otherwise the walk says `NOT VERIFIED` with the
+unit, the network and the shell senders' target (`alert.env`'s when it names one, else
+`propolis.env`'s). Where that target is `propolis.env`'s, today's failure hook reads that file
+with a rule of its own (the last line that starts with `KEY=`), so VERIFIED also requires the
+hook to read the same URL, topic and token, and none of them to be ignored as invalid
+(`deploy/alert-lib.sh#pa_hook_differs`, which compares the hook's reading with the library's
+reading of `propolis.env`, never with `alert.env`); with the target in `alert.env` the page says
+nothing of where the hook posts. Otherwise the walk says `NOT VERIFIED` with the
 first rule that fails: `never` (no test page), `pending` (not typed back), `changed` (another URL,
 topic or token since, or one today's hook reads otherwise), `expired` (over 30 days or dated
 after now), `refused`, `path-failed`, `undelivered`, or `unreadable` when a file it needs cannot
-be read; the banner says the same once the gate is `full` or held at `pointer:token-reads`
-(`deploy/alert-lib.sh#_pa_banner_alert`), and before that the reason the gate gives. A send that
+be read; the banner says the same once the gate is `full` or held at `pointer:token-reads` or
+`pointer:token-unknown` (`deploy/alert-lib.sh#_pa_banner_alert`), and before that the reason the gate gives. A send that
 failed only for now (a timeout, a 429 or a 5xx) undoes nothing. It does not prove the daemon's
 sender, which read its settings when it started, runs in its own sandbox and may hold an older
 topic or token: the walk and `--setup` say `daemon not verified` wherever the daemon is enabled,

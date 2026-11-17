@@ -209,13 +209,18 @@ daily message name this host by (on a host that sends no daily message, the test
 record it; off a single box, with a fallback alias, it warns
 that a fallback alias cannot be told from other hosts' and that `PROPOLIS_OPS_HOST_ALIAS` should
 be set on every host) and that today's failure alerts name it by its
-host name, with no channel line where neither has a target; the push target from
+host name, with no channel line where neither has a target; the push target and the file it
+comes from, `/etc/propolis/alert.env` when that file sets the URL and the topic, else
 `/etc/propolis/propolis.env` (of the URL only its scheme and host, of the topic only its length,
-of the token only whether it is set), the anonymous-read check made now (three GETs, which never
-carry a user and password written into the URL, and a fourth with the token, or without a token
-with those credentials) with each status code and content type and the class it gives, whether
+of the token only whether it is set; a URL in one file and the topic in the other is no target,
+and the line says the target is split across files with the fix), the anonymous-read check made
+now (three GETs, which never carry a user and password written into the URL, and a fourth with
+the token, or without a token with those credentials, never over plain http, where the token
+line reads `not asked`) with each status code and content type and the class it gives, whether
 the credential a post carries can read the topic (`this token`, or `the user and password in the
-URL`; neither is printed),
+URL`; neither is printed); with a target in `alert.env`, a `daemon` line for `propolis.env`'s
+target, where the daemon and today's failure hook still post, with its own check made now (both
+answers are stored, one line of role `shell` and one of role `daemon`),
 the gate, what the daemon and today's failure hook still reveal on a topic that does not refuse
 anonymous reads, the `alias` line (the alias in use and whether it is `PROPOLIS_OPS_HOST_ALIAS`,
 the fallback with how to name the host, or the fallback because the setting is refused), the
@@ -264,9 +269,11 @@ hook claims a page as `sending` before it sends and an attempt still `pending` a
 went out, `deploy/alert-lib.sh#pa_budget_admit`) and records a
 fresh 6-hex code from `/dev/urandom` in `/var/lib/propolis/witness/testpage`, replacing any
 earlier one; then it starts `propolis-alert@propolis-test-page-<CODE>.service`, so the page goes
-out through the failure-alert unit. A page that arrives proves that unit, the network and the
-target as the shell senders read it; VERIFIED also requires today's failure hook to read the same
-target and token from `propolis.env`. The hook sends it only for the recorded code, while it waits
+out through the failure-alert unit, to the shell senders' target (`alert.env`'s when it names
+one, with `alert.env`'s token; today's failure hook keeps posting to `propolis.env`'s). A page
+that arrives proves that unit, the network and that target; where the target is
+`propolis.env`'s, VERIFIED also requires today's failure hook to read the same target and token
+from `propolis.env`. The hook sends it only for the recorded code, while it waits
 and for 10 minutes after it was asked for, and claims its ledger line and then the record
 (`sending`) before the send, so a second start for the same code sends nothing and a page that
 went out always counts toward the three; a page that cannot go out whatever the server would
@@ -318,7 +325,13 @@ used)` after the time when that is so; `... none sent yet`; `daily off
 (PROPOLIS_OPS_DAILY_AT=off)`, `daily off: topic readable`, `daily off: gate <gate>`, or on a host
 that does not run the daemon `daily off: only the host that runs the daemon sends it`,
 `deploy/propolis-status.sh#daily_walk_words`) and, when `PROPOLIS_OPS_HOST_ALIAS` is refused,
-`invalid value ignored: PROPOLIS_OPS_HOST_ALIAS (the fallback alias is used)`; its last line shows when the light and the hourly
+`invalid value ignored: PROPOLIS_OPS_HOST_ALIAS (the fallback alias is used)`; with the target in
+`/etc/propolis/alert.env`, `shell target from alert.env: test pages and the daily message go
+there; the daemon and today's failure hook post to propolis.env's target` (the `alert` row then
+lists a `shell topic` and a `daemon topic` answer); for `PROPOLIS_ALERT_PROFILE`, `invalid value
+ignored: PROPOLIS_ALERT_PROFILE in <file> is neither legacy nor v2 (legacy is used)`, or `profile v2
+set in <file>: not in force in this release, which sends as legacy`; a URL and topic in different
+files make the target field read `(target split across files)`; its last line shows when the light and the hourly
 pass of the witness last completed and, once a light pass has run, the heartbeat URL: `not set`,
 `refused (not an https URL)`, or `set` with when it was last asked and the result, or last
 skipped and why. The URL itself is never printed.

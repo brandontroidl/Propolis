@@ -2478,6 +2478,15 @@ fn fix_scenarios() -> Vec<Scenario> {
                 fx.readcheck("readable");
             },
         ),
+        (
+            "the ntfy URL is set in alert.env and the topic in propolis.env",
+            |fx| {
+                fx.write(
+                    "etc/alert.env",
+                    "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid/alerts\n",
+                );
+            },
+        ),
         ("the witness's hourly timer is not enabled", |fx| {
             fx.unit("propolis-witness@hourly.timer", "disabled", "inactive");
         }),
@@ -8553,19 +8562,36 @@ fn the_alert_channel_warns_without_a_target_over_http_and_with_a_reading_token_o
     let script = healthy_collector(&fx);
     fx.write(
         "etc/propolis.env",
-        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=propolis-ops\n",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=propolis-ops\nPROPOLIS_OPS_NTFY_TOKEN=tk_collector\n",
     );
+    // The stored answer is about the token configured: the salted hash the library names it by.
+    let salt = "0123456789abcdef0123456789abcdef";
+    fx.write(
+        "alert-root/var/lib/propolis/witness/id-salt",
+        &format!("{salt}\n"),
+    );
+    let k8 = Command::new(BASH)
+        .arg("-c")
+        .arg("printf '%s\\0%s' \"$1\" tk_collector | sha256sum | cut -c1-8")
+        .arg("_")
+        .arg(salt)
+        .output()
+        .unwrap();
+    let k8 = String::from_utf8_lossy(&k8.stdout).trim().to_string();
     fx.write(
         "alert-root/var/lib/propolis/witness/readcheck",
         &format!(
-            "#readcheck v1 g=1\nR\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\treads\t403\t403\tboth\t403\n"
+            "#readcheck v1 g=1\nR\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\treads\t403\t403\tboth\t403\ttoken:{k8}\n"
         ),
     );
     let r = fx.run_script(&script, &["--tsv"], &[]);
     let (state, text, _) = alert_channel(&r);
     assert_eq!(
         (state.as_str(), text.as_str()),
-        ("warn", "the topic is not proven private (token-reads)"),
+        (
+            "warn",
+            "the topic refuses anonymous reads; the credential this host carries can read it (token-reads): give this host a token that cannot read the topic, then run sudo propolis-status --setup"
+        ),
         "{}",
         r.out
     );
@@ -8770,5 +8796,393 @@ fn an_invalid_alert_setting_is_named_with_its_file_and_never_its_value() {
         mine,
         ["alert-setting-invalid", "alert-setting-invalid"],
         "{ids:?}"
+    );
+}
+
+/// The shell senders read each of their settings from alert.env when it sets one, over
+/// propolis.env: a URL in one file and the topic in the other is alert-target-split, naming the
+/// two files and never a value; an invalid value alert.env sets is named in alert.env, in words
+/// that do not claim today's hook or the daemon uses it, since neither reads that file; and a
+/// target wholly in alert.env is checked by its own stored line.
+#[test]
+fn alert_settings_are_read_from_alert_env_before_propolis_env() {
+    let fx = Fx::new();
+    let etc = fx.p("etc").display().to_string();
+    fx.write(
+        "etc/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid/alerts\n",
+    );
+    let r = fx.run(&[]);
+    assert_eq!(r.code, 1, "{}", r.out);
+    assert!(
+        r.out.contains(&format!(
+            "PROPOLIS_OPS_NTFY_URL is set in {etc}/alert.env and PROPOLIS_OPS_NTFY_TOPIC in {etc}/propolis.env: the shell senders use a target only when one file sets both"
+        )),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out
+            .contains("set both in /etc/propolis/alert.env, or both in /etc/propolis/propolis.env")
+    );
+    assert!(!r.out.contains("/alerts"), "no value is printed");
+    let r = fx.run(&["--tsv"]);
+    let (state, _, ids) = alert_channel(&r);
+    assert_eq!(state, "warn");
+    assert_eq!(
+        ids.iter()
+            .filter(|i| i.starts_with("alert-"))
+            .collect::<Vec<_>>(),
+        ["alert-target-split"]
+    );
+
+    fx.write(
+        "etc/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=a1ert-topic\n",
+    );
+    let r = fx.run(&[]);
+    assert!(
+        r.out.contains(&format!(
+            "PROPOLIS_OPS_NTFY_URL in {etc}/alert.env is not valid (an http:// or https:// URL with a host and no blanks): the status command, the witness and test pages ignore it; the daemon and today's failure alerts never read alert.env; see sudo propolis-status --setup"
+        )),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("a1ert-topic"));
+
+    // A whole target in alert.env: its own line is what the row needs, and the daemon's target
+    // still has the fixture's refusal.
+    fx.write(
+        "etc/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid/alerts\nPROPOLIS_OPS_NTFY_TOPIC=a1ert-topic\n",
+    );
+    let r = fx.run(&["--tsv"]);
+    let (state, text, ids) = alert_channel(&r);
+    assert_eq!(
+        state, "skip",
+        "the shell target was never checked: {text} {ids:?}"
+    );
+}
+
+/// The alias, the daily time and the profile are the shell senders' alone: a refused alias, a
+/// daily time of neither form and a profile other than legacy or v2 are each
+/// alert-setting-invalid in words that name neither today's failure hook nor the daemon, which do
+/// not read them; v2 is named on the row as set but not in force in this release.
+#[test]
+fn the_alias_the_daily_time_and_the_profile_are_judged_without_naming_the_hook_or_the_daemon() {
+    let fx = Fx::new();
+    let etc = fx.p("etc").display().to_string();
+    let env = fx.read("etc/propolis.env");
+    fx.write(
+        "etc/propolis.env",
+        &format!("{env}PROPOLIS_OPS_HOST_ALIAS=propolis-box\nPROPOLIS_OPS_DAILY_AT=25:99\n"),
+    );
+    fx.write("etc/alert.env", "PROPOLIS_ALERT_PROFILE=v3\n");
+    let r = fx.run(&[]);
+    assert_eq!(r.code, 1, "{}", r.out);
+    for (key, file, why) in [
+        (
+            "PROPOLIS_OPS_HOST_ALIAS",
+            "propolis.env",
+            "test pages and the daily message name this host by the fallback alias instead",
+        ),
+        (
+            "PROPOLIS_OPS_DAILY_AT",
+            "propolis.env",
+            "the daily message keeps the default time, 08:41 local",
+        ),
+        (
+            "PROPOLIS_ALERT_PROFILE",
+            "alert.env",
+            "the witness and the status command read it as legacy",
+        ),
+    ] {
+        let line = r
+            .out
+            .lines()
+            .find(|l| l.contains(&format!("{key} in {etc}/{file} is not valid (")))
+            .unwrap_or_else(|| panic!("{key}:\n{}", r.out));
+        assert!(line.contains(why), "{line}");
+        assert!(!line.contains("hook") && !line.contains("daemon"), "{line}");
+    }
+    for value in ["propolis-box", "25:99", "v3"] {
+        assert!(!r.out.contains(value), "{value} printed");
+    }
+    fx.write("etc/propolis.env", &env);
+    fx.write("etc/alert.env", "PROPOLIS_ALERT_PROFILE=v2\n");
+    let r = fx.run(&["--tsv"]);
+    let (state, text, ids) = alert_channel(&r);
+    assert_eq!(state, "ok", "{text}");
+    assert!(ids.iter().all(|i| !i.starts_with("alert-")), "{ids:?}");
+    assert!(
+        text.ends_with("; PROPOLIS_ALERT_PROFILE=v2 in alert.env is set but not in force in this release, which sends as legacy"),
+        "{text}"
+    );
+}
+
+/// The first 16 hex of sha256(URL LF TOPIC LF): the read-check binding of a target.
+fn rc_binding(url: &str, topic: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(format!("{url}\n{topic}\n").as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The messages of the F lines for the finding `id:KEY` in a --tsv run: the line carries the id
+/// before its colon, and the message starts with the key.
+fn finding_texts(r: &Run, id: &str) -> Vec<String> {
+    let (base, key) = id.split_once(':').unwrap_or((id, ""));
+    r.out
+        .lines()
+        .map(|l| l.split('\t').collect::<Vec<_>>())
+        .filter(|f| f[0] == "F" && f.get(2) == Some(&base))
+        .filter_map(|f| f.get(6).map(|m| m.to_string()))
+        .filter(|m| m.starts_with(&format!("{key} ")))
+        .collect()
+}
+
+/// The one message of the finding `id:KEY`, empty when there is none.
+fn finding_text(r: &Run, id: &str) -> String {
+    finding_texts(r, id).into_iter().next().unwrap_or_default()
+}
+
+/// A stored readcheck line: binding, the definite and attempt stamps' ages, class, role, and the
+/// credential field (empty for none).
+fn rc_line(bind: &str, definite_age: u64, attempt_age: u64, class: &str, role: &str) -> String {
+    let d = format!("{}/0000aaaa/1", NOW - definite_age);
+    let a = format!("{}/0000aaaa/1", NOW - attempt_age);
+    format!("R\t{bind}\t{a}\t{class}\t{d}\t{class}\t-\t403\t403\t{role}\t403\n")
+}
+
+/// A readable propolis.env topic, where the daemon and today's failure hook post, is
+/// alert-topic-readable whatever the shell senders' own target is: also when alert.env leaves
+/// them none, by a URL in one file and the topic in the other, or by a topic it sets that is not
+/// valid, which wins with no fallback.
+#[test]
+fn a_readable_daemon_topic_is_reported_when_alert_env_leaves_the_shell_senders_no_target() {
+    let fx = Fx::new();
+    for (alert, split) in [
+        (
+            "PROPOLIS_OPS_NTFY_URL=https://alert.example.invalid\n",
+            true,
+        ),
+        (
+            "PROPOLIS_OPS_NTFY_URL=https://alert.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=not a topic\n",
+            false,
+        ),
+    ] {
+        fx.write("etc/alert.env", alert);
+        for role in ["both", "daemon"] {
+            fx.write(
+                "alert-root/var/lib/propolis/witness/readcheck",
+                &format!(
+                    "#readcheck v1 g=1\n{}",
+                    rc_line(FX_BINDING, 600, 600, "readable", role)
+                ),
+            );
+            let r = fx.run(&["--tsv"]);
+            let (state, text, ids) = alert_channel(&r);
+            assert_eq!(state, "warn", "{alert} {role}: {text}");
+            assert!(
+                ids.iter().any(|i| i == "alert-topic-readable"),
+                "{alert} {role}: {ids:?}"
+            );
+            assert_eq!(
+                ids.iter().any(|i| i == "alert-target-split"),
+                split,
+                "{ids:?}"
+            );
+        }
+    }
+}
+
+/// With two targets, the propolis.env topic is proven private only on the gate's own terms: a
+/// refusal bound to it, decided within a day, attempted within three hours, over https. Without
+/// one the row is unknown with its limit line, a stale one is unknown too, and over plain http
+/// no refusal makes it ok.
+#[test]
+fn with_two_targets_the_daemon_topic_is_ok_only_for_a_fresh_https_refusal() {
+    let fx = Fx::new();
+    fx.write(
+        "etc/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=https://alert.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=a1ert-topic\n",
+    );
+    let shell = rc_line(
+        &rc_binding("https://alert.example.invalid", "a1ert-topic"),
+        600,
+        600,
+        "refused",
+        "shell",
+    );
+    let store = |daemon: &str| {
+        fx.write(
+            "alert-root/var/lib/propolis/witness/readcheck",
+            &format!("#readcheck v1 g=1\n{shell}{daemon}"),
+        );
+        fx.run(&["--tsv"])
+    };
+    let r = store("");
+    let (state, text, _) = alert_channel(&r);
+    assert_eq!(state, "unknown", "{text}");
+    assert!(
+        r.out
+            .contains("anonymous read of propolis.env's target not checked yet"),
+        "{}",
+        r.out
+    );
+    let r = store(&rc_line(FX_BINDING, 3 * 86400, 600, "refused", "daemon"));
+    let (state, text, _) = alert_channel(&r);
+    assert_eq!(state, "unknown", "a refusal three days old: {text}");
+    let r = store(&rc_line(FX_BINDING, 600, 4 * 3600, "refused", "daemon"));
+    let (state, text, _) = alert_channel(&r);
+    assert_eq!(state, "unknown", "no attempt for four hours: {text}");
+    let r = store(&rc_line(FX_BINDING, 600, 600, "refused", "daemon"));
+    let (state, text, _) = alert_channel(&r);
+    assert_eq!(state, "ok", "{text}");
+
+    fx.set_env_line(
+        "etc/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=",
+        Some("PROPOLIS_OPS_NTFY_URL=http://ntfy.example.invalid"),
+    );
+    let r = store(&rc_line(
+        &rc_binding("http://ntfy.example.invalid", "propolis-ops"),
+        600,
+        600,
+        "refused",
+        "daemon",
+    ));
+    let (state, text, _) = alert_channel(&r);
+    assert_ne!(state, "ok", "{text}");
+    assert!(text.contains("not proven private (plain http)"), "{text}");
+}
+
+/// A token alert.env sets beside no target of its own is not used: the shell senders post to
+/// propolis.env's target with propolis.env's token. It is named, so it is not taken for the one in
+/// use, with the two ways to make it count.
+#[test]
+fn a_token_in_alert_env_without_a_target_there_is_named_as_ignored() {
+    let fx = Fx::new();
+    let etc = fx.p("etc").display().to_string();
+    fx.write("etc/alert.env", "PROPOLIS_OPS_NTFY_TOKEN=tk_alert\n");
+    let r = fx.run(&["--tsv"]);
+    let text = finding_text(&r, "alert-setting-invalid:PROPOLIS_OPS_NTFY_TOKEN");
+    assert_eq!(
+        text,
+        format!(
+            "PROPOLIS_OPS_NTFY_TOKEN in {etc}/alert.env is ignored: alert.env sets no target; a token goes only with the target of its own file; see sudo propolis-status --setup"
+        ),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out.contains("set PROPOLIS_OPS_NTFY_URL and PROPOLIS_OPS_NTFY_TOPIC in /etc/propolis/alert.env too, or move the token to /etc/propolis/propolis.env"),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("tk_alert"));
+}
+
+/// Where the anonymous refusal is proven and only what this host's credential reads is not known
+/// (a host whose role cannot be told, with a token, and a line from before credentials were named)
+/// the row says that, with the step that clears it, never that the topic is not proven private.
+#[test]
+fn an_unknown_credential_answer_is_named_as_such_with_the_step_that_clears_it() {
+    let fx = Fx::new();
+    fx.unit("propolis.service", "disabled", "inactive");
+    let env = fx.read("etc/propolis.env");
+    fx.write(
+        "etc/propolis.env",
+        &format!("{env}PROPOLIS_OPS_NTFY_TOKEN=tk_unknown\n"),
+    );
+    fx.readcheck("refused");
+    let r = fx.run(&["--tsv"]);
+    let (state, text, _) = alert_channel(&r);
+    assert_eq!(state, "warn", "{text}");
+    assert!(
+        text.starts_with("the topic refuses anonymous reads; whether the credential this host carries can read it is not known (the stored answer is from an older line that names no credential): the witness asks again within the light pass or the hour; or run sudo propolis-status --setup"),
+        "{text}"
+    );
+    assert!(!text.contains("not proven private"), "{text}");
+}
+
+/// A push setting that is not valid in both files is one finding that names both: alert.env's
+/// value, which the shell senders ignore, and propolis.env's, which today's failure hook and the
+/// daemon use as written.
+#[test]
+fn a_push_setting_invalid_in_both_files_is_one_finding_naming_both() {
+    let fx = Fx::new();
+    let etc = fx.p("etc").display().to_string();
+    fx.set_env_line(
+        "etc/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=",
+        Some("PROPOLIS_OPS_NTFY_URL=ntfy.example"),
+    );
+    fx.write(
+        "etc/alert.env",
+        "PROPOLIS_OPS_NTFY_URL=ntfy.example\nPROPOLIS_OPS_NTFY_TOPIC=a1ert-topic\n",
+    );
+    let r = fx.run(&["--tsv"]);
+    let text = finding_text(&r, "alert-setting-invalid:PROPOLIS_OPS_NTFY_URL");
+    assert!(
+        text.starts_with(&format!(
+            "PROPOLIS_OPS_NTFY_URL in {etc}/alert.env is not valid ("
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("it is not valid in {etc}/propolis.env either, where today's failure hook and the daemon use it as written")),
+        "{text}"
+    );
+    assert_eq!(
+        finding_texts(&r, "alert-setting-invalid:PROPOLIS_OPS_NTFY_URL").len(),
+        1,
+        "{}",
+        r.out
+    );
+}
+
+/// With a valid target in alert.env, a URL propolis.env holds that is not valid is named in
+/// propolis.env, where today's failure hook and the daemon (or, on a host that runs none, the
+/// hook alone) still use it as written, while the shell senders read theirs from alert.env.
+#[test]
+fn an_invalid_propolis_env_url_beside_an_alert_env_target_is_named_in_propolis_env() {
+    let fx = Fx::new();
+    let etc = fx.p("etc").display().to_string();
+    let target = "PROPOLIS_OPS_NTFY_URL=https://alert.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=a1ert-topic\n";
+    fx.set_env_line(
+        "etc/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=",
+        Some("PROPOLIS_OPS_NTFY_URL=ntfy.example.invalid"),
+    );
+    fx.write("etc/alert.env", target);
+    let r = fx.run(&["--tsv"]);
+    assert_eq!(
+        finding_text(&r, "alert-setting-invalid:PROPOLIS_OPS_NTFY_URL"),
+        format!(
+            "PROPOLIS_OPS_NTFY_URL in {etc}/propolis.env is not valid (an http:// or https:// URL with a host and no blanks): today's failure hook and the daemon still use it as written; the status command and the witness read this setting from alert.env; see sudo propolis-status --setup"
+        ),
+        "{}",
+        r.out
+    );
+
+    let fx = Fx::new();
+    let etc = fx.p("etc").display().to_string();
+    let script = healthy_collector(&fx);
+    fx.write(
+        "etc/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=propolis-ops\n",
+    );
+    fx.write("etc/alert.env", target);
+    let r = fx.run_script(&script, &["--tsv"], &[]);
+    assert_eq!(
+        finding_text(&r, "alert-setting-invalid:PROPOLIS_OPS_NTFY_URL"),
+        format!(
+            "PROPOLIS_OPS_NTFY_URL in {etc}/propolis.env is not valid (an http:// or https:// URL with a host and no blanks): today's failure hook still uses it as written; the status command and the witness read this setting from alert.env; see sudo propolis-status --setup"
+        ),
+        "{}",
+        r.out
     );
 }

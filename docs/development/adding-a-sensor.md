@@ -158,7 +158,8 @@ existing units. Observable required directives (`deploy/sensor-ssh.service`):
   `-/etc/propolis/<name>.env` to every other sensor unit's list: the test derives the set from
   every unit's `EnvironmentFile=`, plus the env files no unit loads, taken from the files that
   name them (`deploy/migrate.sh#MIGRATE_ENV`, `deploy/alert-lib.sh#PA_ALERT_ENV_NAME`,
-  `crates/watch/src/config.rs#WATCH_ENV_PATH`; nothing reads `alert.env` yet), and holds each
+  `crates/watch/src/config.rs#WATCH_ENV_PATH`; `alert.env` is read only by the root shell alert
+  senders), and holds each
   sensor unit to it exactly, so both halves fail until done.
 - Resource caps: `MemoryMax=512M`, `TasksMax=`, `LimitNOFILE=`, `CPUQuota=`.
 

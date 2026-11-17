@@ -4,14 +4,64 @@
 
 ### Upgrade note
 
+- **`/etc/propolis/alert.env` is read by the shell senders, and a collector's credential must be
+  proven unable to read.** This change sends no new message (the daily message below is the only
+  new one) and `v2` cannot be switched on.
+  On a host without `alert.env` the senders behave as before, with three exceptions: the gate of
+  a collector or a host whose role cannot be told (below); the read check over plain http
+  (below); and config-check, which on every host now names a refused alias, a daily time of
+  neither form and a mistyped profile, and on a host whose role cannot be told and that holds a
+  token warns (`alert-channel`, the credential's answer not known) until the witness's first
+  light pass after the upgrade stores which credential its answer is about. In detail:
+  - The witness and `propolis-status` read the push target, the token, `PROPOLIS_OPS_HOST_ALIAS`,
+    `PROPOLIS_OPS_DAILY_AT`, `PROPOLIS_ALERT_PROFILE` and `PROPOLIS_WITNESS_HEARTBEAT_URL` from
+    `alert.env` when it gives the key a value, over `propolis.env`. The URL and topic make a
+    target only from one file (a split is config-check's `alert-target-split`, and the walk's
+    `target split across files`); the token comes from the target's file. The daemon and today's
+    failure hook read `propolis.env` alone, as before (the hook reads `alert.env` only to send a
+    test page), so a token in `alert.env` beside no target there is ignored and named as ignored
+    (`alert-setting-invalid:PROPOLIS_OPS_NTFY_TOKEN`), and with a target in
+    `alert.env` test pages and the daily message go there while the daemon and the hook keep
+    posting to `propolis.env`'s. The anonymous-read check is then made of both targets and stored
+    as one line each (roles `shell` and `daemon`), and `--setup` shows a `daemon` line for
+    `propolis.env`'s target. The alias and the daily time can move to `alert.env`, which keeps
+    their edits out of the daemon's change-pending notice.
+  - `PROPOLIS_ALERT_PROFILE` is read and checked: a value other than `legacy` or `v2` is
+    `alert-setting-invalid` and read as `legacy`; `v2` is shown as set but not in force. This
+    release sends as `legacy` whatever the file says.
+  - On a collector, or a host whose role cannot be told, the gate is `full` only when the
+    credential a post carries (the token, or a user and password in the URL) is proven unable to
+    read the topic, or there is none: an answer of unknown now holds pointer
+    (`pointer:token-unknown`), where before only one that read did. The stored answer names the
+    credential it is about (a salted hash, appended to the `readcheck` line only where there is a
+    credential); an answer about another token, or one stored before this release, is not known,
+    and the next light pass asks again. A definite answer about the credential got while the
+    anonymous reads got none is now kept. The daily message keeps its rule: only a single box or
+    a control node sends it.
+  - Over plain http the anonymous-read check no longer asks whether the credential can read: the
+    three anonymous GETs are made, and `--setup`'s token line reads `not asked`. Test pages,
+    today's failure hook and the daemon still send a token over `http://` where one is set.
+  - A readable `propolis.env` topic is reported (config-check `alert-topic-readable`, the login
+    banner's `topic READABLE by anyone`) whatever the shell senders' own target is, also when
+    `alert.env` leaves them none; with two targets config-check's `alert-channel` is `ok` only
+    for a refusal of the `propolis.env` topic decided within a day, attempted within three hours,
+    over https.
+  - config-check names a refused `PROPOLIS_OPS_HOST_ALIAS` and a `PROPOLIS_OPS_DAILY_AT` of
+    neither form (`alert-setting-invalid`), in words that leave out the hook and the daemon,
+    which do not read them; a mistyped `PROPOLIS_ALERT_PROFILE` likewise. Any host that passed
+    before with one of them set that way now exits `1`.
+  - The alert library is version 11; the witness, `propolis-status` and config-check need it.
+
 - **One low-priority daily message from the witness, to a proven-private topic only.** After
   this upgrade a host that runs the daemon (a single box, or the control node of a split
   deployment) and whose alert topic is proven private sends one low-priority message a day
-  from the witness. `PROPOLIS_OPS_DAILY_AT=off` in `/etc/propolis/propolis.env` stops it. A host
+  from the witness. `PROPOLIS_OPS_DAILY_AT=off` stops it, in `/etc/propolis/alert.env` or in
+  `/etc/propolis/propolis.env` (a value in `alert.env` wins). A host
   whose topic can be read by anyone, or was not checked, gets nothing new, and a collector or a
   gateway-only host sends none, whatever its topic: a split deployment gets one a day, from
   its control node, which counts the collectors it lists. In detail:
-  - Proven private means the gate is `full`: a push target from `propolis.env` over `https://`
+  - Proven private means the gate is `full`: the shell senders' push target (`alert.env`'s when
+    it names one, else `propolis.env`'s) over `https://`
     whose topic the witness's anonymous-read check refused within the last day, checked again
     within the last three hours. Over plain http, to a readable or unchecked topic, on a check
     that is stale or got no answer, or without a target, nothing is sent; neither where the

@@ -42,7 +42,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=10
+PA_LIB_VERSION=11
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -317,8 +317,9 @@ _pa_valid_token() {
 }
 
 # _pa_setting VAR KEY CHECK FILE...: VAR from KEY when CHECK passes, else empty with KEY added to
-# PA_INVALID. A line systemd may read differently is invalid too: the value used here could
-# differ from the one the daemon gets. Sets _PA_SETTING_SRC to the file that assigned it.
+# PA_INVALID and `KEY=<file name>` to PA_INVALID_IN. A line systemd may read differently is
+# invalid too: the value used here could differ from the one the daemon gets. Sets
+# _PA_SETTING_SRC to the file that assigned a valid value.
 _pa_setting() {
     local var="$1" key="$2" check="$3"
     shift 3
@@ -331,13 +332,38 @@ _pa_setting() {
         _PA_SETTING_SRC="$PA_ENV_SRC"
     else
         PA_INVALID="${PA_INVALID:+$PA_INVALID }$key"
+        PA_INVALID_IN="${PA_INVALID_IN:+$PA_INVALID_IN }$key=${PA_ENV_SRC##*/}"
     fi
 }
 
-# pa_settings_load: the shell senders' ntfy target. Only propolis.env is read until the senders
-# that honour alert.env exist, so the target is the daemon's (PA_D_*) as well. The target exists
-# (PA_TARGET=1) only when URL and topic are both valid and come from the same file; PA_INVALID
-# names every key that was set to an invalid value and ignored.
+# _pa_shell_files KEY: the file a shell sender reads KEY from, in _PA_FILES: alert.env when that
+# file gives KEY a value, else propolis.env. An empty value in alert.env counts as unset, so a
+# template copied with its lines left empty does not blank what propolis.env sets.
+_pa_shell_files() {
+    pa_env_get "$1" "$PA_ENV_DIR/$PA_ALERT_ENV_NAME" > /dev/null
+    if [ -n "$PA_ENV_VALUE" ]; then
+        _PA_FILES=("$PA_ENV_DIR/$PA_ALERT_ENV_NAME")
+    else
+        _PA_FILES=("$PA_ENV_DIR/propolis.env")
+    fi
+}
+
+# pa_settings_load: the shell senders' settings, each from alert.env when that file assigns it
+# a value and otherwise from propolis.env, and the daemon's ntfy target, which is propolis.env's
+# alone.
+#
+# The shell senders' target (PA_URL, PA_TOPIC, PA_TOKEN) exists (PA_TARGET=1, PA_TARGET_SRC the
+# file's name) only when URL and topic are both valid and come from the same file: half a target
+# from each file would post to a server with a topic meant for another. Then PA_TARGET_SPLIT=1,
+# and PA_URL_SRC and PA_TOPIC_SRC name the two files. The token is read from the target's file
+# only, so a token written for one server never goes to the other; PA_TOKEN_IGNORED=1 when
+# alert.env sets a token and no target of its own, so that token is not used. PA_INVALID names every key of
+# the shell target that was set to an invalid value and ignored, PA_INVALID_IN each as
+# `KEY=<file>`.
+#
+# PA_D_URL, PA_D_TOPIC, PA_D_TOKEN and PA_D_TARGET are the target the daemon and today's failure
+# hook post to, from propolis.env alone (the hook reads alert.env only to send a test page), with PA_D_INVALID for
+# its invalid keys. Without alert.env both targets are the same.
 #
 # Also the witness's heartbeat URL, PROPOLIS_WITNESS_HEARTBEAT_URL (alert.env over propolis.env):
 # PA_HB_URL holds it only when it is a valid https:// URL, and PA_HB_STATE says set, unset,
@@ -346,7 +372,8 @@ _pa_setting() {
 # variable, given to curl only through a 0600 config file (pa_heartbeat_get), and never printed.
 # PA_OPS_ENABLED is 1 when propolis.env turns the daemon's monitor on, read as the daemon reads it.
 #
-# The alias and the daily message's time come from propolis.env too. PA_ALIAS_SET holds
+# The alias and the daily message's time come from alert.env over propolis.env too, with
+# PA_ALIAS_SRC and PA_DAILY_SRC naming the file. PA_ALIAS_SET holds
 # PROPOLIS_OPS_HOST_ALIAS as written, for pa_alias to judge, and PA_ALIAS_STATE says unset, set or
 # invalid (a line systemd may read otherwise; pa_alias then takes the fallback). PA_DAILY_AT is
 # PROPOLIS_OPS_DAILY_AT when it is HH:MM, `off` when the value starts with a word that means off
@@ -354,22 +381,55 @@ _pa_setting() {
 # form keeps the default time rather than turning the message off, because the message goes only
 # to a topic proven to refuse anonymous reads, so one more message reveals nothing, while a daily
 # message that silently stopped is the absence the operator reads as the host being down.
+#
+# PROPOLIS_ALERT_PROFILE (alert.env over propolis.env) is read and checked: PA_PROFILE_STATE is
+# unset, legacy, v2 or invalid (anything else, read as legacy), PA_PROFILE_SRC its file. This
+# release sends as legacy whatever the file says, so PA_PROFILE is legacy: the v2 senders are
+# not in force yet, and a profile that could be switched on before they are would page in a
+# format nothing has proven. Only the test seam PA_TEST_PROFILE (legacy or v2) sets it, and only
+# under a non-empty root, which no unit and no script passes.
 pa_settings_load() {
     local env="$PA_ENV_DIR/propolis.env" url_src topic_src
-    PA_INVALID="" PA_TARGET=0 PA_TARGET_SRC=""
-    _pa_setting PA_URL PROPOLIS_OPS_NTFY_URL _pa_valid_url "$env"
+    local -a tfiles
+    PA_INVALID="" PA_INVALID_IN="" PA_TARGET=0 PA_TARGET_SRC="" PA_TARGET_SPLIT=0
+    _pa_setting PA_D_URL PROPOLIS_OPS_NTFY_URL _pa_valid_url "$env"
+    PA_D_URL="${PA_D_URL%/}"
+    _pa_setting PA_D_TOPIC PROPOLIS_OPS_NTFY_TOPIC _pa_valid_topic "$env"
+    _pa_setting PA_D_TOKEN PROPOLIS_OPS_NTFY_TOKEN _pa_valid_token "$env"
+    PA_D_TARGET=0
+    if [ -n "$PA_D_URL" ] && [ -n "$PA_D_TOPIC" ]; then PA_D_TARGET=1; fi
+    PA_D_INVALID="$PA_INVALID"
+    PA_INVALID="" PA_INVALID_IN=""
+    _pa_shell_files PROPOLIS_OPS_NTFY_URL
+    _pa_setting PA_URL PROPOLIS_OPS_NTFY_URL _pa_valid_url "${_PA_FILES[@]}"
     url_src="$_PA_SETTING_SRC"
     PA_URL="${PA_URL%/}"
-    _pa_setting PA_TOPIC PROPOLIS_OPS_NTFY_TOPIC _pa_valid_topic "$env"
+    _pa_shell_files PROPOLIS_OPS_NTFY_TOPIC
+    _pa_setting PA_TOPIC PROPOLIS_OPS_NTFY_TOPIC _pa_valid_topic "${_PA_FILES[@]}"
     topic_src="$_PA_SETTING_SRC"
-    _pa_setting PA_TOKEN PROPOLIS_OPS_NTFY_TOKEN _pa_valid_token "$env"
-    if [ -n "$PA_URL" ] && [ -n "$PA_TOPIC" ] && [ "$url_src" = "$topic_src" ]; then
-        PA_TARGET=1
-        PA_TARGET_SRC="${url_src##*/}"
+    PA_URL_SRC="${url_src##*/}" PA_TOPIC_SRC="${topic_src##*/}"
+    _pa_shell_files PROPOLIS_OPS_NTFY_TOKEN
+    tfiles=("${_PA_FILES[@]}")
+    if [ -n "$PA_URL" ] && [ -n "$PA_TOPIC" ]; then
+        if [ "$url_src" = "$topic_src" ]; then
+            PA_TARGET=1
+            PA_TARGET_SRC="${url_src##*/}"
+            tfiles=("$url_src")
+        else
+            PA_TARGET_SPLIT=1
+        fi
     fi
-    PA_D_URL="$PA_URL" PA_D_TOPIC="$PA_TOPIC" PA_D_TARGET="$PA_TARGET"
+    _pa_setting PA_TOKEN PROPOLIS_OPS_NTFY_TOKEN _pa_valid_token "${tfiles[@]}"
+    # A token alert.env sets beside no target of its own goes nowhere: say so, or the operator
+    # takes it for the one in use.
+    PA_TOKEN_IGNORED=0
+    if [ "$PA_TARGET_SRC" != "$PA_ALERT_ENV_NAME" ] && [ "$PA_TARGET_SPLIT" = 0 ]; then
+        pa_env_get PROPOLIS_OPS_NTFY_TOKEN "$PA_ENV_DIR/$PA_ALERT_ENV_NAME" > /dev/null
+        [ -z "$PA_ENV_VALUE" ] || PA_TOKEN_IGNORED=1
+    fi
     PA_HB_URL="" PA_HB_STATE=unset
-    pa_env_get PROPOLIS_WITNESS_HEARTBEAT_URL "$env" "$PA_ENV_DIR/$PA_ALERT_ENV_NAME" > /dev/null
+    _pa_shell_files PROPOLIS_WITNESS_HEARTBEAT_URL
+    pa_env_get PROPOLIS_WITNESS_HEARTBEAT_URL "${_PA_FILES[@]}" > /dev/null
     if [ -n "$PA_ENV_VALUE" ]; then
         if [ "$PA_ENV_COMPLEX" != 0 ] || ! _pa_valid_url "$PA_ENV_VALUE"; then
             PA_HB_STATE=invalid
@@ -384,14 +444,18 @@ pa_settings_load() {
     case "${PA_ENV_VALUE,,}" in true | 1 | yes | on) PA_OPS_ENABLED=1 ;; esac
     # Neither goes into PA_INVALID: that list is of the push settings today's failure hook and
     # the daemon read too, and these two are the shell senders' alone.
-    PA_ALIAS_SET="" PA_ALIAS_STATE=unset
-    pa_env_get PROPOLIS_OPS_HOST_ALIAS "$env" > /dev/null
+    PA_ALIAS_SET="" PA_ALIAS_STATE=unset PA_ALIAS_SRC=""
+    _pa_shell_files PROPOLIS_OPS_HOST_ALIAS
+    pa_env_get PROPOLIS_OPS_HOST_ALIAS "${_PA_FILES[@]}" > /dev/null
     if [ -n "$PA_ENV_VALUE" ]; then
+        PA_ALIAS_SRC="${PA_ENV_SRC##*/}"
         if [ "$PA_ENV_COMPLEX" = 0 ]; then PA_ALIAS_SET="$PA_ENV_VALUE" PA_ALIAS_STATE=set; else PA_ALIAS_STATE=invalid; fi
     fi
-    PA_DAILY_AT=08:41 PA_DAILY_STATE=default
-    pa_env_get PROPOLIS_OPS_DAILY_AT "$env" > /dev/null
+    PA_DAILY_AT=08:41 PA_DAILY_STATE=default PA_DAILY_SRC=""
+    _pa_shell_files PROPOLIS_OPS_DAILY_AT
+    pa_env_get PROPOLIS_OPS_DAILY_AT "${_PA_FILES[@]}" > /dev/null
     if [ -n "$PA_ENV_VALUE" ]; then
+        PA_DAILY_SRC="${PA_ENV_SRC##*/}"
         if _pa_daily_off "$PA_ENV_VALUE"; then
             PA_DAILY_AT=off PA_DAILY_STATE=set
         elif [ "$PA_ENV_COMPLEX" = 0 ] && _pa_valid_daily "$PA_ENV_VALUE"; then
@@ -399,6 +463,18 @@ pa_settings_load() {
         else
             PA_DAILY_STATE=invalid
         fi
+    fi
+    PA_PROFILE=legacy PA_PROFILE_STATE=unset PA_PROFILE_SRC=""
+    _pa_shell_files PROPOLIS_ALERT_PROFILE
+    pa_env_get PROPOLIS_ALERT_PROFILE "${_PA_FILES[@]}" > /dev/null
+    if [ -n "$PA_ENV_VALUE" ]; then
+        PA_PROFILE_SRC="${PA_ENV_SRC##*/}" PA_PROFILE_STATE=invalid
+        if [ "$PA_ENV_COMPLEX" = 0 ]; then
+            case "$PA_ENV_VALUE" in legacy | v2) PA_PROFILE_STATE="$PA_ENV_VALUE" ;; esac
+        fi
+    fi
+    if [ -n "${PA_ROOT:-}" ]; then
+        case "${PA_TEST_PROFILE:-}" in legacy | v2) PA_PROFILE="$PA_TEST_PROFILE" ;; esac
     fi
     return 0
 }
@@ -436,9 +512,10 @@ pa_hook_env_value() {
 }
 
 # pa_hook_differs: the push settings today's failure hook reads (pa_hook_env_value) are not the
-# shell senders' (pa_settings_load, which the caller has run). Sets PA_HOOK_DIFF to the names of
-# the settings that differ or that the shell senders ignore as invalid, and PA_HOOK_URL to the
-# hook's URL; status 1 when they agree. No value is put anywhere but the variables.
+# library's reading of the same file, propolis.env (PA_D_*, from pa_settings_load, which the
+# caller has run), whatever alert.env says: the hook reads alert.env only to send a test page. Sets PA_HOOK_DIFF to
+# the names of the settings that differ or that the library ignores as invalid, and PA_HOOK_URL
+# to the hook's URL; status 1 when they agree. No value is put anywhere but the variables.
 pa_hook_differs() {
     local key url topic token
     PA_HOOK_DIFF=""
@@ -447,11 +524,11 @@ pa_hook_differs() {
     token="$(pa_hook_env_value PROPOLIS_OPS_NTFY_TOKEN)"
     PA_HOOK_URL="${url%/}" PA_HOOK_TOPIC_SET=0
     [ -z "$topic" ] || PA_HOOK_TOPIC_SET=1
-    [ "${url%/}" = "${PA_URL:-}" ] || PA_HOOK_DIFF+=" PROPOLIS_OPS_NTFY_URL"
-    [ "$topic" = "${PA_TOPIC:-}" ] || PA_HOOK_DIFF+=" PROPOLIS_OPS_NTFY_TOPIC"
-    [ "$token" = "${PA_TOKEN:-}" ] || PA_HOOK_DIFF+=" PROPOLIS_OPS_NTFY_TOKEN"
+    [ "${url%/}" = "${PA_D_URL:-}" ] || PA_HOOK_DIFF+=" PROPOLIS_OPS_NTFY_URL"
+    [ "$topic" = "${PA_D_TOPIC:-}" ] || PA_HOOK_DIFF+=" PROPOLIS_OPS_NTFY_TOPIC"
+    [ "$token" = "${PA_D_TOKEN:-}" ] || PA_HOOK_DIFF+=" PROPOLIS_OPS_NTFY_TOKEN"
     for key in PROPOLIS_OPS_NTFY_URL PROPOLIS_OPS_NTFY_TOPIC PROPOLIS_OPS_NTFY_TOKEN; do
-        case " ${PA_INVALID:-} " in
+        case " ${PA_D_INVALID:-} " in
             *" $key "*) [[ " $PA_HOOK_DIFF " == *" $key "* ]] || PA_HOOK_DIFF+=" $key" ;;
         esac
     done
@@ -1417,7 +1494,18 @@ pa_banner() {
     lines+=("$part")
     pa_settings_load
     if [ "${PA_TARGET:-0}" != 1 ]; then
-        if [ "${PA_ROLE:-}" = collector ]; then alert="no push path here (collector)"; else alert="NO PUSH TARGET (journal only)"; fi
+        # The daemon and today's failure hook post to propolis.env's target whatever the shell
+        # senders lack, so what is known of that topic comes first.
+        if ! alert="$(_pa_banner_daemon)"; then
+            pa_hook_differs || true
+            if [ -n "${PA_HOOK_URL:-}" ] && [ "${PA_HOOK_TOPIC_SET:-0}" = 1 ]; then
+                alert="no shell target; failure hook still posts"
+            elif [ "${PA_ROLE:-}" = collector ]; then
+                alert="no push path here (collector)"
+            else
+                alert="NO PUSH TARGET (journal only)"
+            fi
+        fi
     else
         alert="$(_pa_banner_alert)"
     fi
@@ -1481,6 +1569,16 @@ _pa_banner_class() {
     esac
 }
 
+# _pa_banner_daemon: the banner's word (_pa_banner_class) on the daemon's target, propolis.env's,
+# when its stored read check, bound to that target now, found anything but a refusal. Status 1,
+# nothing printed, otherwise.
+_pa_banner_daemon() {
+    local b
+    [ "${PA_D_TARGET:-0}" = 1 ] || return 1
+    b="$(pa_readcheck_binding "$PA_D_URL" "$PA_D_TOPIC")" || return 1
+    _pa_rc_line daemon && [ "$PA_RCL_BIND" = "$b" ] && _pa_banner_class "$PA_RCL_DCLASS"
+}
+
 # _pa_banner_alert: the banner's word on a target that exists: READABLE when the stored read check
 # of the shell target or of the daemon's (propolis.env) target, bound to the target in use now,
 # found the topic readable, and not proven private for any other definite class but refused
@@ -1494,12 +1592,7 @@ _pa_banner_alert() {
     if _pa_rc_line shell && [ "$PA_RCL_BIND" = "$b" ] && _pa_banner_class "$PA_RCL_DCLASS"; then
         return 0
     fi
-    if [ "${PA_D_TARGET:-0}" = 1 ]; then
-        b="$(pa_readcheck_binding "$PA_D_URL" "$PA_D_TOPIC")" || b=""
-        if _pa_rc_line daemon && [ "$PA_RCL_BIND" = "$b" ] && _pa_banner_class "$PA_RCL_DCLASS"; then
-            return 0
-        fi
-    fi
+    if _pa_banner_daemon; then return 0; fi
     # A refusal is claimed only where the gate holds it proven: decided within a day, an attempt
     # within three hours, over https. A token that can read is the gate's own reason to hold full
     # detail back, not a sign the anonymous refusal is unproven, and so is the detail setting,
@@ -1511,7 +1604,7 @@ _pa_banner_alert() {
     b="$(PA_DETAIL=auto pa_gate)"
     if [ "$b" = pointer:token-reads ] && [[ ${PA_URL:-} != https://* ]]; then b=pointer:insecure; fi
     case "$b" in
-        full | pointer:token-reads)
+        full | pointer:token-reads | pointer:token-unknown)
             if pa_verified > /dev/null; then
                 printf 'VERIFIED %s (shell)' "$(pa_dur "$(pa_age "$PA_TP_ACKED")")"
             else
@@ -1537,7 +1630,8 @@ _pa_banner_alert() {
 # `;`, and whether every line of a json body starts with ntfy's own `{"id":"`. Anything that
 # cannot be classified is not refused, so the gate falls to pointer mode. The readcheck state file
 # holds one line per target role (shell, daemon, or both when they are the same):
-# R binding attempt-stamp attempt-class definite-stamp definite-class token json raw role sse.
+# R binding attempt-stamp attempt-class definite-stamp definite-class token json raw role sse
+# [credential], the last only when a credential was carried (pa_cred_fp).
 
 PA_RC_CLASSES="refused readable not_ntfy redirect not_found transient unexpected"
 
@@ -1633,15 +1727,17 @@ _pa_rc_conf() {
 # else the class of the first answer that was not refused), PA_RC_JSON, PA_RC_RAW and PA_RC_SSE
 # (each status code) with PA_RC_JSON_CT, PA_RC_RAW_CT and PA_RC_SSE_CT (each content type's word,
 # `-` when there was none in a type's form), PA_RC_TOKEN (whether the credential a post carries
-# can read the topic: reads, noread, unknown, or `-` when there is none), PA_RC_CRED (which
-# credential that was: token, url for a user and password written into the URL, or `-`) and
-# PA_RC_CAUSE (`-`, or tool.exec when curl or a private temporary file was not to be had, the
-# class then being transient). Status 0, or 1 with that cause.
+# can read the topic: reads, noread, unknown, or `-` when there is none), PA_RC_TOKEN_DEF (1 when
+# that GET got a definite answer, 0 when none came or none was asked), PA_RC_CRED (which
+# credential that was: token, url for a user and password written into the URL, or `-`),
+# PA_RC_CRED_ASKED (0 when there is a credential and it was not asked, over plain http, its class
+# then being unknown; else 1) and PA_RC_CAUSE (`-`, or tool.exec when curl or a private temporary
+# file was not to be had, the class then being transient). Status 0, or 1 with that cause.
 pa_readcheck_run() {
     local url="${1:-}" topic="${2:-}" token="${3:-}" conf hdr body ep r code ct cls first="" any_t=0 all_r=1
     local rest auth url_set="${1:-}" url_cred=0
     PA_RC_CLASS=transient PA_RC_JSON=000 PA_RC_RAW=000 PA_RC_SSE=000 PA_RC_TOKEN=- PA_RC_CAUSE=-
-    PA_RC_JSON_CT=- PA_RC_RAW_CT=- PA_RC_SSE_CT=- PA_RC_CRED=-
+    PA_RC_JSON_CT=- PA_RC_RAW_CT=- PA_RC_SSE_CT=- PA_RC_CRED=- PA_RC_CRED_ASKED=1 PA_RC_TOKEN_DEF=0
     # The check is of anonymous reads: a user and password written into the URL would go out as
     # Basic credentials, and a 401 for those would pass for a refusal of anyone. They are taken
     # off the anonymous requests here; the binding is the caller's, of the URL as set.
@@ -1705,17 +1801,19 @@ pa_readcheck_run() {
     # What a post from this host carries is asked too, since on a collector a credential that can
     # read the topic holds the gate at pointer: the token when one is set (its header replaces
     # any user in the URL), else the user and password written into the URL, sent as they are.
-    if [ -n "$token" ]; then
+    # Not over plain http: the gate never gives full there whatever the answer, so the request
+    # would change no decision and would carry the credential in clear.
+    if { [ -n "$token" ] || [ "$url_cred" = 1 ]; } && [[ $url != https://* ]]; then
+        PA_RC_TOKEN=unknown PA_RC_CRED=url PA_RC_CRED_ASKED=0
+        [ -z "$token" ] || PA_RC_CRED=token
+    elif [ -n "$token" ]; then
         PA_RC_TOKEN=unknown PA_RC_CRED=token
         : > "$body" 2> /dev/null
         if _pa_rc_conf "$conf" "$url/$topic/json?poll=1&since=1s" \
             && { printf 'Authorization: Bearer %s\n' "$token" > "$hdr"; } 2> /dev/null; then
             r="$(_pa_rc_get "$conf" "$hdr" "$body")"
             code="${r%%$'\t'*}" ct="${r#*$'\t'}"
-            case "$(pa_readcheck_class json "$code" "$ct" "$body")" in
-                readable) PA_RC_TOKEN=reads ;;
-                refused) PA_RC_TOKEN=noread ;;
-            esac
+            _pa_rc_token_answer "$(pa_readcheck_class json "$code" "$ct" "$body")"
         fi
     elif [ "$url_cred" = 1 ]; then
         PA_RC_TOKEN=unknown PA_RC_CRED=url
@@ -1723,26 +1821,37 @@ pa_readcheck_run() {
         if _pa_rc_conf "$conf" "$url_set/$topic/json?poll=1&since=1s"; then
             r="$(_pa_rc_get "$conf" "" "$body")"
             code="${r%%$'\t'*}" ct="${r#*$'\t'}"
-            case "$(pa_readcheck_class json "$code" "$ct" "$body")" in
-                readable) PA_RC_TOKEN=reads ;;
-                refused) PA_RC_TOKEN=noread ;;
-            esac
+            _pa_rc_token_answer "$(pa_readcheck_class json "$code" "$ct" "$body")"
         fi
     fi
     rm -f -- "$conf" "$hdr" "$body" 2> /dev/null
     return 0
 }
 
+# _pa_rc_token_answer CLASS: the credential's class from its GET's answer: reads for readable,
+# noread for refused, unknown for anything else. PA_RC_TOKEN_DEF is 1 when the server gave a
+# definite answer (anything but no answer, 429 or a 5xx): only an answer that never came lets a
+# stored class about the same credential stand.
+_pa_rc_token_answer() {
+    case "$1" in
+        readable) PA_RC_TOKEN=reads PA_RC_TOKEN_DEF=1 ;;
+        refused) PA_RC_TOKEN=noread PA_RC_TOKEN_DEF=1 ;;
+        transient) PA_RC_TOKEN=unknown PA_RC_TOKEN_DEF=0 ;;
+        *) PA_RC_TOKEN=unknown PA_RC_TOKEN_DEF=1 ;;
+    esac
+}
+
 # _pa_rc_line ROLE: the stored readcheck line for ROLE (shell or daemon; a `both` line serves
 # either). Sets PA_RCL_BIND, PA_RCL_ASTAMP, PA_RCL_ACLASS, PA_RCL_DSTAMP, PA_RCL_DCLASS,
-# PA_RCL_TOKEN, PA_RCL_JSON, PA_RCL_RAW, PA_RCL_ROLE and PA_RCL_SSE, every field checked against
-# its form (a class outside the closed list reads unexpected, a stamp that cannot be read `-`).
-# Status 1 when there is none.
+# PA_RCL_TOKEN, PA_RCL_JSON, PA_RCL_RAW, PA_RCL_ROLE, PA_RCL_SSE and PA_RCL_CRED (the credential
+# the token class is about, as pa_cred_fp names it; empty when the line does not say, which is
+# how an older release wrote it), every field checked against its form (a class outside the
+# closed list reads unexpected, a stamp that cannot be read `-`). Status 1 when there is none.
 _pa_rc_line() {
-    local want="${1:-}" t b as ac ds dc tk j r role s found=""
+    local want="${1:-}" t b as ac ds dc tk j r role s c found=""
     PA_RCL_BIND="" PA_RCL_ASTAMP=- PA_RCL_ACLASS=- PA_RCL_DSTAMP=- PA_RCL_DCLASS=- PA_RCL_TOKEN=-
-    PA_RCL_JSON=- PA_RCL_RAW=- PA_RCL_ROLE="" PA_RCL_SSE=-
-    while IFS=$'\t' read -r t b as ac ds dc tk j r role s _; do
+    PA_RCL_JSON=- PA_RCL_RAW=- PA_RCL_ROLE="" PA_RCL_SSE=- PA_RCL_CRED=""
+    while IFS=$'\t' read -r t b as ac ds dc tk j r role s c _; do
         [ "$t" = R ] && [[ ${b:-} =~ ^[0-9a-f]{16}$ ]] || continue
         case "${role:-}" in shell | daemon | both) ;; *) continue ;; esac
         if [ "$role" = "$want" ]; then
@@ -1761,6 +1870,7 @@ _pa_rc_line() {
         if [[ ${j:-} =~ ^[0-9]{3}$ ]]; then PA_RCL_JSON="$j"; else PA_RCL_JSON=-; fi
         if [[ ${r:-} =~ ^[0-9]{3}$ ]]; then PA_RCL_RAW="$r"; else PA_RCL_RAW=-; fi
         if [[ ${s:-} =~ ^[0-9]{3}$ ]]; then PA_RCL_SSE="$s"; else PA_RCL_SSE=-; fi
+        if [[ ${c:-} =~ ^(-|(token|url):[0-9a-f]{8})$ ]]; then PA_RCL_CRED="$c"; else PA_RCL_CRED=""; fi
         [ "$found" != 1 ] || break
     done < <(pa_state_read readcheck)
     [ -n "$found" ]
@@ -1777,17 +1887,46 @@ _pa_rc_word() {
     fi
 }
 
+# pa_cred_fp URL TOKEN: the credential a post to URL with TOKEN carries, named without being
+# kept: token:<pa_token8 of the token> when a token is set (its header replaces any user in the
+# URL), url:<pa_token8 of the user and password> when they are written into the URL, `-` for
+# none. A stored answer about a credential is used only while this names the same one. `?` and
+# status 1 without a salt, which matches no stored value.
+pa_cred_fp() {
+    local url="${1:-}" token="${2:-}" rest auth h kind=token
+    if [ -z "$token" ] && [[ $url == *://* ]]; then
+        rest="${url#*://}"
+        auth="${rest%%[/?#]*}"
+        if [[ $auth == *@* ]]; then
+            token="${auth%@*}" kind=url
+        fi
+    fi
+    if [ -z "$token" ]; then
+        printf -- -
+        return 0
+    fi
+    if ! h="$(pa_token8 "$token")"; then
+        printf '?'
+        return 1
+    fi
+    printf '%s:%s' "$kind" "$h"
+}
+
 # pa_gate: full, pointer:<reason> or none:notarget for the shell target, from the stored read
 # check and the settings; no network. full only when: there is a target; the detail setting is
 # auto (PA_DETAIL, read from a later release; auto until then); the stored line is bound to this
 # target; its definite class is refused, decided within 24 h; an attempt was made within 3 h (the
-# checker is alive); on a collector the token cannot read the topic (the role is PA_ROLE, or
-# pa_role's answer when the caller set none, and a role that cannot be told counts as a
-# collector's); and the URL is https (over plain HTTP anyone on the path can answer 403 to the
-# check and then read every push). A stamp that cannot be read or lies in the future fails its
-# rule. Sets PA_GATE, and PA_GATE_CHECKED to the stored attempt stamp (`-` without one).
+# checker is alive); the URL is https (over plain HTTP anyone on the path can answer 403 to the
+# check and then read every push); and on a collector the credential a post carries is proven
+# unable to read the topic, or there is none (the role is PA_ROLE, or pa_role's answer when the
+# caller set none, and a role that cannot be told counts as a collector's). What a credential
+# reads is known only from a stored answer about that same credential (pa_cred_fp), so a token
+# changed since the check, a line that does not say, and an answer of unknown all hold pointer:
+# token-reads for one proven to read, token-unknown otherwise. A stamp that cannot be read or lies
+# in the future fails its rule. Sets PA_GATE, and PA_GATE_CHECKED to the stored attempt stamp
+# (`-` without one).
 pa_gate() {
-    local b a role
+    local b a role cred ck held=0
     PA_GATE="" PA_GATE_CHECKED=-
     if [ "${PA_TARGET:-0}" != 1 ]; then
         PA_GATE=none:notarget
@@ -1810,17 +1949,27 @@ pa_gate() {
                 PA_GATE=pointer:stale
             else
                 a="$(pa_age "$PA_RCL_ASTAMP")"
+                ck=unknown
+                cred="$(pa_cred_fp "${PA_URL:-}" "${PA_TOKEN:-}")" || cred=""
+                if [ "$cred" = - ]; then
+                    ck=none
+                elif [ -n "$cred" ] && [ "$PA_RCL_CRED" = "$cred" ]; then
+                    case "$PA_RCL_TOKEN" in reads | noread) ck="$PA_RCL_TOKEN" ;; esac
+                fi
                 # The role is asked for here when the caller has not set it, and only when it
                 # decides anything: a collector must never pass for another host because nobody
                 # said what it is, and a host whose role cannot be told is held to its rule.
                 role="${PA_ROLE:-}"
-                if [ "$PA_RCL_TOKEN" = reads ] && [ -z "$role" ]; then role="$(pa_role)"; fi
+                if { [ "$ck" = reads ] || [ "$ck" = unknown ]; } && [ -z "$role" ]; then role="$(pa_role)"; fi
+                case "$role" in collector | unknown) held=1 ;; esac
                 if [ "$a" -lt 0 ] || [ "$a" -gt 10800 ]; then
                     PA_GATE=pointer:stale
-                elif [ "$PA_RCL_TOKEN" = reads ] && { [ "$role" = collector ] || [ "$role" = unknown ]; }; then
+                elif [ "$held" = 1 ] && [ "$ck" = reads ]; then
                     PA_GATE=pointer:token-reads
                 elif [[ ${PA_URL:-} != https://* ]]; then
                     PA_GATE=pointer:insecure
+                elif [ "$held" = 1 ] && [ "$ck" = unknown ]; then
+                    PA_GATE=pointer:token-unknown
                 else
                     PA_GATE=full
                 fi
@@ -1830,27 +1979,54 @@ pa_gate() {
     printf '%s' "$PA_GATE"
 }
 
-# pa_readcheck_merge ROLE BINDING HAVE: the readcheck line for ROLE after an attempt whose results
-# are in PA_RC_* (pa_readcheck_run), merged with the stored line the caller read under the lock
-# with _pa_rc_line (HAVE 1, its fields in PA_RCL_*) or without one (HAVE 0). A new binding replaces the line; an attempt with the same
-# binding that was transient changes only the attempt fields, so a 429, a 5xx or a timeout never
-# undoes an earlier definite answer. Prints the line.
+# pa_readcheck_merge ROLE BINDING HAVE [CRED]: the readcheck line for ROLE after an attempt whose
+# results are in PA_RC_* (pa_readcheck_run), merged with the stored line the caller read under
+# the lock with _pa_rc_line (HAVE 1, its fields in PA_RCL_*) or without one (HAVE 0). CRED is
+# pa_cred_fp of the credential the attempt asked about; anything not of its form means it could
+# not be named. A new binding replaces the line; an attempt with the same binding that was
+# transient changes only the attempt fields, so a 429, a 5xx or a timeout never undoes an
+# earlier definite answer, except that a definite answer about the credential (reads or noread)
+# is new knowledge and is kept whatever the anonymous GETs got. An unknown answer keeps a stored
+# definite one only when that one is about the same credential and the credential's GET got no
+# answer at all (PA_RC_TOKEN_DEF 0), so a timed-out GET cannot lift a collector out of pointer
+# mode, a redirect or a 404 for the credential is not taken for its earlier refusal, and an
+# answer about an old token never stands for a new one: over a line about another credential, or
+# about none, the attempt's credential is stored with the class unknown. The
+# credential is appended as the last field only when there is one: with none the line is the one
+# an older release wrote, and a reader that does not know the field ignores it. Prints the line.
 pa_readcheck_merge() {
-    local role="${1:-}" b="${2:-}" have="${3:-0}" ds dc tk j r s
+    local role="${1:-}" b="${2:-}" have="${3:-0}" fp="${4:-}" ds dc tk j r s same=0 tab=$'\t'
+    [[ $fp =~ ^(-|(token|url):[0-9a-f]{8})$ ]] || fp=""
     ds="$PA_STAMP" dc="$PA_RC_CLASS" tk="$PA_RC_TOKEN" j="$PA_RC_JSON" r="$PA_RC_RAW" s="$PA_RC_SSE"
+    if [ "$have" = 1 ] && [ "$PA_RCL_BIND" = "$b" ]; then same=1; fi
     if [ "$PA_RC_CLASS" = transient ]; then
         ds=- dc=-
-        if [ "$have" = 1 ] && [ "$PA_RCL_BIND" = "$b" ]; then
-            ds="$PA_RCL_DSTAMP" dc="$PA_RCL_DCLASS" tk="$PA_RCL_TOKEN" j="$PA_RCL_JSON" r="$PA_RCL_RAW" s="$PA_RCL_SSE"
+        if [ "$same" = 1 ]; then
+            ds="$PA_RCL_DSTAMP" dc="$PA_RCL_DCLASS" j="$PA_RCL_JSON" r="$PA_RCL_RAW" s="$PA_RCL_SSE"
+            # The stored class stands only for the credential it is about: an older line names
+            # none, and keeping its fingerprint would make every light pass ask again.
+            case "$PA_RC_TOKEN" in
+                reads | noread) ;;
+                *)
+                    if [ -n "$fp" ] && [ "$PA_RCL_CRED" = "$fp" ] && [ "${PA_RC_TOKEN_DEF:-0}" = 0 ]; then
+                        tk="$PA_RCL_TOKEN"
+                    elif [ "$fp" = - ]; then
+                        tk=-
+                    elif [ -n "$fp" ]; then
+                        tk=unknown
+                    else
+                        tk="$PA_RCL_TOKEN" fp="$PA_RCL_CRED"
+                    fi
+                    ;;
+            esac
         fi
-    elif [ "$PA_RC_TOKEN" = unknown ] && [ "$have" = 1 ] && [ "$PA_RCL_BIND" = "$b" ] \
-        && { [ "$PA_RCL_TOKEN" = reads ] || [ "$PA_RCL_TOKEN" = noread ]; }; then
-        # The token GET got no answer while the anonymous ones did: what is known of the token
-        # stands, so a timed-out GET cannot lift a collector out of pointer mode.
+    elif [ "$PA_RC_TOKEN" = unknown ] && [ "${PA_RC_TOKEN_DEF:-0}" = 0 ] && [ "$same" = 1 ] && [ -n "$fp" ] \
+        && [ "$PA_RCL_CRED" = "$fp" ] && { [ "$PA_RCL_TOKEN" = reads ] || [ "$PA_RCL_TOKEN" = noread ]; }; then
         tk="$PA_RCL_TOKEN"
     fi
-    printf 'R\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$b" "$PA_STAMP" "$PA_RC_CLASS" "$ds" "$dc" \
-        "${tk:--}" "${j:--}" "${r:--}" "$role" "${s:--}"
+    [ "$fp" != - ] || fp=""
+    printf 'R\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n' "$b" "$PA_STAMP" "$PA_RC_CLASS" "$ds" "$dc" \
+        "${tk:--}" "${j:--}" "${r:--}" "$role" "${s:--}" "${fp:+$tab$fp}"
 }
 
 # ---- the heartbeat URL -------------------------------------------------------------------------
@@ -3485,9 +3661,10 @@ _pa_after() {
 
 # pa_verified: `VERIFIED <dur>` (how long ago the operator typed the code back) while every rule
 # holds, else `NOT VERIFIED (<word>)` with the first that fails: a test page was recorded (never);
-# its code was typed back (pending); it went to the target and token in the files now, and
-# today's failure hook reads that same target and token, none of them ignored here as invalid
-# (changed: the page proves nothing for a hook that would post elsewhere, or not at all);
+# its code was typed back (pending); it went to the shell target and token in the files now, and,
+# where that target is propolis.env's, today's failure hook reads that same target and token,
+# none of them ignored here as invalid (changed: the page proves nothing for a hook that would
+# post elsewhere, or not at all; a target from alert.env is the shell senders' alone);
 # the acknowledgement is at most 30 days old (expired); since then no message was refused for good
 # (refused), no alert-path incident opened (path-failed) and the legacy hook left no alert
 # undelivered (undelivered). A transient failure undoes nothing. A file it needs and cannot read
@@ -3506,7 +3683,8 @@ pa_verified() {
     elif [ "$PA_TP_ACKED" = - ]; then
         word=pending
     elif [ "${PA_TARGET:-0}" != 1 ] || [ "$(pa_readcheck_binding "$PA_URL" "$PA_TOPIC")" != "$PA_TP_BIND" ] \
-        || [ "$(pa_token8 "${PA_TOKEN:-}")" != "$PA_TP_TOKEN8" ] || pa_hook_differs; then
+        || [ "$(pa_token8 "${PA_TOKEN:-}")" != "$PA_TP_TOKEN8" ] \
+        || { [ "${PA_TARGET_SRC:-}" != "$PA_ALERT_ENV_NAME" ] && pa_hook_differs; }; then
         word=changed
     else
         a="$(pa_age "$PA_TP_ACKED")"

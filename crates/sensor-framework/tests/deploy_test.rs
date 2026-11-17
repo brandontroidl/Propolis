@@ -2687,6 +2687,151 @@ fn the_split_deployment_page_does_not_mention_alert_env_before_a_collector_can_p
     );
 }
 
+/// alert.env is read as root by the witness and propolis-status (and by the failure hook on its
+/// test-page path), so no page under docs/ may still say that nothing reads it.
+#[test]
+fn no_doc_says_nothing_reads_alert_env() {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("failed to read docs/") {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                out.push(path);
+            }
+        }
+    }
+    let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+    let mut pages = Vec::new();
+    walk(&docs, &mut pages);
+    assert!(!pages.is_empty());
+    for page in pages {
+        let text = std::fs::read_to_string(&page).unwrap().replace('\n', " ");
+        for (i, _) in text.match_indices("nothing reads it yet") {
+            let start = text[..i]
+                .char_indices()
+                .rev()
+                .nth(200)
+                .map_or(0, |(j, _)| j);
+            assert!(
+                !text[start..i].contains("alert.env"),
+                "{} still says nothing reads alert.env",
+                page.display()
+            );
+        }
+    }
+}
+
+/// Today's failure hook reads alert.env on its test-page path (deploy/alert-lib.sh
+/// pa_hook_test_page), so every page that says who reads the file names that path, and neither a
+/// page nor the text config-check and the library give says that the hook never reads it or
+/// that nothing else does.
+#[test]
+fn the_pages_that_say_who_reads_alert_env_name_the_failure_hooks_test_page_path() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        one_line(&std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}")))
+    };
+    assert!(
+        deploy_file("alert-lib.sh").contains("pa_hook_test_page() {"),
+        "the failure hook's test-page path is gone: what the pages say of alert.env must be checked again"
+    );
+    for rel in [
+        "docs/operations/secret-management.md",
+        "docs/reference/environment-variables.md",
+        "docs/reference/filesystem-paths.md",
+        "docs/security/filesystem-and-db-protections.md",
+    ] {
+        assert!(
+            read(rel).contains("test-page path"),
+            "{rel} must say that today's failure hook reads alert.env on its test-page path"
+        );
+    }
+    assert!(
+        read("docs/operations/secret-management.md").contains("hashes"),
+        "docs/operations/secret-management.md must say which hashes of alert.env's values are stored"
+    );
+    let mut texts = vec![
+        (
+            "deploy/config-check.sh".to_string(),
+            read("deploy/config-check.sh"),
+        ),
+        (
+            "deploy/alert-lib.sh".to_string(),
+            read("deploy/alert-lib.sh"),
+        ),
+    ];
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("failed to read docs/") {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                out.push(path);
+            }
+        }
+    }
+    let mut pages = Vec::new();
+    walk(&root.join("docs"), &mut pages);
+    for page in pages {
+        let text = one_line(&std::fs::read_to_string(&page).unwrap());
+        texts.push((page.display().to_string(), text));
+    }
+    for (what, text) in &texts {
+        for phrase in [
+            "nothing else reads alert.env",
+            "nothing else reads that file",
+            "hook never read",
+            "hook never reads alert.env",
+        ] {
+            assert!(
+                !text.contains(phrase),
+                "{what} says `{phrase}`, but today's failure hook reads alert.env on its test-page path"
+            );
+        }
+    }
+}
+
+/// The Unreleased section sends one new message, the daily one: the upgrade note for alert.env
+/// must not say that no new message is sent, and the daily message's bullet must say that it
+/// goes to the shell senders' target and that its time is read from alert.env first.
+#[test]
+fn the_changelog_names_the_daily_message_as_the_only_new_one_and_alert_env_for_its_settings() {
+    let changelog =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../CHANGELOG.md"))
+            .expect("failed to read CHANGELOG.md");
+    let unreleased = changelog_unreleased(&changelog);
+    let bullets: Vec<String> = unreleased.split("\n- ").map(one_line).collect();
+    let daily = bullets
+        .iter()
+        .find(|b| b.starts_with("**One low-priority daily message"))
+        .expect("the Unreleased section has no bullet about the daily message");
+    let note = bullets
+        .iter()
+        .find(|b| b.contains("is read by the shell senders"))
+        .expect("the Unreleased section has no upgrade note about alert.env");
+    assert!(
+        !note.contains("No new message is sent"),
+        "the alert.env note says no new message is sent beside the daily message's bullet: {note}"
+    );
+    assert!(
+        note.contains("the daily message below is the only new one"),
+        "the alert.env note must name the daily message as the only new one: {note}"
+    );
+    assert!(
+        note.contains("`v2` cannot be switched on"),
+        "the alert.env note must say that v2 cannot be switched on: {note}"
+    );
+    assert!(
+        daily.contains("`alert.env`'s when it names one, else `propolis.env`'s"),
+        "the daily message's bullet must say it goes to the shell senders' target: {daily}"
+    );
+    assert!(
+        daily.contains("`PROPOLIS_OPS_DAILY_AT=off` stops it, in `/etc/propolis/alert.env` or in `/etc/propolis/propolis.env`"),
+        "the daily message's bullet must say that off works in either file: {daily}"
+    );
+}
+
 /// install.sh enables the backup timer on every host. On a collector backup.sh only records
 /// `not configured` and config-check leaves the backup to the control node, so the timer can
 /// stay as install.sh left it: step 1 must say so, or an operator reading that the backup is the

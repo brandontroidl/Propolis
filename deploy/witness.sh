@@ -150,7 +150,7 @@
 # PROPOLIS_WITNESS_SPOOL_MAX replaces the 1024 entries one spool listing reads.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 10
+# needs-alert-lib: 11
 
 umask 077
 WITNESS_SELF="${BASH_SOURCE[0]}"
@@ -305,7 +305,8 @@ pa_cause pa_unit_map pa_incident_load pa_incident_get pa_incident_transition pa_
 pa_incident_write pa_incident_prune pa_first_sighting pa_banner_write pa_trusted_exec pa_cleanup
 pa_unit_name_ok pa_incident_fold pa_env_get pa_sensor_logs pa_readcheck_binding pa_readcheck_run
 pa_readcheck_merge pa_pg pa_heartbeat_get pa_journal_patterns pa_jcursor_ok pa_vol_project pa_vol_judge
-pa_vol_stores pa_gate pa_daily_due pa_budget_admit pa_render pa_ledger_add pa_ledger_result"
+pa_vol_stores pa_gate pa_daily_due pa_budget_admit pa_render pa_ledger_add pa_ledger_result
+pa_cred_fp"
 # shellcheck disable=SC2086 # the list is a fixed set of names
 unset -f $WITNESS_LIB_FUNCS
 # Loaded once in a subshell first: under set -u an unbound variable at the library's top level
@@ -1542,6 +1543,7 @@ ops-no-heartbeat|daily|NOTICE|alert|alerting|-|-
 ops-push-half|daily|NOTICE|alert|alerting|-|-
 alert-setting-invalid|daily|NOTICE|alert|alert-channel|-|-
 alert-topic-readable|daily|NOTICE|alert|alert-channel|-|-
+alert-target-split|daily|NOTICE|alert|alert-channel|-|-
 clock-unsynced|daily|NOTICE|host|clock|-|-
 bins-missing|daily|NOTICE|host|binaries|-|-
 bins-differ|never|-|host|binaries|-|-
@@ -1746,12 +1748,23 @@ cc_findings() {
 
 # ---- the anonymous-read check ---------------------------------------------------------------
 
-declare -A RC_CLASS=() RC_JSON=() RC_RAW=() RC_SSE=() RC_TOKEN=() RC_BIND=() RC_CAUSE=()
+declare -A RC_CLASS=() RC_JSON=() RC_RAW=() RC_SSE=() RC_TOKEN=() RC_TOKEN_DEF=() RC_BIND=() RC_CAUSE=()
 RC_ROLES=()
 
+# rc_cred ROLE: the credential a check of ROLE's target carries (pa_cred_fp): the shell target's
+# token or URL user, and for the daemon's target only a user written into its URL, since that
+# target is checked without a token.
+rc_cred() {
+    if [ "$1" = daemon ]; then
+        pa_cred_fp "$PA_D_URL" ""
+    else
+        pa_cred_fp "$PA_URL" "${PA_TOKEN:-}"
+    fi
+}
+
 # rc_roles: the targets to check, by role: both when the shell target and the daemon's are the
-# same one, else shell and daemon apiece (from a later release they can differ); none without a
-# target. Sets RC_ROLES and RC_BIND.
+# same one, else shell and daemon apiece (alert.env can give the shell senders a target of their
+# own); none without a target. Sets RC_ROLES and RC_BIND.
 rc_roles() {
     local sb="" db=""
     RC_ROLES=()
@@ -1766,16 +1779,20 @@ rc_roles() {
 }
 
 # rc_collect ALL: the read check of each target role, without the lock: every role (ALL 1, the
-# hourly pass), or only those whose stored line is bound to another target or missing (ALL 0, a
-# light pass, so a changed URL or topic is checked within five minutes). The results wait in
-# RC_* for rc_store.
+# hourly pass), or only those whose stored line is bound to another target or missing, or whose
+# answer is about another credential than the one a post carries now (ALL 0, a light pass, so a
+# changed URL, topic, token or URL user is checked within five minutes). A credential that
+# cannot be named (no salt yet) is no reason to ask again: the next pass names it. The results
+# wait in RC_* for rc_store.
 rc_collect() {
-    local role url topic token
+    local role url topic token cred
     rc_roles
     for role in "${RC_ROLES[@]}"; do
         if [ "$1" = 0 ]; then
+            cred="$(rc_cred "$role")" || cred=""
             if _pa_rc_line "${role/both/shell}" && [ "$PA_RCL_BIND" = "${RC_BIND[$role]}" ] \
-                && { [ "$PA_RCL_ROLE" = "$role" ] || [ "$role" != both ]; }; then
+                && { [ "$PA_RCL_ROLE" = "$role" ] || [ "$role" != both ]; } \
+                && { [ "$cred" = - ] || [ -z "$cred" ] || [ "$PA_RCL_CRED" = "$cred" ]; }; then
                 continue
             fi
         fi
@@ -1791,15 +1808,31 @@ rc_collect() {
         pa_readcheck_run "$url" "$topic" "$token" || true
         RC_CLASS[$role]="$PA_RC_CLASS" RC_JSON[$role]="$PA_RC_JSON" RC_RAW[$role]="$PA_RC_RAW"
         RC_SSE[$role]="$PA_RC_SSE" RC_TOKEN[$role]="$PA_RC_TOKEN" RC_CAUSE[$role]="$PA_RC_CAUSE"
+        RC_TOKEN_DEF[$role]="$PA_RC_TOKEN_DEF"
     done
 }
 
+# rc_both_as LINE ROLE: a both line as the line of ROLE alone. The daemon's target is checked
+# without a token, so as a daemon line it keeps no token class and names no credential: the shell
+# token's answer would read there as a credential changed since.
+rc_both_as() {
+    local t b as ac ds dc j r s
+    if [ "$2" != daemon ]; then
+        printf '%s\t%s\t%s' "${1%$'\t'both$'\t'*}" "$2" "${1##*$'\t'both$'\t'}"
+        return 0
+    fi
+    IFS=$'\t' read -r t b as ac ds dc _ j r _ s _ <<< "$1"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\t%s\tdaemon\t%s' "$t" "$b" "$as" "$ac" "$ds" "$dc" "$j" "$r" "$s"
+}
+
 # rc_store: under the lock, the readcheck file read afresh with this pass's answers merged in. A
-# line of a role no target has now goes, except that a both line stands for the shell target
-# when that has no line of its own; a line this pass did not check, and a line of a type this
-# release does not know, are kept as read.
+# line of a role no target has now goes, except that a both line stands for the shell target and
+# for the daemon's when either has no line of its own, so the first pass after the two targets
+# part keeps what was known of the one it did not check; a line this pass did not check, and a
+# line of a type this release does not know, are kept as read. Each answer is stored with the
+# credential it was asked with, named under the lock, where the salt is sure to exist.
 rc_store() {
-    local line t role new="" old="" r keep b
+    local line t role new="" old="" r b cred
     local -A have=()
     while IFS= read -r line; do
         [ -n "$line" ] || continue
@@ -1810,27 +1843,26 @@ rc_store() {
             new+="$line"$'\n'
             continue
         fi
-        keep=""
         for r in "${RC_ROLES[@]}"; do
-            [ -z "${RC_CLASS[$r]:-}" ] || continue
+            [ -z "${RC_CLASS[$r]:-}" ] && [ -z "${have[$r]:-}" ] || continue
             if [ "$role" = "$r" ]; then
-                keep="$line"
-            elif [ "$role" = both ] && [ "$r" = shell ]; then
-                keep="${line%$'\t'both$'\t'*}"$'\t'shell$'\t'"${line##*$'\t'both$'\t'}"
+                new+="$line"$'\n'
+            elif [ "$role" = both ] && { [ "$r" = shell ] || [ "$r" = daemon ]; }; then
+                new+="$(rc_both_as "$line" "$r")"$'\n'
+            else
+                continue
             fi
+            have[$r]=1
         done
-        if [ -n "$keep" ] && [ -z "${have[$role]:-}" ]; then
-            new+="$keep"$'\n'
-            have[$role]=1
-        fi
     done < <(pa_state_read readcheck)
     for r in "${RC_ROLES[@]}"; do
         [ -n "${RC_CLASS[$r]:-}" ] || continue
         b=0
         if _pa_rc_line "${r/both/shell}" && { [ "$PA_RCL_ROLE" = "$r" ] || [ "$PA_RCL_ROLE" = both ]; }; then b=1; fi
+        cred="$(rc_cred "$r")" || cred=""
         PA_RC_CLASS="${RC_CLASS[$r]}" PA_RC_JSON="${RC_JSON[$r]}" PA_RC_RAW="${RC_RAW[$r]}"
-        PA_RC_SSE="${RC_SSE[$r]}" PA_RC_TOKEN="${RC_TOKEN[$r]}"
-        new+="$(pa_readcheck_merge "$r" "${RC_BIND[$r]}" "$b")"$'\n'
+        PA_RC_SSE="${RC_SSE[$r]}" PA_RC_TOKEN="${RC_TOKEN[$r]}" PA_RC_TOKEN_DEF="${RC_TOKEN_DEF[$r]:-0}"
+        new+="$(pa_readcheck_merge "$r" "${RC_BIND[$r]}" "$b" "$cred")"$'\n'
     done
     [ "$new" != "$old" ] || return 0
     pa_state_write readcheck < <(printf '%s' "$new")
@@ -4072,7 +4104,8 @@ alert_delivered() {
     _pa_stamp_split "$opened" || return 1
     ow="$((10#$_PA_W))"
     if [[ $DELIV_LAST =~ ^[0-9]{1,12}$ ]] && [ "$((10#$DELIV_LAST))" -gt "$ow" ]; then return 0; fi
-    if [ "${PA_TARGET:-0}" != 1 ] && [ "$HOOK_C" -gt 0 ] && [ "$((HOOK_A + HOOK_B))" = 0 ]; then return 0; fi
+    # The legacy hook's target is propolis.env's, whatever alert.env gives the shell senders.
+    if [ "${PA_D_TARGET:-0}" != 1 ] && [ "$HOOK_C" -gt 0 ] && [ "$((HOOK_A + HOOK_B))" = 0 ]; then return 0; fi
     for line in "${_PA_INC_I[@]}"; do
         IFS=$'\t' read -r -a f <<< "$line"
         [[ ${f[2]:-} == unit:* ]] || continue

@@ -34,7 +34,12 @@ All secrets are set in the per-service files under `/etc/propolis/`:
   file before that namespace exists, so the sensor still gets its variables. The three files no
   unit loads are taken from the files that name them (`deploy/migrate.sh#MIGRATE_ENV`,
   `deploy/alert-lib.sh#PA_ALERT_ENV_NAME`, `crates/watch/src/config.rs#WATCH_ENV_PATH`);
-  `alert.env` is reserved for the root shell alert senders and nothing reads it yet.
+  `alert.env` holds the root shell alert senders' own push target, token and settings: the
+  witness and `propolis-status` read it as root, today's failure hook reads it only on its
+  test-page path (`deploy/alert-lib.sh#pa_hook_test_page`, which sends the page to this file's
+  target), and the daemon never does. Keep it `0600 root:root`; nothing from it is printed or
+  stored but a URL's scheme and host, the topic's length and whether a token is set, and hashes
+  of them (the readcheck and testpage bindings, the salted token and credential fingerprints).
 - `deploy/install.sh` **puts no value in any operator-owned `.env` file** -
   the script "has no business fabricating" secret-bearing files; the files it creates are empty,
   and the only env files it generates, `/etc/propolis/fleet-listeners.env` (no secret) and the

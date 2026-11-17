@@ -23,8 +23,9 @@
 # (pa_heartbeat_get) and the fixed journal lines it looks for (PA_JOURNAL_CLASSES); the database
 # probe through pg-exec (pa_pg) and the public-feed push scheduler check (pa_push_scheduler), so
 # the status command and the witness judge both by one rule; the volume projection and triggers
-# (pa_vol_project, pa_vol_judge), for the same reason; the incident record; and the failure
-# hook's record step (pa_hook_record), which the hook runs in a child process of its own.
+# (pa_vol_project, pa_vol_judge), for the same reason; the incident record; the failure hook's
+# record step (pa_hook_record), which the hook runs in a child process of its own; and the
+# hook's two children of profile v2, the decision (pa_hook_profile) and the v2 path (pa_hook_v2).
 #
 # TEMPORARY FILES. A function that makes one appends its path to PA_CLEANUP. Each caller's single
 # EXIT handler runs pa_cleanup, which removes them.
@@ -42,7 +43,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=11
+PA_LIB_VERSION=12
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -59,7 +60,7 @@ PA_STATE_NAMES="incidents send-ledger readcheck meta observe testpage"
 # pg-exec guard nobody read, and an inherited PA_CLEANUP would make pa_cleanup delete a path
 # someone else chose. A value this shell set itself, before sourcing again, is kept. Bash cannot export an
 # array, so an inherited PA_CLEANUP is always a scalar.
-for _PA_V in PA_LOCK_FD _PA_UNREADABLE_LOGGED PA_PG_GUARD_KNOWN; do
+for _PA_V in PA_LOCK_FD _PA_UNREADABLE_LOGGED PA_PG_GUARD_KNOWN PA_ROLE_WAIT; do
     if [[ $(declare -p "$_PA_V" 2> /dev/null) =~ ^declare\ -[a-zA-Z]*x ]]; then unset "$_PA_V"; fi
 done
 unset _PA_V
@@ -538,11 +539,18 @@ pa_hook_differs() {
 
 # ---- role --------------------------------------------------------------------------------------
 
-# pa_role: collector, control, single, gateway or unknown, from which units are enabled.
+# pa_role: collector, control, single, gateway or unknown, from which units are enabled. A caller
+# with a time limit of its own (the failure hook's v2 child) sets PA_ROLE_WAIT, the seconds each
+# question may wait (1 to 999), so a PID 1 or a bus that does not answer costs it seconds, not its
+# limit; a unit then asked about in vain reads as not enabled. Every other caller waits as it
+# always did, so a slow answer never changes the role it sees; a value inherited from the
+# environment is dropped when the library is sourced, with the other internal state.
 pa_role() {
     local p=0 g=0
-    if systemctl is-enabled --quiet propolis.service 2> /dev/null; then p=1; fi
-    if systemctl is-enabled --quiet gateway.service 2> /dev/null; then g=1; fi
+    local -a role_ask=(systemctl)
+    if [[ ${PA_ROLE_WAIT:-} =~ ^[1-9][0-9]{0,2}$ ]]; then role_ask=(timeout "$PA_ROLE_WAIT" systemctl); fi
+    if "${role_ask[@]}" is-enabled --quiet propolis.service 2> /dev/null; then p=1; fi
+    if "${role_ask[@]}" is-enabled --quiet gateway.service 2> /dev/null; then g=1; fi
     if [ -e "$PA_ENV_DIR/shipper.env" ] && [ "$p" = 0 ]; then
         printf 'collector'
     elif [ "$p" = 1 ] && [ "$g" = 1 ]; then
@@ -3187,8 +3195,10 @@ _pa_hook_field() {
 # cannot grow it. Written without the lock, which is the point. propolis-status lists the file
 # (deploy/propolis-status.sh#load_hook_spool reads this format), and nothing removes it yet: the
 # witness's light pass will take it in under the lock and delete it. The cause is PA_CAUSE.
+# _PA_HK_SPOOL_FILE names the file written, for the v2 path to put its send's result in.
 _pa_hook_spool() {
     local unit="$1" out="$2" dir f head="" t="" a="" b="" c="" g first count
+    _PA_HK_SPOOL_FILE=""
     for dir in "$PA_STATE/hook" "$PA_RUN/fallback"; do
         { [ -d "$dir" ] || mkdir -m 0700 -- "$dir"; } 2> /dev/null || continue
         if [ "$dir" = "$PA_RUN/fallback" ]; then f="$dir/hook-$unit"; else f="$dir/$unit"; fi
@@ -3210,6 +3220,7 @@ _pa_hook_spool() {
             "$((g + 1))" "$first" "$PA_STAMP" "$count" "$(_pa_hook_field "$_PA_HK_RESULT")" \
             "$(_pa_hook_field "$_PA_HK_CODE")" "$(_pa_hook_field "$_PA_HK_STATUS")" \
             "$(_pa_hook_field "$PA_CAUSE")" "$(_pa_hook_field "$_PA_HK_NR")" "$out"); then
+            _PA_HK_SPOOL_FILE="$f"
             return 0
         fi
     done
@@ -5184,4 +5195,496 @@ _pa_render_incident() {
         return 1
     fi
     PA_TITLE="$title"
+}
+
+# ---- the failure hook under profile v2 ---------------------------------------------------------
+#
+# deploy/alert.sh asks pa_hook_profile, in a child bash of its own, whether profile v2 is in
+# force, and only then hands the failure to pa_hook_v2, in a second child, instead of running
+# today's code. This release honours the profile only under the test seam (pa_settings_load), so
+# outside the tests the first child always says legacy and the second never runs. The input is
+# the environment, as for the record step: PA_HOOK_UNIT (the unit, already checked by the hook),
+# PA_HOOK_MARKER (the marker file the hook looks at afterwards) and systemd's MONITOR_* variables.
+#
+# The marker is all the hook learns of what the second child did. It is made once the state lock
+# is had or found busy, before any state file is read under the lock (such a read sets a damaged
+# file aside), before any is written and before anything is sent, so a child that fails once it
+# may have changed something leaves it, and the hook then adds neither today's message nor a
+# second record of the same firing; a child that fails before that leaves none, and the hook runs
+# today's code as if this path did not exist. A marker that cannot be made stops this path before
+# it changes anything, for the same reason. The marker holds nothing.
+
+# pa_hook_profile: the decision child's answer, as its status: 0 when profile v2 is in force for
+# this firing; 10 when legacy is, which is always outside the test seam, for a unit name systemd
+# would not give (propolis-alert@sensor-ssh.service started by hand passes `sensor-ssh`), and for
+# a name too long for a record's key, which v2 could neither record nor claim a message for:
+# today's message still reports both. The hook takes any other status as legacy too.
+pa_hook_profile() {
+    pa_unit_name_ok "${PA_HOOK_UNIT:-}" || return 10
+    pa_ok_field "unit:$PA_HOOK_UNIT" || return 10
+    pa_settings_load
+    [ "$PA_PROFILE" = v2 ] || return 10
+    return 0
+}
+
+# _pa_hv2_mark: makes the marker file (see the section comment), once per child. Status 1 when
+# there is no marker path or the file cannot be made: the caller must then change nothing.
+_pa_hv2_mark() {
+    [ "${_PA_HV2_MARKED:-0}" != 1 ] || return 0
+    [ -n "${PA_HOOK_MARKER:-}" ] || return 1
+    { : > "$PA_HOOK_MARKER"; } 2> /dev/null || return 1
+    _PA_HV2_MARKED=1
+}
+
+# _pa_hv2_post TITLE PRIORITY BODY: the v2 path's one call of pa_send, made only with the marker in
+# place, so a message that may have gone always leaves the hook the marker that says so. Sets
+# PA_SEND_RESULT, norender when the marker is not there.
+_pa_hv2_post() {
+    if [ "${_PA_HV2_MARKED:-0}" != 1 ] || [ ! -e "${PA_HOOK_MARKER:-}" ]; then
+        PA_SEND_RESULT=norender
+        return 1
+    fi
+    pa_send "$1" "$2" < <(printf '%s\n' "$3")
+}
+
+# _pa_hv2_log TEXT: one journal line of the v2 path. No line names the target, the topic or the
+# token.
+_pa_hv2_log() {
+    logger -p daemon.notice -t propolis-witness "$1" 2> /dev/null || true
+}
+
+# _pa_hv2_light_stale: no light pass will judge a first sighting soon: meta's light_last is over
+# 900 s old, or none can be dated once uptime is past half an hour, the rule by which the
+# witness's hourly pass sends in the light pass's place. An uptime that is not a count reads as
+# stale, so the failure opens. The caller holds the lock.
+_pa_hv2_light_stale() {
+    local a
+    a="$(pa_age "$(_pa_meta_get light_last)")"
+    if [ "$a" -lt 0 ]; then
+        [[ ${PA_UP:-} =~ ^[0-9]{1,10}$ ]] || return 0
+        [ "$((10#$PA_UP))" -gt 1800 ]
+    else
+        [ "$a" -gt 900 ]
+    fi
+}
+
+# _pa_hv2_firing UNIT: what systemd and the journal say about this firing, read as the record step
+# reads it: PA_REC_KIND, PA_REC_STAGE, PA_REC_TIER, PA_REC_CAUSE (and PA_CAUSE), PA_REC_NR,
+# PA_REC_FLAG, PA_REC_INST and PA_REC_OUT, and _PA_HV2_TX: open for a unit that does not restart
+# itself, else pending (a first sighting), and pending, flagged maint, under an active maintenance
+# marker (_PA_HV2_MAINT 1).
+_pa_hv2_firing() {
+    local unit="$1" panics=0
+    _pa_hook_facts "$unit" 1
+    if [ -n "$_PA_HK_INV" ]; then
+        panics="$(timeout 3 journalctl -q -o cat "_SYSTEMD_UNIT=$unit" "_SYSTEMD_INVOCATION_ID=$_PA_HK_INV" \
+            2> /dev/null | grep -c -F 'panicked at')" || true
+        panics="$(_pa_num "$panics")"
+    fi
+    pa_cause "$_PA_HK_RESULT" "$_PA_HK_STATUS" "$panics" > /dev/null
+    pa_unit_map "$unit"
+    PA_REC_KIND=unit-failed PA_REC_STAGE="$PA_UNIT_STAGE" PA_REC_TIER="$PA_UNIT_TIER"
+    PA_REC_CAUSE="$PA_CAUSE" PA_REC_NR="$_PA_HK_NR" PA_REC_OUT=- PA_REC_FLAG="" PA_REC_INST=-
+    case "$unit" in
+        propolis.service) PA_REC_KIND=daemon-down ;;
+        propolis-logrotate.service) _pa_hook_guard ;;
+    esac
+    _PA_HV2_TX=pending _PA_HV2_MAINT=0
+    [ "$_PA_HK_RESTART" != no ] || _PA_HV2_TX=open
+    if pa_maint_active; then
+        _PA_HV2_TX=pending PA_REC_FLAG=maint _PA_HV2_MAINT=1
+    fi
+}
+
+# pa_hook_v2: handles one failure under profile v2 (see the section comment). The kind is the
+# record step's: the daemon's unit is daemon-down, the rotation unit follows the guard's lines, a
+# witness pass is unit-failed on the witness rail, a sensor restarting while an open no-config
+# finding names it is unit-nobind, anything else is unit-failed by the unit map. A unit that
+# restarts itself is a first sighting, written pending for the light pass to judge, unless the
+# light pass is stale and none would; then it opens at once, as a unit that does not restart
+# itself does. A record already open only counts a repeat, unless the cause changed class (or the
+# tier rose), which is a change. A transition that sends is claimed under the lock
+# (pa_incident_admit: its pending ledger line, then the record's pending transition), posted with
+# the lock released, and its result written under the lock again (_pa_hv2_result). The record the
+# hook opens carries the flag hookopen. With the gate anything but full the transition is only
+# recorded; a withheld one leaves its W line. A change while the incident's open or reopen is
+# still pending (not yet through) is only recorded, and the pending transition is left for the
+# retry, so the open is neither lost nor sent twice. A first
+# sighting or a claim that neither directory takes is sent with the journal as the memory
+# (_pa_hv2_journal_send), since no pass could keep it; a firing no record can hold (512 open) is
+# sent as the lockless path sends it. Each read is bounded (3 s, the journal of journal mode 5 s),
+# the lock is waited for 10 s twice and the post takes at most 40 s, so the hook's limit on this
+# child (75 s) is met only by a stuck lock or read, which leave a claimed transition pending, to be
+# retried. Returns 0 on every outcome it handled, and 1 only when the marker could not be made and
+# nothing was changed.
+pa_hook_v2() {
+    local unit="${PA_HOOK_UNIT:-}" key gate rc=0 k12 state="" was="" ptx=- whole=1 new=0 tx id kh
+    local stamp as where result held=0
+    _PA_HV2_MARKED=0
+    if ! pa_unit_name_ok "$unit"; then
+        _pa_hook_unrecorded - "the unit name is not one systemd gives"
+        return 0
+    fi
+    key="unit:$unit"
+    pa_now
+    pa_settings_load
+    PA_ROLE="$(PA_ROLE_WAIT=3 pa_role 2> /dev/null)" || PA_ROLE=unknown
+    _pa_hv2_firing "$unit"
+    # Asked before the lock: it reads files only, and the walk reads them without the lock too.
+    gate="$(pa_gate 2> /dev/null)" || gate=""
+    pa_lock 10 || rc=$?
+    if [ "$rc" != 0 ]; then
+        _pa_hv2_lockless "$unit" "$gate"
+        return
+    fi
+    if ! _pa_hv2_mark; then
+        pa_unlock
+        return 1
+    fi
+    pa_incident_load
+    case "$unit" in
+        sensor-*.service)
+            k12="$(_pa_sha256 "noconfig:${unit%.service}")" || k12=""
+            if [ -n "$k12" ] && pa_incident_get "finding:noconfig:${k12:0:12}"; then
+                case "${PA_INC[7]}" in
+                    pending | open | acked) PA_REC_KIND=unit-nobind PA_REC_TIER=ACT PA_REC_STAGE=listen ;;
+                esac
+            fi
+            ;;
+    esac
+    if [ "$_PA_HV2_TX" = pending ] && [ "$_PA_HV2_MAINT" = 0 ] && _pa_hv2_light_stale; then
+        _PA_HV2_TX=open
+    fi
+    if pa_incident_get "$key"; then
+        state="${PA_INC[7]}" was="${PA_INC[11]}" ptx="${PA_INC[26]:--}"
+        _pa_inc_whole || whole=0
+    fi
+    pa_salt_ensure || true
+    # A repeat on an open record is asked as a change, which counts it and becomes one only for a
+    # new cause class or a higher tier; a firing of a lower tier only counts, so the record's tier
+    # never falls.
+    if { [ "$state" = open ] || [ "$state" = acked ]; } && [ "$whole" = 1 ] \
+        && [ "$(_pa_tier_rank "$PA_REC_TIER")" -ge "$(_pa_tier_rank "${PA_INC[6]}")" ]; then
+        pa_incident_transition "$key" change || true
+    else
+        pa_incident_transition "$key" "$_PA_HV2_TX" || true
+    fi
+    [ "$PA_TX_DONE" != open ] || _pa_flag_add hookopen
+    tx="$PA_TX"
+    [ "$tx" != open ] || new=1
+    # The open (or reopen) is still pending, claimed and not yet through. A change admitted now
+    # would replace that pending transition, and the open would never be delivered; sent as that
+    # open again, it could go out beside a post still in flight and be counted twice. So the
+    # change is only recorded: the pending transition stays for the retry, which renders the
+    # record as it then is, with this cause.
+    if [ "$tx" = change ]; then
+        case "$ptx" in open | reopen) held=1 ;; esac
+    fi
+    rc=0
+    pa_incident_set || rc=$?
+    if [ "$rc" != 0 ]; then
+        pa_unlock
+        case "$rc" in
+            2) _pa_hook_unrecorded "$unit" "the unit name is too long for a record" ;;
+            *)
+                # No record can hold it, so it goes as a firing that found the lock busy does:
+                # spooled, and its message without an id, held by today's stamp.
+                _pa_hook_unrecorded "$unit" "512 incidents are open or pending (notpersisted)"
+                _pa_hv2_lockless "$unit" "$gate"
+                ;;
+        esac
+        return 0
+    fi
+    if [ "$whole" = 0 ] || [ "$gate" != full ] || [ "$held" = 1 ] \
+        || ! [[ $PA_TX_DONE == open || $PA_TX_DONE == change ]]; then
+        # A first sighting that neither directory took cannot be kept for a light pass to judge,
+        # so the journal is its memory, as when nothing can be written at all.
+        if ! _pa_hv2_write "$unit" && [ "${PA_WHERE:-}" = none ] && [ "$whole" = 1 ] \
+            && [ "$PA_TX_DONE" = pending ]; then
+            _pa_hv2_journal_send "$unit" "$gate"
+        fi
+        return 0
+    fi
+    case "$tx" in
+        open | reopen | change) ;;
+        *)
+            _pa_hv2_write "$unit" || true
+            return 0
+            ;;
+    esac
+    id="${PA_INC[1]}"
+    kh="$(_pa_keyhash "$key")" || kh=""
+    PA_WHERE=""
+    pa_incident_admit "$key" "$tx" "$new" full hook > /dev/null || true
+    # A send ledger with no readable copy admits nothing on the read that finds it so, which
+    # leaves an empty ledger in its place: asked again, the message is counted from empty.
+    if [ "$PA_ADMIT_VERDICT" = withhold:ledger ] && [ "${PA_WHERE:-}" != none ]; then
+        PA_WHERE=""
+        pa_incident_admit "$key" "$tx" "$new" full hook > /dev/null || true
+    fi
+    case "$PA_ADMIT_VERDICT" in
+        admit) ;;
+        *)
+            # Neither directory took a write: the journal has to remember what was sent.
+            if [ "${PA_WHERE:-}" = none ] \
+                && [[ $PA_ADMIT_VERDICT == withhold:ledger || $PA_ADMIT_VERDICT == withhold:noclaim ]]; then
+                pa_unlock
+                _pa_hook_unrecorded "$unit" "neither the state directory nor /run took the write"
+                _pa_hv2_journal_send "$unit" "$gate"
+                return 0
+            fi
+            if [ "$PA_ADMIT_VERDICT" != withhold:undelivered ] && [ -n "$kh" ]; then
+                _PA_INC_REST+=("$(printf 'W\t%s\t%s\t%s\t%s\t%s\t%s' "$PA_STAMP" "$kh" "$tx" "$new" \
+                    "${PA_INC[5]:--}" "${PA_ADMIT_VERDICT#withhold:}")")
+            fi
+            _pa_hv2_write "$unit" || true
+            return 0
+            ;;
+    esac
+    stamp="${PA_INC[27]}" as="$PA_ADMIT_AS" where="${PA_WHERE:-}"
+    if [ "$where" = run ]; then
+        _pa_flag_add notpersisted
+        if pa_incident_set; then pa_incident_write || true; fi
+        where="${PA_WHERE:-}"
+    fi
+    _pa_meta_set where "$where" > /dev/null 2>&1 || true
+    pa_unlock
+    result=norender
+    if pa_render full "$tx" "$id" "$was"; then
+        _pa_hv2_post "$PA_TITLE" "$PA_PRIO" "$PA_BODY" || true
+        result="$PA_SEND_RESULT"
+    fi
+    _pa_hv2_result "$unit" "$key" "$stamp" "$as" "$kh" "$tx" "$result"
+    return 0
+}
+
+# _pa_hv2_write UNIT: the records in memory written, where they landed noted in meta, and the
+# lock released; one journal line, status 1 and PA_WHERE left as the write set it when they could
+# not be written. Sends nothing.
+_pa_hv2_write() {
+    local rc=0
+    pa_incident_write || rc=$?
+    [ "$rc" != 0 ] || _pa_meta_set where "${PA_WHERE:-none}" > /dev/null 2>&1 || true
+    pa_unlock
+    if [ "$rc" != 0 ]; then
+        _pa_hook_unrecorded "$1" "neither the state directory nor /run took the write"
+        return 1
+    fi
+    return 0
+}
+
+# _pa_hv2_result UNIT KEY STAMP CLASS KEYHASH TX RESULT: the result of the post admitted at STAMP,
+# written under the lock into its ledger line and its record: pending_tx stays only for a
+# transient result, which a retry may mend; any other result ends it (a refusal or a message
+# that could not be put together would fail the same way again); ok marks an open or a reopen
+# delivered. A record whose pending transition is no longer this one keeps what it has. A lock
+# not had in 10 s leaves the transition pending, and one line says so. A message that got through
+# also sets today's stamp for the unit, without the lock, as the lockless path does: a later
+# firing that finds the lock busy then holds its own message for the cooldown instead of sending a
+# second open of an incident already delivered.
+_pa_hv2_result() {
+    local unit="$1" key="$2" stamp="$3" as="$4" kh="$5" tx="$6" result="$7" rc=0
+    if [ "$result" = ok ] && ! _pa_hv2_touch "$unit"; then
+        _pa_hv2_log "message for $unit sent; its stamp could not be set, so a failure that finds the state lock busy may send again"
+    fi
+    if ! pa_lock 10; then
+        _pa_hv2_log "the result of the message for $unit ($result) was not recorded: the state lock was busy"
+        return 0
+    fi
+    pa_ledger_result "$stamp" "$as" "$result" hook "$kh" "$tx" || rc=1
+    pa_incident_load
+    if pa_incident_get "$key" && _pa_inc_whole && [ "${PA_INC[26]}" = "$tx" ] && [ "${PA_INC[27]}" = "$stamp" ]; then
+        case "$result" in
+            transient:*) ;;
+            ok)
+                PA_INC[26]=- PA_INC[27]=-
+                case "$tx" in open | reopen) PA_INC[17]=1 ;; esac
+                ;;
+            *) PA_INC[26]=- PA_INC[27]=- ;;
+        esac
+        { pa_incident_set && pa_incident_write; } || rc=1
+    fi
+    pa_unlock
+    [ "$rc" = 0 ] || _pa_hv2_log "the result of the message for $unit ($result) was not recorded"
+    [ "$result" = ok ] || _pa_hv2_log "message for $unit not delivered ($result)"
+    return 0
+}
+
+# _pa_hv2_spool_last UNIT: the send result in the last field of the unit's spool file, or `-`, so
+# a firing that sends nothing keeps there the result of the one that did: the file is the only
+# account of that send until it is taken in. `sending` is the claim written before a post, left by
+# a firing stopped before its result was written: a send that may have gone.
+_pa_hv2_spool_last() {
+    local f head t r
+    for f in "$PA_STATE/hook/$1" "$PA_RUN/fallback/hook-$1"; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        head="" t="" r=""
+        {
+            IFS= read -r head
+            IFS=$'\t' read -r t _ _ _ _ _ _ _ _ r _
+        } < "$f" 2> /dev/null
+        [[ $head =~ ^#hook\ v1\ g=[0-9]{1,18}$ ]] && [ "$t" = H ] || continue
+        case "$r" in
+            sending | ok | notarget | norender | nocurl | perm:[0-9][0-9][0-9] | transient:[0-9][0-9][0-9]) printf '%s' "$r" ;;
+            *) printf -- - ;;
+        esac
+        return 0
+    done
+    printf -- -
+}
+
+# _pa_hv2_spool_set RESULT: RESULT in the last field of the spool file this firing wrote
+# (_PA_HK_SPOOL_FILE). Written without the lock, as the spool is; a file the witness has taken in
+# meanwhile is not written again (status 1).
+_pa_hv2_spool_set() {
+    local f="${_PA_HK_SPOOL_FILE:-}" head="" line=""
+    [ -n "$f" ] && [ -f "$f" ] && [ ! -L "$f" ] || return 1
+    {
+        IFS= read -r head
+        IFS= read -r line
+    } < "$f" 2> /dev/null || return 1
+    [[ $head =~ ^#hook\ v1\ g=[0-9]{1,18}$ && $line == H$'\t'* ]] || return 1
+    pa_write "$f" < <(printf '%s\n%s\t%s\n' "$head" "${line%$'\t'*}" "$1")
+}
+
+# _pa_hv2_due FILE SECS: FILE, a stamp kept as today's hook keeps its stamps (its mtime is the
+# time), is absent, at least SECS old or dated ahead of the clock, read as today's hook reads it.
+_pa_hv2_due() {
+    local m now
+    m="$(stat -c %Y -- "$1" 2> /dev/null)" || return 0
+    now="$(date +%s)"
+    [[ $m =~ ^[0-9]{1,12}$ && $now =~ ^[0-9]{1,12}$ ]] || return 0
+    [ "$((10#$now - 10#$m))" -lt 0 ] || [ "$((10#$now - 10#$m))" -ge "$2" ]
+}
+
+# _pa_hv2_stamp_due UNIT: the message sent without the lock may go: today's hook's own stamp for
+# the unit (its delivered stamp in /run/propolis-alert) allows it once the cooldown has passed
+# (PROPOLIS_ALERT_COOLDOWN_SECS, 1800 by default), and the stamp of this path's last attempt
+# (v2-tried/<unit> beside it) once the retry time has (PROPOLIS_ALERT_RETRY_SECS, 120 by
+# default), as today's hook holds a retry: otherwise a server that takes each post but answers
+# too late would get one on every firing of a crash loop while the lock stays busy.
+_pa_hv2_stamp_due() {
+    local cd="${PROPOLIS_ALERT_COOLDOWN_SECS:-1800}" rt="${PROPOLIS_ALERT_RETRY_SECS:-120}"
+    local dir="${PROPOLIS_ALERT_STATE_DIR:-$PA_ROOT/run/propolis-alert}"
+    [[ $cd =~ ^[0-9]{1,7}$ ]] || cd=1800
+    [[ $rt =~ ^[0-9]{1,7}$ ]] || rt=120
+    _pa_hv2_due "$dir/$1" "$((10#$cd))" && _pa_hv2_due "$dir/v2-tried/$1" "$((10#$rt))"
+}
+
+# _pa_hv2_touch NAME: NAME (`<unit>`, today's delivered stamp, or `v2-tried/<unit>`) under today's
+# hook's stamp directory dated now, each directory made 0700 where it is missing, as today's hook
+# leaves it. Status 1 when it cannot be.
+_pa_hv2_touch() {
+    local dir="${PROPOLIS_ALERT_STATE_DIR:-$PA_ROOT/run/propolis-alert}" sub="${1%/*}"
+    {
+        { [ -d "$dir" ] || mkdir -m 0700 -- "$dir"; } \
+            && { [ "$sub" = "$1" ] || [ -d "$dir/$sub" ] || mkdir -m 0700 -- "$dir/$sub"; } \
+            && touch -- "$dir/$1"
+    } 2> /dev/null
+}
+
+# _pa_hv2_lockless UNIT GATE: the firing when the state lock was not had in 10 s, or not at all.
+# It goes to the hook spool as the record step's would, keeping the last send result there, and
+# one message for this unit, rendered without an id (it reads `(id pending)`), goes only while
+# today's hook's own stamp for the unit and the stamp of this path's last attempt allow it
+# (_pa_hv2_stamp_due). Only a post that got through sets the first, so a stuck lock can delay the
+# record but neither silence the hook nor let it flood. The spool file is the send's only account:
+# its last field is claimed as `sending` before the post, as a ledger line would be, so a light
+# pass that takes the file in meanwhile, or a firing stopped mid-post, still leaves a send that
+# may have gone; no claim, no post. The post's result replaces the claim. Where no spool file can
+# be written either, the journal is the memory (_pa_hv2_journal_send). Nothing is sent under a
+# maintenance marker or with the gate anything but full. Status 1, nothing changed, when the
+# marker cannot be made.
+_pa_hv2_lockless() {
+    local unit="$1" gate="$2" prev held=1
+    _pa_hv2_mark || return 1
+    prev="$(_pa_hv2_spool_last "$unit")"
+    if ! _pa_hook_spool "$unit" "$prev"; then
+        _pa_hv2_journal_send "$unit" "$gate"
+        return 0
+    fi
+    [ "$gate" = full ] && [ "$_PA_HV2_MAINT" = 0 ] || return 0
+    _pa_hv2_stamp_due "$unit" || return 0
+    pa_render full open - || return 0
+    if ! _pa_hv2_spool_set sending; then
+        _pa_hv2_log "message for $unit not sent: its claim could not be written to the hook spool"
+        return 0
+    fi
+    _pa_hv2_touch "v2-tried/$unit" || held=0
+    _pa_hv2_post "$PA_TITLE" "$PA_PRIO" "$PA_BODY" || true
+    _pa_hv2_spool_set "$PA_SEND_RESULT" || true
+    if [ "$PA_SEND_RESULT" = ok ]; then
+        if ! _pa_hv2_touch "$unit"; then
+            _pa_hv2_log "message for $unit sent without the state lock; its stamp could not be set, so the next failure sends again"
+        fi
+    elif [ "$held" = 1 ]; then
+        _pa_hv2_log "message for $unit not delivered ($PA_SEND_RESULT)"
+    else
+        _pa_hv2_log "message for $unit not delivered ($PA_SEND_RESULT); its retry hold could not be set, so the next failure sends again"
+    fi
+    return 0
+}
+
+# _pa_hv2_journal_line TEXT: TEXT in the journal under tag propolis-witness, written over a stream
+# connection (systemd-cat): journald takes a stream's sender, and so the trusted _SYSTEMD_UNIT the
+# journal-mode query matches, when it connects, while the writer is alive. A datagram from logger,
+# which exits at once, is often read after its sender is gone, and the field is then missing.
+_pa_hv2_journal_line() {
+    printf '%s\n' "$1" | systemd-cat -t propolis-witness -p notice 2> /dev/null
+}
+
+# _pa_hv2_journal_holds LINES: LINES (this unit's hook's journal of the last 30 minutes) hold a send
+# that still bounds the next one: a `hook sent <inst> <stamp>` line, unless a `hook send failed
+# <stamp>` line of the same stamp says that post did not get through and the retry time (120 s,
+# as today's hook holds a retry) has passed since. A failure dated ahead of the clock still holds.
+_pa_hv2_journal_holds() {
+    local line s failed=" "
+    while IFS= read -r line; do
+        case "$line" in
+            "hook send failed "*)
+                s="${line#hook send failed }"
+                if _pa_stamp_split "$s"; then failed+="$s "; fi
+                ;;
+        esac
+    done <<< "$1"
+    while IFS= read -r line; do
+        case "$line" in
+            "hook sent "*)
+                s="${line##* }"
+                if [[ $failed == *" $s "* ]] && [ "$(pa_age "$s")" -ge 120 ]; then continue; fi
+                return 0
+                ;;
+        esac
+    done <<< "$1"
+    return 1
+}
+
+# _pa_hv2_journal_send UNIT GATE: with no state file that can be written, the journal is the
+# memory: a message goes only when the journal holds no send of this unit's hook in the last 30
+# minutes that still bounds it (_pa_hv2_journal_holds), and its `hook sent` line is logged before
+# the message goes, as the claim a ledger line would be, and a `hook send failed` line after a post
+# that did not get through. When the journal cannot be asked, only the daemon's failure is sent:
+# the one this host may have no other way to report, where any other unit could page on every
+# crash. The message is rendered without an id, since none can be kept, and it opens whatever the
+# unit's Restart= says, since no pass can keep a first sighting either.
+_pa_hv2_journal_send() {
+    local unit="$1" gate="$2" out st=0
+    [ "$gate" = full ] && [ "$_PA_HV2_MAINT" = 0 ] || return 0
+    pa_render full open - || return 0
+    out="$(timeout 5 journalctl -q -o cat "_SYSTEMD_UNIT=propolis-alert@$unit.service" _UID=0 \
+        -t propolis-witness --since=-30min 2> /dev/null)" || st=$?
+    if [ "$st" = 0 ]; then
+        if _pa_hv2_journal_holds "$out"; then return 0; fi
+    elif [ "$PA_REC_KIND" != daemon-down ]; then
+        return 0
+    fi
+    if ! _pa_hv2_journal_line "hook sent ${PA_REC_INST:--} $PA_STAMP" && [ "$st" = 0 ]; then
+        return 0
+    fi
+    _pa_hv2_post "$PA_TITLE" "$PA_PRIO" "$PA_BODY" || true
+    if [ "$PA_SEND_RESULT" != ok ]; then
+        _pa_hv2_journal_line "hook send failed $PA_STAMP" || true
+        _pa_hv2_log "message for $unit not delivered ($PA_SEND_RESULT)"
+    fi
+    return 0
 }

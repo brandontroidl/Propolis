@@ -50,7 +50,8 @@
     neither form (`alert-setting-invalid`), in words that leave out the hook and the daemon,
     which do not read them; a mistyped `PROPOLIS_ALERT_PROFILE` likewise. Any host that passed
     before with one of them set that way now exits `1`.
-  - The alert library is version 11; the witness, `propolis-status` and config-check need it.
+  - The alert library is version 12; the witness, `propolis-status` and config-check need 11 or
+    later.
 
 - **One low-priority daily message from the witness, to a proven-private topic only.** After
   this upgrade a host that runs the daemon (a single box, or the control node of a split
@@ -819,12 +820,20 @@
 
 ### Added
 
+- **The failure hook can hand a failure to the new message format, under a profile no host can
+  set yet** - `deploy/alert.sh` (hook contract 2) can ask the library, in a child process, which
+  profile is in force, and only under `v2` a second child records the failure and sends at most
+  one message in the new format (`pa_hook_profile`, `pa_hook_v2`; library version 12). This
+  release starts neither child without the tests' root, so on every host the hook is today's,
+  whatever file sits at the library's path, and nothing new is sent. Under the tests' root a
+  missing, older, broken or hung library leaves today's message as it was.
+
 - **The message shapes and the send budget of the new alerting, in the library only** -
   `deploy/alert-lib.sh` renders the full text of an incident's open, change, reopen, reminder and
   resolve (`pa_render`), decides every budget class with the reserve, the pool, the stage-1
   sub-cap and the per-key cap (`pa_budget_admit`), and records an admitted message so that it can
   be retried without being counted again (`pa_incident_admit`, `pa_retry_due`,
-  `pa_ledger_retry`). Nothing calls them yet and nothing new is sent.
+  `pa_ledger_retry`). Only the failure hook's `v2` path above calls them, and nothing new is sent.
 
 - **The root witness's light pass: failures judged, reminded and resolved, in record mode** -
   `deploy/witness.sh`, run as root every five minutes by `propolis-witness@light.timer`

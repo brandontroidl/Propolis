@@ -533,8 +533,12 @@ current one's (`deploy/rollback.sh#check_hook_contract`). When the kept number i
 the current `propolis-alert`, `propolis-alert-lib` and `propolis-alert@.service` all three, and
 prints `kept the current failure hook: the kept release's hook has contract <k>, older than <n>
 (under profile v2 it would put the host name back into alert titles)`. The rest of the release
-goes back as usual. Every hook released so far sends the same alert, so keeping the current one
-changes nothing that is sent.
+goes back as usual. The hook is at contract 2: it can hand a failure to the new message format
+under profile v2 (`deploy/alert.sh` checks the library version its two v2 children need itself,
+so a library too old for them leaves today's message). This release puts v2 in force on no host, so
+every hook released so far, contract 1 and 2 alike, sends the same alert, and keeping the current
+one changes nothing that is sent. A kept contract-1 hook under the current contract-2 one keeps
+the current three files.
 
 **The maintenance marker.** Just before it stops the services the script writes
 `/run/propolis-witness/maintenance` with reason `rollback` (`deploy/rollback.sh#maint_write`),

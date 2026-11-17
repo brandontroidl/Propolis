@@ -26,28 +26,43 @@
 # checked to be digits before it is used, and it goes only in the body. The token goes to curl in
 # a header file, never on its command line.
 #
-# Whatever path it took, unless the argument was refused, the failure is then recorded in the root
-# alerting state (/var/lib/propolis/witness/incidents) with systemd's own cause and what this hook
-# did with it. The record is made by the shared library (/usr/local/sbin/propolis-alert-lib), and
-# none of its code runs in this shell: under `set -euo pipefail` an unbound variable or an arithmetic
-# error inside a sourced file ends the shell even behind `|| true`, and this is the alert that
-# must still go out when everything else is broken. So the record runs once the send is decided,
-# from the EXIT handler, in a separate bash under `timeout` within the unit's 90 s, with its
-# output discarded. A library that is missing, too old, broken or hung loses the record and writes
-# one journal line under tag propolis-witness; what this hook sends, logs as propolis-alert,
-# leaves in its own state files and returns stays exactly as it was.
+# On today's path, whatever it did with the failure, unless the argument was refused, the failure
+# is then recorded in the root alerting state (/var/lib/propolis/witness/incidents) with systemd's
+# own cause and what this hook did with it. The record is made by the shared library
+# (/usr/local/sbin/propolis-alert-lib), and none of its code runs in this shell: under
+# `set -euo pipefail` an unbound variable or an arithmetic error inside a sourced file ends the
+# shell even behind `|| true`, and this is the alert that must still go out when everything else
+# is broken. So the record runs once the send is decided, from the EXIT handler, in a separate bash
+# under `timeout` within the unit's 90 s, with its output discarded. A library that is missing,
+# too old, broken or hung loses the record and writes one journal line under tag
+# propolis-witness; what this hook sends, logs as propolis-alert, leaves in its own state files and
+# returns stays exactly as it was. Under profile v2 (below) the v2 child records the failure
+# instead, and one that fails late (after its marker but before its first write, or without its
+# marker once too little time is left for today's message) may leave only that one line.
 #
 # One name takes another path: propolis-test-page-<6 hex>, which only `propolis-status
 # --test-page` starts. That path sends the operator's test page through the library, in a child
 # process, and exits 0 on every outcome (see the block after the argument check).
+#
+# Under a test root, before today's code, a child process asks the library which alerting profile
+# is in force, and under profile v2 a second child handles the failure in the new message format
+# instead (see the block after the test page). This release starts neither child without a test
+# root, so on every host this hook is today's, whatever file sits at the library's path.
 #
 # Usage: propolis-alert <unit name>
 # PROPOLIS_ALERT_ROOT reads every path under that directory instead of / (tests only).
 #
 # The two lines below are read by deploy/rollback.sh and the deploy tests, in exactly this form:
 # this hook's contract number, which rollback compares before it puts an older hook back, and the
-# version of the library the record step needs.
-# hook-contract: 1
+# version of the library the record step needs. The two children of profile v2 check the version
+# they need themselves (V2_NEEDS).
+#
+# The decision child says v2 with status CHILD_DONE (20), never 0: a library file that ends the
+# shell with status 0 at its top level (a stray `exit 0`, the wrong file at its path) would
+# otherwise read as profile v2 in force, and the v2 child, ended the same way, as a failure
+# handled. Such a library ends the record step's child with status 0 too, so the decision's 0 is
+# named in one line of its own.
+# hook-contract: 2
 # needs-alert-lib: 2
 
 set -euo pipefail
@@ -93,6 +108,8 @@ LIB="$ROOT/usr/local/sbin/propolis-alert-lib"
 # The same number as the library version line above. The record step checks it before calling
 # anything, so an older library is never asked for a function it does not have.
 LIB_NEEDS=2
+# The decision child's status for v2 in force (see the header).
+CHILD_DONE=20
 # What this hook did with the failure, for the record: set just before each exit below, and
 # before the post. A plain assignment, so it sends and logs nothing.
 PA_HOOK_OUT=-
@@ -123,7 +140,106 @@ record_on_exit() {
     exit "$rc"
 }
 
+# Set before the decision below, so a hook stopped by a signal while the decision runs (the unit
+# stopped, the host shutting down) still records the failure, as one stopped anywhere in today's
+# code does. It is cleared while the v2 child runs, which records the failure itself (see below).
 trap record_on_exit EXIT
+
+# Profile v2, decided before any of today's code runs. Two children, each its own bash under
+# timeout, so no library code runs in this shell (see the header): the decision asks the library
+# which profile is in force (it ends CHILD_DONE once pa_hook_profile says v2, which it says by
+# ending 0, and 10 for legacy), and only then the v2 child hands the failure to pa_hook_v2, which
+# records it and sends at most one message in the new format. Any other status from the decision
+# (10, a library that is missing, older than V2_NEEDS, broken or hung) leaves the failure to
+# today's code below, unchanged. The decision gets no stdin and its output is discarded, as the
+# record step's is.
+#
+# In this release the decision is asked only under a test root (PROPOLIS_ALERT_ROOT), which no
+# unit passes: the library honours v2 only there, and a host must not depend on that alone, since
+# a wrong file at the library's path that ended its shell with CHILD_DONE would read as v2 and,
+# if it were slow, cost today's message its time. Without a test root neither child starts.
+#
+# The v2 child makes the marker file once it has the state lock, or has found it busy, and before
+# it reads any state file under the lock, writes one or sends. The marker sits in a directory this
+# hook makes for the one run (mktemp -d, so no other account can enter it or have prepared its
+# name: the unit's /tmp is private, but a hook run by hand shares /tmp, and a link under a name
+# that could be guessed would be followed when the marker is made). With no such directory the
+# child is given no marker path, changes nothing and fails, and today's code runs. The
+# marker is what this hook goes by: a child that left it may have sent, whatever its status, so
+# this hook ends 0 here and adds nothing, no second message and no second record, since the
+# record step's handler is cleared while the child runs. A child that left none wrote no record,
+# no ledger line and no message, whatever its status (a library that ends the shell with status 0
+# makes none), and today's code sends today's message, if enough of the unit's time is left for
+# its worst case.
+#
+# The time budget, in seconds from the hook's start, inside TimeoutStartSec=90s:
+# - today's code takes at most LEGACY_WORST = 65: the post's --retry-max-time 40 and its last
+#   attempt's --max-time 20, and 5 for everything else; the record step then has what is left of
+#   85 s, at least 1, and 2 more before it is killed.
+# - legacy: the decision ends by 5 + 1 (DECIDE_LIMIT and its kill-after), today's code by
+#   6 + 65 = 71, the record step by 85 + 2 = 87.
+# - v2 handled: the v2 child ends by 75 + 2 (V2_LIMIT, counted from the hook's start, and its
+#   kill-after) = 77; there is no record step.
+# - v2 failed without the marker by 20 s (LEGACY_LAST_START = 85 - LEGACY_WORST; SECONDS counts
+#   whole seconds, so up to a second later): today's code ends by 21 + 65 = 86, the record step
+#   by 86 + 1 + 2 = 89.
+# - v2 failed without the marker later: one journal line, by 77 and a moment. Without the marker
+#   the child admitted nothing, and the witness's failed-state and crash-loop checks open the
+#   incident.
+# The decision's limit also shrinks to what is left of 85 s, so a hook started late keeps the
+# record step's time.
+DECIDE_LIMIT=5
+V2_LIMIT=75
+LEGACY_WORST=65
+LEGACY_LAST_START=$(( 85 - LEGACY_WORST ))
+# The library version that has pa_hook_profile and pa_hook_v2.
+V2_NEEDS=12
+decide_budget=$(( 85 - SECONDS ))
+[ "$decide_budget" -le "$DECIDE_LIMIT" ] || decide_budget="$DECIDE_LIMIT"
+[ "$decide_budget" -ge 1 ] || decide_budget=1
+decide_rc=10
+if [ -n "$ROOT" ]; then
+    decide_rc=0
+    # shellcheck source=deploy/alert-lib.sh
+    # shellcheck disable=SC2016 # the child bash expands these, with the library as $1
+    PA_HOOK_UNIT="$UNIT" timeout --kill-after=1 "$decide_budget" \
+        bash -c 'trap "pa_cleanup 2>/dev/null" EXIT; . "$1" && [ "${PA_LIB_VERSION:-0}" -ge "$3" ] && pa_init "$2" && pa_hook_profile && exit "$4"' \
+        _ "$LIB" "$ROOT" "$V2_NEEDS" "$CHILD_DONE" < /dev/null > /dev/null 2>&1 || decide_rc=$?
+    if [ "$decide_rc" = 0 ]; then
+        logger -p daemon.notice -t propolis-witness "the alert library ended before it said which profile is in force; today's code handles the failure of $UNIT, which may not be recorded" 2>/dev/null || true
+    fi
+fi
+if [ "$decide_rc" = "$CHILD_DONE" ]; then
+    v2_dir="$(mktemp -d 2>/dev/null)" || v2_dir=""
+    v2_marker="${v2_dir:+$v2_dir/sent}"
+    v2_budget=$(( V2_LIMIT - SECONDS ))
+    [ "$v2_budget" -ge 1 ] || v2_budget=1
+    v2_rc=0
+    trap - EXIT
+    # shellcheck source=deploy/alert-lib.sh
+    # shellcheck disable=SC2016 # the child bash expands these, with the library as $1
+    PA_HOOK_UNIT="$UNIT" PA_HOOK_MARKER="$v2_marker" timeout --kill-after=2 "$v2_budget" \
+        bash -c 'trap "pa_cleanup 2>/dev/null" EXIT; . "$1" && [ "${PA_LIB_VERSION:-0}" -ge "$3" ] && pa_init "$2" && pa_hook_v2' \
+        _ "$LIB" "$ROOT" "$V2_NEEDS" < /dev/null > /dev/null 2>&1 || v2_rc=$?
+    v2_began=0
+    if [ -n "$v2_dir" ]; then
+        [ ! -e "$v2_marker" ] || v2_began=1
+        rm -f -- "$v2_marker" 2>/dev/null || true
+        rmdir -- "$v2_dir" 2>/dev/null || true
+    fi
+    if [ "$v2_began" = 1 ]; then
+        if [ "$v2_rc" != 0 ]; then
+            logger -p daemon.notice -t propolis-witness "new-format alert for $UNIT stopped after it began; a message may have gone" 2>/dev/null || true
+        fi
+        exit 0
+    fi
+    if [ "$SECONDS" -gt "$LEGACY_LAST_START" ]; then
+        logger -p daemon.notice -t propolis-witness "alert for $UNIT not sent: the new-format path failed, and too little of the unit's time is left for today's message" 2>/dev/null || true
+        exit 0
+    fi
+    trap record_on_exit EXIT
+fi
+
 # Units that did not exist before the record step are decided by name alone, before anything
 # else: a failed witness pass is recorded, never paged, so no host is sent a page it was not sent
 # before.

@@ -377,7 +377,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "11");
+    assert_eq!(version, "12");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);
@@ -1533,6 +1533,57 @@ fn the_banner_without_a_shell_target_judges_the_topic_todays_hook_still_posts_to
     // Nothing that posts: the journal is where failure alerts go.
     fx.write("etc/propolis/propolis.env", "");
     assert_eq!(alerts(), "alerts: NO PUSH TARGET (journal only)");
+}
+
+/// The role's two questions wait for systemd as they always did, unless the caller says how long
+/// it can: only the failure hook's v2 child, which has a time limit, bounds them, so a slow PID 1
+/// cannot change the role the witness, the status command or config-check see.
+#[test]
+fn pa_role_bounds_its_questions_only_for_a_caller_that_says_how_long() {
+    let fx = Fx::new();
+    let calls = fx.p("timeout-calls");
+    write_exec(
+        &fx.bin.join("timeout"),
+        &format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> '{}'\nshift\nexec \"$@\"\n",
+            calls.display()
+        ),
+    );
+    let enabled = [("STUB_ENABLED", "propolis.service")];
+    let r = fx.run_env("echo \"role=$(pa_role)\"", &enabled);
+    assert_eq!(r.get("role"), "single", "{}", r.err);
+    assert!(
+        !calls.exists(),
+        "{}",
+        std::fs::read_to_string(&calls).unwrap_or_default()
+    );
+    let r = fx.run_env("echo \"role=$(PA_ROLE_WAIT=3 pa_role)\"", &enabled);
+    assert_eq!(r.get("role"), "single", "{}", r.err);
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap(),
+        "3 systemctl is-enabled --quiet propolis.service\n\
+         3 systemctl is-enabled --quiet gateway.service\n"
+    );
+    // A wait that is not a plain count of seconds, or is 0 (which timeout reads as no limit), is
+    // no wait; and one inherited from the environment is not the caller's: a shell that exported
+    // it must not change how the witness or the status command ask.
+    std::fs::remove_file(&calls).unwrap();
+    for script in [
+        "echo \"role=$(PA_ROLE_WAIT=3s pa_role)\"",
+        "echo \"role=$(PA_ROLE_WAIT=0 pa_role)\"",
+        "echo \"role=$(pa_role)\"",
+    ] {
+        let r = fx.run_env(
+            script,
+            &[("STUB_ENABLED", "propolis.service"), ("PA_ROLE_WAIT", "5")],
+        );
+        assert_eq!(r.get("role"), "single", "{script}: {}", r.err);
+        assert!(
+            !calls.exists(),
+            "{script}: {}",
+            std::fs::read_to_string(&calls).unwrap_or_default()
+        );
+    }
 }
 
 #[test]
@@ -11338,25 +11389,55 @@ fn a_role_out_of_its_list_reads_unknown() {
     }
 }
 
-/// Nothing calls the new code yet: no script in deploy/ but the library renders an incident
-/// message, asks the budget about a class other than the test page's and the daily message's, or
-/// admits or retries an incident message; pa_send keeps its two call sites (alert_script_test).
+/// The incident renderer, the incident budget and the retry code have one caller outside their
+/// own definitions: the failure hook's v2 path in the library (pa_hook_v2 and the _pa_hv2_
+/// functions it calls). No script in deploy/ renders an incident message, asks the budget about a
+/// class other than the test page's and the daily message's, or admits or retries an incident
+/// message, and no script but the failure hook names pa_hook_v2 or pa_hook_profile: the hook
+/// starts the v2 child once, after the decision child (pa_hook_profile), which a run without a
+/// test root cannot pass (pa_hook_profile_is_legacy_without_a_test_root_whatever_the_env_files_and_the_seam_say).
 #[test]
-fn no_script_calls_the_incident_renderer_the_incident_budget_or_the_retry_code() {
+fn only_the_hooks_v2_path_calls_the_incident_renderer_the_incident_budget_or_the_retry_code() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
     let mut found = Vec::new();
+    let mut hook_lines: Vec<(usize, String)> = Vec::new();
     let mut seen = 0;
+    // The library's own chain from each entry point to the code behind it, and the v2 path.
+    let allowed_in_lib = |f: &str| {
+        matches!(
+            f,
+            "pa_incident_admit" | "pa_budget_admit" | "pa_render" | "pa_budget_next" | "pa_hook_v2"
+        ) || f.starts_with("_pa_hv2_")
+    };
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if !name.ends_with(".sh") || name == "alert-lib.sh" {
+        if !name.ends_with(".sh") {
             continue;
         }
         seen += 1;
         let text = std::fs::read_to_string(&path).unwrap();
-        for line in text.lines() {
+        let mut function = String::new();
+        for (n, line) in text.lines().enumerate() {
             let t = line.trim_start();
+            if let Some(f) = t.strip_suffix("() {")
+                && !line.starts_with(' ')
+            {
+                function = f.to_string();
+                continue;
+            }
             if t.starts_with('#') {
+                continue;
+            }
+            if name != "alert-lib.sh" && (t.contains("pa_hook_v2") || t.contains("pa_hook_profile"))
+            {
+                if name == "alert.sh" {
+                    hook_lines.push((n, t.to_string()));
+                } else {
+                    found.push(format!("{name}: {t}"));
+                }
+            }
+            if name == "alert-lib.sh" && allowed_in_lib(&function) {
                 continue;
             }
             for f in [
@@ -11402,6 +11483,58 @@ fn no_script_calls_the_incident_renderer_the_incident_budget_or_the_retry_code()
             }
         }
     }
-    assert!(seen >= 5, "the scripts in deploy/");
+    assert!(seen >= 6, "the scripts in deploy/");
     assert!(found.is_empty(), "calls of the new code: {found:#?}");
+    // In the hook: the decision first, then the v2 child, once each.
+    let profile: Vec<usize> = hook_lines
+        .iter()
+        .filter(|(_, t)| t.contains("pa_hook_profile"))
+        .map(|(n, _)| *n)
+        .collect();
+    let v2: Vec<usize> = hook_lines
+        .iter()
+        .filter(|(_, t)| t.contains("pa_hook_v2"))
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!((profile.len(), v2.len()), (1, 1), "{hook_lines:#?}");
+    assert!(
+        profile[0] < v2[0],
+        "the decision comes first: {hook_lines:#?}"
+    );
+}
+
+/// The decision child of the failure hook: pa_hook_profile ends 0 only when profile v2 is in
+/// force, else 10. With an empty root, which is how every unit runs it, it is 10 whatever both env
+/// files say and whatever the test seam says; under the test root with the seam it is 0, and a
+/// unit name systemd would not give is 10 even then, so today's message reports it.
+#[test]
+fn pa_hook_profile_is_legacy_without_a_test_root_whatever_the_env_files_and_the_seam_say() {
+    let fx = Fx::new();
+    fx.write("etc/propolis/propolis.env", "PROPOLIS_ALERT_PROFILE=v2\n");
+    fx.write("etc/propolis/alert.env", "PROPOLIS_ALERT_PROFILE=v2\n");
+    let decide =
+        "rc=0\npa_hook_profile || rc=$?\necho \"rc=$rc\"\necho \"state=${PA_PROFILE_STATE:-}\"";
+    let unit = ("PA_HOOK_UNIT", "sensor-ssh.service");
+    let seam = ("PA_TEST_PROFILE", "v2");
+    // An empty root, with the env files read from the fixture so that both say v2.
+    let r = fx.run_raw(
+        &format!(
+            "set -u -o pipefail\nsource \"$LIB\"\npa_init ''\nPA_ENV_DIR=\"$ROOT/etc/propolis\"\n{decide}"
+        ),
+        &[unit, seam],
+    );
+    assert_eq!(
+        (r.get("rc"), r.get("state")),
+        ("10".into(), "v2".into()),
+        "{}",
+        r.err
+    );
+    let r = fx.run_env(decide, &[unit, seam]);
+    assert_eq!(r.get("rc"), "0", "the seam under a test root: {}", r.err);
+    let r = fx.run_env(decide, &[unit]);
+    assert_eq!(r.get("rc"), "10", "no seam: {}", r.err);
+    for bad in ["sensor-ssh", "", "bad unit"] {
+        let r = fx.run_env(decide, &[("PA_HOOK_UNIT", bad), seam]);
+        assert_eq!(r.get("rc"), "10", "{bad:?}: {}", r.err);
+    }
 }

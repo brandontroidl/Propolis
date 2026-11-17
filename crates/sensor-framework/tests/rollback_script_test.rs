@@ -1443,6 +1443,23 @@ fn the_shipped_hook_stays_over_a_kept_hook_from_before_hook_contracts() {
     assert_current_trio_kept(&fx, &current, &stdout, 0, contract);
 }
 
+/// The shipped hook is contract 2, the first that can hand a failure to the v2 format, and a kept
+/// contract-1 hook (every hook released before it) is older: the shipped hook, its library and
+/// its unit stay. The rule compares numbers, so this needs no change to rollback.
+#[test]
+fn the_shipped_contract_two_hook_stays_over_a_kept_contract_one_hook() {
+    let fx = Fixture::new();
+    let current = shipped("alert.sh");
+    let contract = current
+        .lines()
+        .find_map(|l| l.strip_prefix("# hook-contract: "))
+        .and_then(|n| n.parse::<u32>().ok())
+        .expect("deploy/alert.sh states its contract");
+    assert_eq!(contract, 2);
+    let stdout = roll_back_hooks(&fx, Some(hook_with_contract(Some(1), "kept")), &current);
+    assert_current_trio_kept(&fx, &current, &stdout, 1, 2);
+}
+
 /// While the services are down the maintenance marker says so, with reason `rollback`, this
 /// boot and an end at most two hours ahead; once propolis.service is back it is gone.
 #[test]

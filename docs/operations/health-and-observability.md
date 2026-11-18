@@ -522,7 +522,16 @@ transition that adds to `would_push` in the default profile is sent as an incide
   (`deploy/alert-lib.sh#pa_incident_admit`): an admitted one gets its `pending` line in the send
   ledger and then its pending transition in the record, both written before anything is posted;
   a withheld one gets a `W` line in the incidents file naming the budget's reason (none for a
-  RESOLVED whose open never got through). A record that is not whole, a kind the tables do not
+  RESOLVED whose open never got through). No pass reads the `W` lines yet: the library holds the
+  storm notice and the hourly summary that will list them
+  (`deploy/alert-lib.sh#pa_withheld_since`, each counted against its own cap and never against
+  the pool, the listener caps or a key), which count every line since the last notice, name the
+  new incidents ten at most and count the rest, and, for a withheld open or reopen of a PAGE
+  incident, name it in the title at priority 5; a line or a record out of form is counted and
+  never named. The library also holds the pointer message for a topic not proven private, with a
+  ref and nothing else (`deploy/alert-lib.sh#pa_render`), and can admit and record it in its own
+  budget class (`deploy/alert-lib.sh#pa_notice_admit`). Nothing sends it yet: the rules for when
+  a pointer is sent come with its senders. A record that is not whole, a kind the tables do not
   know and a send ledger no copy of which can be read are each withheld, never sent. A change or
   a reminder of an incident whose open or reopen is still pending is only recorded: the retry of
   that open renders the record as it then is. One message per incident and pass.

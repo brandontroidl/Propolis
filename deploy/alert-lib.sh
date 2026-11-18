@@ -24,8 +24,10 @@
 # probe through pg-exec (pa_pg) and the public-feed push scheduler check (pa_push_scheduler), so
 # the status command and the witness judge both by one rule; the volume projection and triggers
 # (pa_vol_project, pa_vol_judge), for the same reason; the incident record; the failure hook's
-# record step (pa_hook_record), which the hook runs in a child process of its own; and the
-# hook's two children of profile v2, the decision (pa_hook_profile) and the v2 path (pa_hook_v2).
+# record step (pa_hook_record), which the hook runs in a child process of its own; the hook's two
+# children of profile v2, the decision (pa_hook_profile) and the v2 path (pa_hook_v2); and the
+# storm notice, the summaries and the pointer message of profile v2, with their admission, which
+# no script calls yet.
 #
 # TEMPORARY FILES. A function that makes one appends its path to PA_CLEANUP. Each caller's single
 # EXIT handler runs pa_cleanup, which removes them.
@@ -389,6 +391,13 @@ _pa_shell_files() {
 # not in force yet, and a profile that could be switched on before they are would page in a
 # format nothing has proven. Only the test seam PA_TEST_PROFILE (legacy or v2) sets it, and only
 # under a non-empty root, which no unit and no script passes.
+#
+# PROPOLIS_OPS_PUSH_DETAIL (alert.env over propolis.env, whichever file holds the target) gives
+# PA_DETAIL under profile v2: auto when unset, empty or `auto`, else pointer, which pa_gate then
+# answers whatever the read check proved. Under legacy PA_DETAIL is auto whatever the key says.
+# PA_DETAIL_STATE says what the file holds under either profile: unset, auto, pointer or invalid
+# (any other value, or a line systemd may read otherwise, read as pointer); PA_DETAIL_SRC its
+# file.
 pa_settings_load() {
     local env="$PA_ENV_DIR/propolis.env" url_src topic_src
     local -a tfiles
@@ -477,6 +486,21 @@ pa_settings_load() {
     if [ -n "${PA_ROOT:-}" ]; then
         case "${PA_TEST_PROFILE:-}" in legacy | v2) PA_PROFILE="$PA_TEST_PROFILE" ;; esac
     fi
+    # Anything but auto, or nothing, means pointer: a value written in error then costs detail,
+    # never a leak, and there is no value that forces full detail onto a topic not proven private.
+    PA_DETAIL=auto PA_DETAIL_STATE=unset PA_DETAIL_SRC=""
+    _pa_shell_files PROPOLIS_OPS_PUSH_DETAIL
+    pa_env_get PROPOLIS_OPS_PUSH_DETAIL "${_PA_FILES[@]}" > /dev/null
+    if [ -n "$PA_ENV_VALUE" ]; then
+        PA_DETAIL_SRC="${PA_ENV_SRC##*/}" PA_DETAIL=pointer PA_DETAIL_STATE=invalid
+        if [ "$PA_ENV_COMPLEX" = 0 ]; then
+            case "$PA_ENV_VALUE" in auto | pointer) PA_DETAIL="$PA_ENV_VALUE" PA_DETAIL_STATE="$PA_ENV_VALUE" ;; esac
+        fi
+    fi
+    # Pointer mode is profile v2's. Under legacy the key holds nothing back, whatever it says:
+    # the one message legacy sends by the gate is the daily one, and a host that wrote the key,
+    # or mistyped it, must not lose that message without a report that says why.
+    [ "$PA_PROFILE" = v2 ] || PA_DETAIL=auto
     return 0
 }
 
@@ -1922,8 +1946,8 @@ pa_cred_fp() {
 
 # pa_gate: full, pointer:<reason> or none:notarget for the shell target, from the stored read
 # check and the settings; no network. full only when: there is a target; the detail setting is
-# auto (PA_DETAIL, read from a later release; auto until then); the stored line is bound to this
-# target; its definite class is refused, decided within 24 h; an attempt was made within 3 h (the
+# auto (PA_DETAIL, from pa_settings_load, which every sender runs first); the stored line is
+# bound to this target; its definite class is refused, decided within 24 h; an attempt was made within 3 h (the
 # checker is alive); the URL is https (over plain HTTP anyone on the path can answer 403 to the
 # check and then read every push); and on a collector the credential a post carries is proven
 # unable to read the topic, or there is none (the role is PA_ROLE, or pa_role's answer when the
@@ -3059,11 +3083,14 @@ pa_incident_write() {
 }
 
 # pa_incident_prune: the bounds of the incidents file, in memory: a resolved record goes seven
-# days after its resolve and a withheld (W) line after 48 hours. A time that cannot be read keeps
-# the line, and open, acked and pending records always stay.
+# days after its resolve and a withheld (W) line after 48 hours. A record's time that cannot be
+# read keeps the record. A W line whose stamp is out of form goes, and one whose time is ahead of
+# the clock stays only while its wall time is within 48 hours of the wall clock. Open, acked and
+# pending records always stay.
 pa_incident_prune() {
     local i a
     local -a f keep=() rest=()
+    [ -n "${PA_STAMP:-}" ] || pa_now
     for i in "${!_PA_INC_I[@]}"; do
         IFS=$'\t' read -r -a f <<< "${_PA_INC_I[$i]}"
         if [ "${f[7]:-}" = resolved ]; then
@@ -3075,8 +3102,19 @@ pa_incident_prune() {
     for i in "${!_PA_INC_REST[@]}"; do
         if [[ ${_PA_INC_REST[$i]} == W$'\t'* ]]; then
             IFS=$'\t' read -r -a f <<< "${_PA_INC_REST[$i]}"
+            # Every notice counts a W line whose stamp cannot be placed, so one kept for good
+            # would keep a summary due every hour for good.
+            _pa_stamp_split "${f[1]:-}" || continue
             a="$(pa_age "${f[1]:-}")"
             [ "$a" -le 172800 ] || continue
+            # Ahead of the clock (a stamp of this boot whose uptime is not reached, or a wall
+            # time not reached): the usual rule can never age it out, so the wall clock alone
+            # bounds it, 48 hours either side.
+            if [ "$a" -lt 0 ]; then
+                [[ ${PA_WALL:-} =~ ^[0-9]{1,12}$ ]] || continue
+                a=$((10#$PA_WALL - 10#$_PA_W))
+                [ "$a" -ge -172800 ] && [ "$a" -le 172800 ] || continue
+            fi
         fi
         rest+=("${_PA_INC_REST[$i]}")
     done
@@ -3455,9 +3493,14 @@ pa_send() {
 # daily, MODE full only: it goes only where the gate is full) is _pa_render_daily's. An incident
 # message (TX open, change, reopen, remind or resolve, ID the incident's id or `-` for the hook's
 # message without a record, MODE full only, WAS the stored cause before a change) is
-# _pa_render_incident's, where a body line pa_ok_line refuses reads `(line withheld)`. Status 1,
-# with nothing set, for any other message, a code not of 6 hex, a title (or a line of the test page
-# or the daily message) pa_ok_line refuses, or no alias yet.
+# _pa_render_incident's, where a body line pa_ok_line refuses reads `(line withheld)`. The storm
+# notice and the hourly summary (TX storm or summary, MODE full, ID the stamp they list what was
+# withheld since) are _pa_render_withheld's, the switch summary (TX switch, MODE full, ID `-`)
+# _pa_render_switch's, each over the records in memory (pa_incident_load); the pointer message
+# (TX pointer, MODE pointer, ID its ref of 6 hex) carries the alias and the ref and nothing else,
+# so it is the same whatever it covers. Status 1, with nothing set, for any other message, a code
+# or a ref not of 6 hex, a title (or a line of the test page, the daily message or a notice)
+# pa_ok_line refuses, or no alias yet.
 pa_render() {
     local mode="${1:-}" tx="${2:-}" id="${3:-}" line
     PA_TITLE="" PA_PRIO="" PA_BODY=""
@@ -3468,10 +3511,28 @@ pa_render() {
             _pa_render_incident "$mode" "$tx" "$id" "${4:-}"
             return
             ;;
+        storm | summary | switch) [ "$mode" = full ] || return 1 ;;
+        pointer) [ "$mode" = pointer ] && [[ $id =~ ^[0-9a-f]{6}$ ]] || return 1 ;;
         *) return 1 ;;
     esac
     pa_alias > /dev/null 2>&1 || return 1
     [ "$PA_ALIAS" != - ] && pa_ok_field "$PA_ALIAS" || return 1
+    case "$tx" in
+        storm | summary)
+            _pa_render_withheld "$tx" "$id"
+            return
+            ;;
+        switch)
+            _pa_render_switch
+            return
+            ;;
+        pointer)
+            PA_TITLE="$PA_ALIAS: needs attention"
+            PA_PRIO=4
+            PA_BODY="Run the status command on $PA_ALIAS. ref $id"
+            return 0
+            ;;
+    esac
     if [ "$tx" = daily ]; then
         PA_BODY="$(_pa_render_daily)" || PA_BODY=""
         while IFS= read -r line; do
@@ -3747,8 +3808,8 @@ _pa_ledger_ages() {
 
 # _pa_exempt_caps CLASS: `<window seconds> <limit>` pairs of an exempt class: storm 1 in 6 h,
 # summary 1 an hour and 12 a day, switch 1 a day where the time of the switch is not known
-# (_pa_switch_held decides it otherwise), pointer 2 an hour and 48 a day (its sender's 30-minute
-# coalescing gives that; the cap holds if it does not).
+# (_pa_switch_held decides it otherwise), pointer 2 an hour and 48 a day (a bound under
+# whatever rules its senders bring).
 _pa_exempt_caps() {
     case "${1:-}" in
         storm) printf '21600 1' ;;
@@ -3988,8 +4049,9 @@ _pa_budget_incident() {
 # must not be sent (withhold:noclaim). Prints the verdict of pa_budget_admit, or withhold:ledger
 # when the line cannot be written; status 0 only for admit. PA_ADMIT_VERDICT says the same word,
 # and PA_ADMIT_AS is empty unless admitted; a withhold that comes after the verdict (the line or
-# the record could not be written) leaves the records in memory as they were. MODE is full only: pointer mode is a budget class of its own, exempt from the pool,
-# stage 1 and the key cap, and comes with the profile switch. The caller holds the lock and loaded
+# the record could not be written) leaves the records in memory as they were. MODE is full only:
+# pointer mode is a budget class of its own, exempt from the pool, stage 1 and the key cap
+# (pa_notice_admit pointer). The caller holds the lock and loaded
 # the records (pa_incident_load), with the transition already applied and stored in memory
 # (pa_incident_set): the record is read again from there, so a change left only in PA_INC is lost.
 pa_incident_admit() {
@@ -4173,9 +4235,10 @@ pa_budget_next() {
 # window holds limit or more counted lines, the time the oldest of the surplus leaves it, and the
 # latest of those; now when there is room already. HH:MM UTC, rounded up to the minute. A switch
 # summary already sent for the switch in force has room only at the next switch, which no clock
-# gives: `?`.
+# gives: `?`. PLUS 1 counts one more line sent now, so a summary can say when the one after it
+# may go.
 _pa_budget_next_exempt() {
-    local class="$1" w l n c a r need=0 t rc=2
+    local class="$1" plus="${2:-0}" w l n c a r need=0 t rc=2
     local -a caps=() rem=()
     if [ "$class" = switch ]; then
         _pa_switch_held && rc=0 || rc=$?
@@ -4192,6 +4255,7 @@ _pa_budget_next_exempt() {
             [ -n "${c:-}" ] && [ "$a" -lt "$w" ] || continue
             rem+=("$((w - a))")
         done < <(_pa_ledger_ages "$class")
+        [ "$plus" != 1 ] || rem+=("$w")
         n="${#rem[@]}"
         [ "$n" -ge "$l" ] || continue
         r="$(printf '%s\n' "${rem[@]}" | sort -n | sed -n "$((n - l + 1))p")"
@@ -4615,8 +4679,8 @@ _pa_render_daily() {
 # alias, an opaque id, an incident id, a count, a duration, a clock time, a cause code and its
 # number. Nothing read from a record, a state file, the host or the environment is ever copied in
 # as text: a key, a kind or a path only selects a phrase, and a value out of form reads `not known
-# here` or `?`, or the message is not rendered at all. Pointer mode, the storm notice and the
-# summaries come with the profile switch, which honours what these render.
+# here` or `?`, or the message is not rendered at all. The storm notice, the summaries and the
+# pointer message follow under their own heading, by the same rule.
 
 # _pa_keyhash KEY: the first 8 hex of sha256(KEY), the form the send ledger and W lines name a key
 # by, so a copy of either taken for a bug report names nothing.
@@ -5281,6 +5345,385 @@ _pa_render_incident() {
     PA_TITLE="$title"
 }
 
+# ---- the notices and the pointer message -------------------------------------------------------
+#
+# The storm notice and the hourly summary say how many messages the budget withheld and which new
+# incidents those were; the switch summary lists what is open when the new alerting comes on; the
+# pointer message, for a topic not proven private, says only that the host needs attention. As
+# for the incident messages, every word is from a closed list here or a value matched against its
+# form before use: the alias, an opaque instance id, an incident id, a count, a clock time, a tier
+# and a stage word from the tables, a ref. A W line or a record out of form is counted and never
+# named, and never raises a notice's priority, so damage can make a notice say that more was
+# withheld, never less. Each class has its own caps in the budget (_pa_exempt_caps): none of
+# them counts against the pool, the listener caps or a key, and no incident message against them.
+
+# _pa_inst_ok V: an opaque instance id as pa_id_table gives one.
+_pa_inst_ok() {
+    [[ ${1:-} =~ ^[uscvmf][0-9a-f]{5}([0-9a-f]{3})?$ ]]
+}
+
+# _pa_names NAMES MORE: a list of at most ten names and a count of the rest, as a notice prints
+# it: `none`, the names, `<names> and <k> more`, or `<k> not named` when none could be named.
+_pa_names() {
+    local named="${1:-}" more="${2:-0}"
+    if [ -z "$named" ] && [ "$more" = 0 ]; then
+        printf none
+    elif [ -z "$named" ]; then
+        printf '%s not named' "$more"
+    elif [ "$more" = 0 ]; then
+        printf '%s' "$named"
+    else
+        printf '%s and %s more' "$named" "$more"
+    fi
+}
+
+# _pa_stamp_before A B: stamp A is earlier than stamp B, both in form: by uptime within one boot,
+# else by the wall clock. Status 1 when either cannot be placed.
+_pa_stamp_before() {
+    local w b u
+    _pa_stamp_split "${1:-}" || return 1
+    w="$_PA_W" b="$_PA_B" u="$_PA_U"
+    _pa_stamp_split "${2:-}" || return 1
+    if [ "$b" != - ] && [ "$b" = "$_PA_B" ]; then
+        [ "$((10#$u))" -lt "$((10#$_PA_U))" ]
+    else
+        [ "$((10#$w))" -lt "$((10#$_PA_W))" ]
+    fi
+}
+
+# pa_w_line KEY TX NEW INST REASON: the W line of a withheld transition, `W stamp keyhash tx new
+# inst reason`, added to the records in memory and stamped when it is written, under the
+# caller's lock, not when the caller's pass began: a notice lists the lines stamped at or after
+# its own claim, and a line stamped earlier than it was written could fall before a notice
+# claimed in between and never be listed. The caller's PA_STAMP (and PA_WALL, PA_BOOT, PA_UP) is
+# left as it was. Status 1, nothing added, when the key cannot be hashed.
+pa_w_line() {
+    local kh s="${PA_STAMP:-}" w="${PA_WALL:-}" b="${PA_BOOT:-}" u="${PA_UP:-}" line
+    kh="$(_pa_keyhash "${1:-}")" || return 1
+    pa_now
+    line="W"$'\t'"$PA_STAMP"$'\t'"$kh"$'\t'"${2:-}"$'\t'"${3:-}"$'\t'"${4:--}"$'\t'"${5:-}"
+    PA_STAMP="$s" PA_WALL="$w" PA_BOOT="$b" PA_UP="$u"
+    _PA_INC_REST+=("$line")
+}
+
+# pa_withheld_since SINCE: what the W lines in memory (pa_incident_load) stamped at or after SINCE
+# say (a line in the same second as SINCE is counted, which errs toward more), or every W line
+# when SINCE is out of form or ahead of the clock: a stamp that cannot be placed must not hide what
+# was withheld. Within the boot of SINCE lines are placed by uptime; when SINCE is of this boot, a
+# line of another boot was written before it and is not counted; when SINCE is of an earlier boot,
+# a line of this boot was written after it and is counted, whatever a clock that came up behind
+# says. A line whose own stamp cannot be placed is counted; one that is not whole is placed by its
+# stamp when that is in form, so an old one is not counted by every later notice. Sets PA_WH_N
+# (how many), PA_WH_NEW (the instances of the new incidents among
+# them, in the order they were withheld, ten at most), PA_WH_MORE (the new incidents not named:
+# past ten, or not nameable), PA_WH_PAGE and PA_WH_PAGE_MORE (the same for the withheld opens and
+# reopens of PAGE incidents, which the PAGE rule of a notice follows, so that a dead listener
+# whose reopen the caps hold back is never one count in a message of priority 3) and
+# PA_WH_OLDEST (the earliest counted stamp in form, or empty). Status 1, all of it zero, when no
+# records are in memory.
+#
+# A line names an incident only when every field is in form and its key hash names exactly one
+# record, whole (_pa_inc_whole), with an incident id and a tier of PAGE or ACT, and the line is
+# not older than that record's last open (field 9): one record per key is kept, so an older line
+# may be of an earlier incident on the key that this one replaced. The tier is the record's, never
+# the line's. The name is the record's instance id, or its incident id where the record has no
+# instance in form. Only an open with new 1 is a new incident; a reopen is named only for the
+# PAGE rule. A line that still says it withheld the open of a new incident (transition open, new
+# 1, each in its place) but can name none is counted in PA_WH_MORE. A record's key is hashed only
+# once a line needs it, and every record's then, so that a hash two records share names neither.
+pa_withheld_since() {
+    local since="${1:-}" all=1 sw="" sb="" su="" line rl i k kh name idx tier n=0 newopen
+    local more=0 pmore=0 named=0 pnamed=0 oldest="" ow=-1 mapped=0 lw placed
+    local -a f wrec
+    local -A recs=() seen=() pseen=()
+    PA_WH_N=0 PA_WH_NEW="" PA_WH_MORE=0 PA_WH_PAGE="" PA_WH_PAGE_MORE=0 PA_WH_OLDEST=""
+    declare -p _PA_INC_I > /dev/null 2>&1 || return 1
+    [ -n "${PA_STAMP:-}" ] || pa_now
+    if [ "$(pa_age "$since")" -ge 0 ] && _pa_stamp_split "$since"; then
+        all=0 sw="$_PA_W" sb="$_PA_B" su="$_PA_U"
+    fi
+    for line in "${_PA_INC_REST[@]}"; do
+        [[ $line == W$'\t'* ]] || continue
+        IFS=$'\t' read -r -a f <<< "$line"
+        placed=0
+        if _pa_stamp_split "${f[1]:-}"; then
+            placed=1
+            if [ "$all" = 0 ]; then
+                if [ "$sb" != - ] && [ "$sb" = "$_PA_B" ]; then
+                    [ "$((10#$_PA_U))" -ge "$((10#$su))" ] || continue
+                elif [ "$sb" != - ] && [ "$sb" = "${PA_BOOT:-}" ] && [ "$_PA_B" != - ]; then
+                    # Written in an earlier boot, so before anything in this one, whatever a
+                    # clock stepped back says of its wall time.
+                    continue
+                elif [ "$sb" != - ] && [ "$_PA_B" != - ] && [ "$_PA_B" = "${PA_BOOT:-}" ]; then
+                    # Written in this boot, so after a stamp of an earlier one, whatever a
+                    # clock that came up behind says of its wall time.
+                    :
+                else
+                    [ "$((10#$_PA_W))" -ge "$((10#$sw))" ] || continue
+                fi
+            fi
+            if [ "$ow" -lt 0 ] || [ "$((10#$_PA_W))" -lt "$ow" ]; then
+                ow=$((10#$_PA_W)) oldest="${f[1]}"
+            fi
+        fi
+        # A line with an empty field or one too few cannot be read field by field (the reader
+        # would move every later field one place early): it is counted, unless its stamp put
+        # it before SINCE above, and never named.
+        if [[ $line == *$'\t\t'* || $line == *$'\t' ]] || [ "${#f[@]}" -lt 7 ]; then
+            n=$((n + 1))
+            continue
+        fi
+        [ "$placed" = 1 ] || f[2]=-
+        n=$((n + 1))
+        case "${f[3]}" in open | reopen) ;; *) continue ;; esac
+        case "${f[4]}" in 0) newopen=0 ;; 1) newopen=1 ;; *) continue ;; esac
+        [ "${f[3]}" = open ] || newopen=0
+        lw="${f[1]}"
+        idx=""
+        if [[ ${f[2]} =~ ^[0-9a-f]{8}$ ]]; then
+            kh="${f[2]}"
+            if [ "$mapped" = 0 ]; then
+                mapped=1
+                for i in "${!_PA_INC_I[@]}"; do
+                    IFS=$'\t' read -r -a wrec <<< "${_PA_INC_I[$i]}"
+                    k="$(_pa_keyhash "${wrec[2]:-}")" || continue
+                    if [ -n "${recs[$k]+set}" ]; then recs[$k]=x; else recs[$k]="$i"; fi
+                done
+            fi
+            idx="${recs[$kh]:-}"
+        fi
+        name="" tier=""
+        if [[ $idx =~ ^[0-9]+$ ]]; then
+            rl="${_PA_INC_I[idx]}"
+            IFS=$'\t' read -r -a wrec <<< "$rl"
+            if [[ $rl != *$'\t\t'* && $rl != *$'\t' && ${wrec[1]:-} =~ ^w#[0-9]{1,9}$ ]] \
+                && ! _pa_stamp_before "$lw" "${wrec[9]:-}"; then
+                case "${wrec[6]:-}" in PAGE | ACT) tier="${wrec[6]}" ;; esac
+                if [ -n "$tier" ]; then
+                    if _pa_inst_ok "${wrec[5]:-}"; then name="${wrec[5]}"; else name="${wrec[1]}"; fi
+                fi
+            fi
+        fi
+        if [ -z "$name" ]; then
+            [ "$newopen" = 0 ] || more=$((more + 1))
+            continue
+        fi
+        if [ "$newopen" = 1 ] && [ -z "${seen[$name]+set}" ]; then
+            seen[$name]=1
+            if [ "$named" -lt 10 ]; then
+                PA_WH_NEW+="${PA_WH_NEW:+ }$name" named=$((named + 1))
+            else
+                more=$((more + 1))
+            fi
+        fi
+        if [ "$tier" = PAGE ] && [ -z "${pseen[$name]+set}" ]; then
+            pseen[$name]=1
+            if [ "$pnamed" -lt 10 ]; then
+                PA_WH_PAGE+="${PA_WH_PAGE:+ }$name" pnamed=$((pnamed + 1))
+            else
+                pmore=$((pmore + 1))
+            fi
+        fi
+    done
+    PA_WH_N="$n" PA_WH_MORE="$more" PA_WH_PAGE_MORE="$pmore" PA_WH_OLDEST="$oldest"
+    return 0
+}
+
+# _pa_render_withheld TX SINCE: the storm notice (TX storm) or the hourly summary (TX summary) of
+# what was withheld since SINCE (pa_withheld_since): the count and since when, the new incidents,
+# and when the next summary may go (for a summary, the one after it). The PAGE rule: when a
+# withheld open of a PAGE incident is among them, the title names the first such instance, a
+# first line lists them all and the priority is 5, so a dead listener is never one id in a
+# message of priority 3. Nothing withheld renders nothing.
+_pa_render_withheld() {
+    local tx="$1" since="$2" at word next title body="" line plus=0 span=-1
+    pa_withheld_since "$since" || return 1
+    [ "$PA_WH_N" -ge 1 ] || return 1
+    if [ "$(pa_age "$since")" -ge 0 ] && _pa_stamp_split "$since"; then
+        at="$(_pa_hm_of "$since")" span="$(pa_age "$since")"
+    elif [ -n "$PA_WH_OLDEST" ]; then
+        at="$(_pa_hm_of "$PA_WH_OLDEST")"
+    else
+        at="?"
+    fi
+    word=messages
+    [ "$PA_WH_N" != 1 ] || word=message
+    [ "$tx" != summary ] || plus=1
+    next="$(_pa_budget_next_exempt summary "$plus")" || next="?"
+    # `in the last hour` only for a count that starts about an hour back (65 minutes at most: a
+    # summary goes on the first pass after its hour); over a longer span, or from a stamp that
+    # cannot be placed, the title names the time the count starts at, or no time at all.
+    if [ "$tx" = storm ]; then
+        title="$PA_ALIAS: alert budget reached"
+    elif [ "$span" -ge 0 ] && [ "$span" -le 3900 ]; then
+        title="$PA_ALIAS: $PA_WH_N $word withheld in the last hour"
+    elif [ "$at" != "?" ]; then
+        title="$PA_ALIAS: $PA_WH_N $word withheld since $at UTC"
+    else
+        title="$PA_ALIAS: $PA_WH_N $word withheld"
+    fi
+    PA_PRIO=3
+    if [ -n "$PA_WH_PAGE" ]; then
+        title="$PA_ALIAS: PAGE withheld ${PA_WH_PAGE%% *}"
+        body="PAGE withheld: $(_pa_names "$PA_WH_PAGE" "$PA_WH_PAGE_MORE")"$'\n'
+        PA_PRIO=5
+    fi
+    body+="Withheld: $PA_WH_N $word since $at UTC; new incidents: $(_pa_names "$PA_WH_NEW" "$PA_WH_MORE")"$'\n'
+    body+="Next summary $next UTC. Do: status"
+    _pa_render_check "$title" "$body"
+}
+
+# _pa_render_check TITLE BODY: the notice in PA_TITLE and PA_BODY when the title and every line
+# pass pa_ok_line and the body is under the 1024 bytes the sender cuts at; else nothing is set
+# and the status is 1, so a notice is sent whole or not at all.
+_pa_render_check() {
+    local line
+    pa_ok_line "$1" && [ -n "$1" ] && [ "${#2}" -lt 1024 ] || {
+        PA_TITLE="" PA_PRIO="" PA_BODY=""
+        return 1
+    }
+    while IFS= read -r line; do
+        pa_ok_line "$line" || {
+            PA_TITLE="" PA_PRIO="" PA_BODY=""
+            return 1
+        }
+    done <<< "$2"
+    PA_TITLE="$1" PA_BODY="$2"
+}
+
+# _pa_render_switch: the switch summary over the records in memory: how many incidents are open
+# or acknowledged, then one line each, `<id> <TIER> <stage> <inst>`, PAGE first, then ACT, then
+# NOTICE, ten at most and the rest counted, then `Do: status`. A record that is not whole is
+# counted, since its state cannot be read, and never listed, nor is one whose id, tier, stage or
+# instance is out of form.
+_pa_render_switch() {
+    local line n=0 shown=0 k body="" p="" a="" o="" item
+    local -a f
+    declare -p _PA_INC_I > /dev/null 2>&1 || return 1
+    for line in "${_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r -a f <<< "$line"
+        if [[ $line == *$'\t\t'* || $line == *$'\t' ]]; then
+            n=$((n + 1))
+            continue
+        fi
+        case "${f[7]:-}" in open | acked) n=$((n + 1)) ;; *) continue ;; esac
+        if [[ ! ${f[1]:-} =~ ^w#[0-9]{1,9}$ ]] || ! _pa_stage_where "${f[4]:-}" > /dev/null; then
+            continue
+        fi
+        [ "${f[5]:-}" = - ] || _pa_inst_ok "${f[5]:-}" || continue
+        item="${f[1]} ${f[6]:-} ${f[4]} ${f[5]}"$'\n'
+        case "${f[6]:-}" in
+            PAGE) p+="$item" ;;
+            ACT) a+="$item" ;;
+            NOTICE) o+="$item" ;;
+        esac
+    done
+    while IFS= read -r line; do
+        [ -n "$line" ] && [ "$shown" -lt 10 ] || continue
+        body+="$line"$'\n'
+        shown=$((shown + 1))
+    done <<< "$p$a$o"
+    k=$((n - shown))
+    [ "$k" = 0 ] || body+="and $k more"$'\n'
+    body+="Do: status"
+    PA_PRIO=3
+    _pa_render_check "$PA_ALIAS: alerting on; $n open" "$body"
+}
+
+# _pa_notice_mode CLASS: the mode a message of an exempt class goes in, pointer for the pointer
+# message and full for the three notices; status 1 for any other class.
+_pa_notice_mode() {
+    case "${1:-}" in
+        storm | summary | switch) printf full ;;
+        pointer) printf pointer ;;
+        *) return 1 ;;
+    esac
+}
+
+# pa_notice_admit CLASS SENDER: a storm notice, a summary, a switch summary or a pointer message
+# admitted by its class's own caps (pa_budget_admit) and, when admitted, claimed before its post:
+# one ledger line, `L stamp CLASS - CLASS MODE sending SENDER`, claimed from the start as the
+# daily message's is. A claimed line counts in every window of its class's caps whatever becomes
+# of the post, so one whose result is never written counts as sent, which errs toward fewer
+# messages. Sets PA_ADMIT_VERDICT (and prints it) and PA_NOTICE_STAMP, the line's stamp, by which
+# pa_notice_result finds it (empty unless admitted). A line that cannot be written sends nothing
+# (withhold:ledger); a class not of the four is withhold:class and a sender not of the closed list
+# withhold:unknown, before anything is read. The caller holds the lock and has rendered the
+# message first, so one that cannot be put together is never counted.
+pa_notice_admit() {
+    local class="${1:-}" sender="${2:-}" mode
+    PA_NOTICE_STAMP="" PA_ADMIT_AS=""
+    if ! mode="$(_pa_notice_mode "$class")"; then
+        PA_ADMIT_VERDICT=withhold:class
+    else
+        case "$sender" in hook | light | hourly | status) PA_ADMIT_VERDICT="" ;; *) PA_ADMIT_VERDICT=withhold:unknown ;; esac
+    fi
+    if [ -n "$PA_ADMIT_VERDICT" ] || ! pa_budget_admit "$class" > /dev/null; then
+        printf '%s' "$PA_ADMIT_VERDICT"
+        return 1
+    fi
+    if ! pa_ledger_add "$class" - "$class" "$mode" sending "$sender"; then
+        PA_ADMIT_VERDICT=withhold:ledger PA_ADMIT_AS=""
+        printf '%s' "$PA_ADMIT_VERDICT"
+        return 1
+    fi
+    PA_NOTICE_STAMP="$PA_LEDGER_STAMP"
+    printf admit
+}
+
+# pa_notice_result STAMP CLASS RESULT SENDER: the result of the post pa_notice_admit claimed at
+# STAMP, written into its ledger line under the lock (10 s), which the caller does not hold.
+# Status 0 when written, 1 when no claimed line of that class and stamp is left, 2 for a class not
+# of the four or when the lock was not had: the line then stays claimed, and counted.
+pa_notice_result() {
+    local rc=0
+    _pa_notice_mode "${2:-}" > /dev/null || return 2
+    pa_lock 10 || return 2
+    pa_ledger_result "${1:-}" "$2" "${3:-}" "${4:-}" || rc=1
+    pa_unlock
+    return "$rc"
+}
+
+# _pa_meta_form KEY VALUE: VALUE has the form of meta KEY, one of the five the notices and the
+# profile switch keep: storm_last, summary_last and profile_switched a stamp; pointer_last the
+# stamp of a pointer that got ok and its ref (`<stamp>/<ref>`); profile_last legacy or v2. Status
+# 2 for any other key.
+_pa_meta_form() {
+    case "${1:-}" in
+        storm_last | summary_last | profile_switched) _pa_stamp_split "${2:-}" ;;
+        pointer_last) [[ ${2:-} =~ ^[0-9]{1,12}/([0-9a-f]{8}|-)/[0-9]{1,10}/[0-9a-f]{6}$ ]] ;;
+        profile_last) [ "${2:-}" = legacy ] || [ "${2:-}" = v2 ] ;;
+        *) return 2 ;;
+    esac
+}
+
+# pa_meta_value KEY: the value of meta KEY, one of the five of _pa_meta_form, printed only when it
+# has its form and, for a time, is not ahead of the clock: a time that cannot be placed must not
+# hold back a notice or stand for a pointer that may never have arrived. Status 1, nothing
+# printed, otherwise, and 2 for any other key.
+pa_meta_value() {
+    local key="${1:-}" v s
+    v="$(_pa_meta_get "$key")"
+    _pa_meta_form "$key" "$v" || return
+    if [ "$key" != profile_last ]; then
+        s="$v"
+        [ "$key" != pointer_last ] || s="${v%/*}"
+        [ "$(pa_age "$s")" -ge 0 ] || return 1
+    fi
+    printf '%s' "$v"
+}
+
+# pa_meta_put KEY VALUE: sets meta KEY, one of the five of _pa_meta_form but pointer_last, to
+# VALUE when VALUE has its form; status 2, nothing written, otherwise. pointer_last stands for a
+# pointer that arrived, so only the step that records a pointer's result writes it; that step
+# comes with the pointer's senders, so nothing writes it yet. The caller holds the lock.
+pa_meta_put() {
+    [ "${1:-}" != pointer_last ] || return 2
+    _pa_meta_form "${1:-}" "${2:-}" || return 2
+    _pa_meta_set "$1" "$2"
+}
+
 # ---- the failure hook under profile v2 ---------------------------------------------------------
 #
 # deploy/alert.sh asks pa_hook_profile, in a child bash of its own, whether profile v2 is in
@@ -5518,8 +5961,7 @@ pa_hook_v2() {
                 return 0
             fi
             if [ "$PA_ADMIT_VERDICT" != withhold:undelivered ] && [ -n "$kh" ]; then
-                _PA_INC_REST+=("$(printf 'W\t%s\t%s\t%s\t%s\t%s\t%s' "$PA_STAMP" "$kh" "$tx" "$new" \
-                    "${PA_INC[5]:--}" "${PA_ADMIT_VERDICT#withhold:}")")
+                pa_w_line "$key" "$tx" "$new" "${PA_INC[5]:--}" "${PA_ADMIT_VERDICT#withhold:}" || true
             fi
             _pa_hv2_write "$unit" || true
             return 0

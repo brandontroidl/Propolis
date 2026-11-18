@@ -844,6 +844,16 @@
   whatever file sits at the library's path, and nothing new is sent. Under the tests' root a
   missing, older, broken or hung library leaves today's message as it was.
 
+- **The notices and the pointer message of the new alerting, in the library only** -
+  `deploy/alert-lib.sh` renders the storm notice, the hourly summary (each naming a withheld open
+  or reopen of a PAGE incident at priority 5), the switch summary and the pointer message
+  (`pa_render`), reads the withheld (`W`) lines they list (`pa_withheld_since`), admits each in
+  its own budget class and keeps its result (`pa_notice_admit`, `pa_notice_result`), and reads
+  `PROPOLIS_OPS_PUSH_DETAIL` (`auto`, or `pointer` for any other value), which takes effect only
+  under profile `v2`. The rules for when a pointer is sent come with its senders. Nothing calls
+  any of it and nothing new is sent: under `legacy`, which is every host's profile, the new key
+  changes nothing.
+
 - **The message shapes and the send budget of the new alerting, in the library only** -
   `deploy/alert-lib.sh` renders the full text of an incident's open, change, reopen, reminder and
   resolve (`pa_render`), decides every budget class with the reserve, the pool, the stage-1

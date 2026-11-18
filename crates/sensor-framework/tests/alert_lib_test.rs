@@ -11402,7 +11402,11 @@ fn a_role_out_of_its_list_reads_unknown() {
 /// send_init sets, from the profile in force, which is legacy without a test root; its part that
 /// decides whether a pending transition is due or dropped (send_expire) asks pa_retry_due and no
 /// other guarded function. The witness's list of the library functions it needs is the one line
-/// of names this test passes over.
+/// of names this test passes over. The storm notice, the summary, the switch summary and the
+/// pointer message (their renderers, the W-line reader, their admission and result, and the
+/// helpers of their meta keys) are called by no script at all: no
+/// script renders one (pa_render with a class other than the test page's and the daily
+/// message's), asks the budget about its class, or names one of their functions.
 #[test]
 fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
@@ -11419,6 +11423,8 @@ fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
                 | "pa_budget_next"
                 | "pa_hook_v2"
                 | "pa_incident_result"
+                | "_pa_render_withheld"
+                | "pa_notice_admit"
         ) || f.starts_with("_pa_hv2_")
     };
     // Which of the guarded names each part of the witness's send step may use: send_expire, which
@@ -11504,6 +11510,21 @@ fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
                 "_pa_budget_incident",
             ] {
                 if t.contains(f) && !allowed(f) {
+                    found.push(format!("{name}: {t}"));
+                }
+            }
+            // The notices, the pointer message and their meta keys have no caller at all outside
+            // the library, the witness's send step included.
+            for f in [
+                "_pa_render_withheld",
+                "_pa_render_switch",
+                "pa_withheld_since",
+                "pa_notice_admit",
+                "pa_notice_result",
+                "pa_meta_value",
+                "pa_meta_put",
+            ] {
+                if t.contains(f) {
                     found.push(format!("{name}: {t}"));
                 }
             }
@@ -11765,4 +11786,1939 @@ fn a_message_that_has_gone_is_charged_to_the_class_its_kind_would_have_had() {
         let r = fx.run_env(&format!("echo \"c=$(pa_budget_class {args})\""), &NOW);
         assert_eq!(r.get("c"), want, "{args}: {}", r.err);
     }
+}
+
+// ---- the notices and the pointer message ---------------------------------------------------------
+
+/// The shell target's settings, loaded, and a stored readcheck line that proves the target
+/// refuses anonymous reads, fresh at `NOW`: with nothing else in the way the gate is full.
+const FULL_GATE: &str = "pa_settings_load\nb=\"$(pa_readcheck_binding \"$PA_URL\" \"$PA_TOPIC\")\"\n\
+     printf '#readcheck v1 g=1\\nR\\t%s\\t999000/abcdef01/4000\\trefused\\t999000/abcdef01/4000\\trefused\\t-\\t403\\t403\\tboth\\t403\\n' \
+     \"$b\" > \"$PA_STATE/readcheck\"\nPA_ROLE=single\n";
+
+const TARGET_ENV: &str =
+    "PROPOLIS_OPS_NTFY_URL=https://ntfy.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n";
+
+/// PROPOLIS_OPS_PUSH_DETAIL can only take detail away: unset, empty and `auto` leave the gate to
+/// decide, and every other value, `full` among them, a value with a blank, one with a control
+/// byte, one of 300 bytes and one systemd would read otherwise, means pointer. A PA_DETAIL the
+/// caller's environment holds is no setting. The setting belongs to profile v2, which the test
+/// seam selects here.
+#[test]
+fn the_push_detail_setting_can_only_narrow_what_is_sent_and_only_auto_or_nothing_leaves_full() {
+    let fx = Fx::salted(SALT);
+    let long = "a".repeat(300);
+    let cases: Vec<(Option<String>, &str, &str, &str)> = vec![
+        (None, "auto", "unset", "full"),
+        (Some(String::new()), "auto", "unset", "full"),
+        (Some("auto".into()), "auto", "auto", "full"),
+        (Some("'auto'".into()), "auto", "auto", "full"),
+        (
+            Some("pointer".into()),
+            "pointer",
+            "pointer",
+            "pointer:detail-pointer",
+        ),
+        (
+            Some("full".into()),
+            "pointer",
+            "invalid",
+            "pointer:detail-pointer",
+        ),
+        (
+            Some("FULL".into()),
+            "pointer",
+            "invalid",
+            "pointer:detail-pointer",
+        ),
+        (
+            Some("AUTO".into()),
+            "pointer",
+            "invalid",
+            "pointer:detail-pointer",
+        ),
+        (
+            Some("auto full".into()),
+            "pointer",
+            "invalid",
+            "pointer:detail-pointer",
+        ),
+        (
+            Some("auto\x01".into()),
+            "pointer",
+            "invalid",
+            "pointer:detail-pointer",
+        ),
+        (
+            Some("auto\\".into()),
+            "pointer",
+            "invalid",
+            "pointer:detail-pointer",
+        ),
+        (Some(long), "pointer", "invalid", "pointer:detail-pointer"),
+    ];
+    for (value, detail, state, gate) in cases {
+        let mut env = TARGET_ENV.to_string();
+        if let Some(v) = &value {
+            env.push_str(&format!("PROPOLIS_OPS_PUSH_DETAIL={v}\n"));
+        }
+        fx.write("etc/propolis/propolis.env", &env);
+        let mut all = NOW.to_vec();
+        all.push(("PA_DETAIL", "auto"));
+        all.push(("PA_TEST_PROFILE", "v2"));
+        let r = fx.run_env(
+            &format!(
+                "{FULL_GATE}echo \"detail=$PA_DETAIL\"\necho \"state=$PA_DETAIL_STATE\"\n\
+                 echo \"gate=$(pa_gate)\""
+            ),
+            &all,
+        );
+        assert_eq!(
+            (r.get("detail"), r.get("state"), r.get("gate")),
+            (detail.to_string(), state.to_string(), gate.to_string()),
+            "{value:?}: {}",
+            r.err
+        );
+    }
+}
+
+/// Under the legacy profile, which is every host's, the detail setting changes nothing: pointer
+/// mode is profile v2's, and a host that writes the key, in form or not, keeps the gate the
+/// anonymous-read check gives, so the daily message goes as before. What the file says is still
+/// recorded (PA_DETAIL_STATE), for the report that comes with the switch.
+#[test]
+fn under_the_legacy_profile_the_push_detail_setting_changes_nothing() {
+    let fx = Fx::salted(SALT);
+    for (value, state) in [
+        ("pointer", "pointer"),
+        ("full", "invalid"),
+        ("AUTO", "invalid"),
+        ("auto full", "invalid"),
+        ("auto", "auto"),
+    ] {
+        // A profile line that names v2 changes nothing either: this release honours none.
+        fx.write(
+            "etc/propolis/propolis.env",
+            &format!("{TARGET_ENV}PROPOLIS_ALERT_PROFILE=v2\nPROPOLIS_OPS_PUSH_DETAIL={value}\n"),
+        );
+        for seam in [None, Some("legacy")] {
+            let mut all = NOW.to_vec();
+            if let Some(p) = seam {
+                all.push(("PA_TEST_PROFILE", p));
+            }
+            let r = fx.run_env(
+                &format!(
+                    "{FULL_GATE}echo \"profile=$PA_PROFILE\"\necho \"detail=$PA_DETAIL\"\n\
+                     echo \"state=$PA_DETAIL_STATE\"\necho \"gate=$(pa_gate)\""
+                ),
+                &all,
+            );
+            assert_eq!(
+                (
+                    r.get("profile"),
+                    r.get("detail"),
+                    r.get("state"),
+                    r.get("gate")
+                ),
+                (
+                    "legacy".to_string(),
+                    "auto".to_string(),
+                    state.to_string(),
+                    "full".to_string()
+                ),
+                "{value} {seam:?}: {}",
+                r.err
+            );
+        }
+    }
+}
+
+/// The detail setting follows the precedence of every other setting of the shell senders, key by
+/// key: alert.env when it gives the key a value, else propolis.env, whichever file holds the
+/// target. So `pointer` in propolis.env holds a target alert.env gives to pointer mode, and an
+/// empty line in alert.env does not lift it.
+#[test]
+fn the_push_detail_setting_is_read_from_alert_env_over_propolis_env_whatever_file_holds_the_target()
+{
+    let fx = Fx::salted(SALT);
+    for (alert_extra, env_extra, detail, src) in [
+        (
+            "",
+            "PROPOLIS_OPS_PUSH_DETAIL=pointer\n",
+            "pointer",
+            "propolis.env",
+        ),
+        (
+            "PROPOLIS_OPS_PUSH_DETAIL=\n",
+            "PROPOLIS_OPS_PUSH_DETAIL=pointer\n",
+            "pointer",
+            "propolis.env",
+        ),
+        (
+            "PROPOLIS_OPS_PUSH_DETAIL=auto\n",
+            "PROPOLIS_OPS_PUSH_DETAIL=pointer\n",
+            "auto",
+            "alert.env",
+        ),
+        (
+            "PROPOLIS_OPS_PUSH_DETAIL=pointer\n",
+            "PROPOLIS_OPS_PUSH_DETAIL=auto\n",
+            "pointer",
+            "alert.env",
+        ),
+        ("", "", "auto", ""),
+    ] {
+        fx.write(
+            "etc/propolis/alert.env",
+            &format!("{TARGET_ENV}{alert_extra}"),
+        );
+        fx.write("etc/propolis/propolis.env", env_extra);
+        let mut all = NOW.to_vec();
+        all.push(("PA_TEST_PROFILE", "v2"));
+        let r = fx.run_env(
+            &format!(
+                "{FULL_GATE}echo \"detail=$PA_DETAIL\"\necho \"src=$PA_DETAIL_SRC\"\n\
+                 echo \"target=$PA_TARGET_SRC\"\necho \"gate=$(pa_gate)\""
+            ),
+            &all,
+        );
+        let gate = if detail == "auto" {
+            "full"
+        } else {
+            "pointer:detail-pointer"
+        };
+        assert_eq!(
+            (
+                r.get("detail"),
+                r.get("src"),
+                r.get("target"),
+                r.get("gate")
+            ),
+            (
+                detail.to_string(),
+                src.to_string(),
+                "alert.env".to_string(),
+                gate.to_string()
+            ),
+            "{alert_extra:?} {env_extra:?}: {}",
+            r.err
+        );
+    }
+}
+
+/// An hour before `NOW`, in the same boot: the stamp a notice lists what was withheld since.
+const SINCE: &str = "996400/abcdef01/1400";
+/// Ten minutes before `NOW`, after `SINCE`.
+const W_T: &str = "999400/abcdef01/4400";
+
+/// An open record of incident `w#<n>` on KEY at TIER, instance INST.
+fn nrec(n: usize, key: &str, tier: &str, inst: &str) -> String {
+    let id = format!("w#{n}");
+    inc_rec(&[(1, &id), (2, key), (5, inst), (6, tier)])
+}
+
+/// The key of the n-th sensor of a fixture.
+fn nkey(n: usize) -> String {
+    format!("unit:sensor-n{n}.service")
+}
+
+/// An opaque instance id for the n-th sensor of a fixture.
+fn ninst(n: usize) -> String {
+    format!("u{:05x}", 0xa0000 + n)
+}
+
+/// A W line at stamp AT for KEYHASH.
+fn wline(at: &str, kh: &str, tx: &str, new: &str) -> String {
+    format!("W\t{at}\t{kh}\t{tx}\t{new}\t-\tpool\n")
+}
+
+/// What pa_withheld_since gives over RECORDS (and their W lines) for SINCE.
+fn withheld(fx: &Fx, records: &[String], since: &str) -> Run {
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", records.concat()),
+    );
+    let mut env = NOW.to_vec();
+    env.push(("SINCE", since));
+    fx.run_env(
+        "pa_incident_load\npa_withheld_since \"$SINCE\"\n\
+         printf 'n=%s\\nnames=%s\\nmore=%s\\npage=%s\\npagemore=%s\\n' \
+         \"$PA_WH_N\" \"$PA_WH_NEW\" \"$PA_WH_MORE\" \"$PA_WH_PAGE\" \"$PA_WH_PAGE_MORE\"",
+        &env,
+    )
+}
+
+/// Renders a notice: `pa_render MODE TX ID` over RECORDS, with the send ledger LEDGER (its lines
+/// after the header) when it is not empty.
+fn notice(fx: &Fx, records: &[String], ledger: &str, mode: &str, tx: &str, id: &str) -> Msg {
+    notice_with(fx, records, ledger, "", mode, tx, id)
+}
+
+/// `notice`, with the shell lines PRE run first.
+fn notice_with(
+    fx: &Fx,
+    records: &[String],
+    ledger: &str,
+    pre: &str,
+    mode: &str,
+    tx: &str,
+    id: &str,
+) -> Msg {
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", records.concat()),
+    );
+    if !ledger.is_empty() {
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!("#send-ledger v1 g=1\n{ledger}"),
+        );
+    }
+    let mut all: Vec<(&str, &str)> = NOW.to_vec();
+    all.push(("MODE", mode));
+    all.push(("TX", tx));
+    all.push(("ID", id));
+    let r = fx.run_env(
+        &format!(
+            "{pre}PA_ROLE=single\npa_incident_load\n\
+             if pa_render \"$MODE\" \"$TX\" \"$ID\"; then echo rc=0; else echo rc=1; fi\n\
+             printf 'title=%s\\nprio=%s\\n' \"$PA_TITLE\" \"$PA_PRIO\"\n\
+             printf '%s\\n' \"$PA_BODY\" | sed 's/^/body=/'"
+        ),
+        &all,
+    );
+    Msg {
+        rc: r.get("rc"),
+        title: r.get("title"),
+        prio: r.get("prio"),
+        body: r
+            .out
+            .lines()
+            .filter_map(|l| l.strip_prefix("body="))
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+        out: format!("{}{}", r.out, r.err),
+    }
+}
+
+/// The reader counts every W line stamped after the stamp it is given, names the instances of the
+/// new incidents among them in the order they were withheld, ten at most, and counts the rest; a
+/// withheld change or reminder is counted and names nothing, and a line from before the stamp is
+/// not counted. A stamp out of form, or one ahead of the clock, would make the count say less, so
+/// with either every W line is counted.
+#[test]
+fn the_withheld_reader_counts_the_w_lines_after_a_stamp_and_names_ten_new_incidents_at_most() {
+    let fx = Fx::salted(SALT);
+    let mut records: Vec<String> = (1..=12)
+        .map(|n| nrec(n, &nkey(n), "ACT", &ninst(n)))
+        .collect();
+    let kh: Vec<String> = (0..=12).map(|n| keyhash(&fx, &nkey(n))).collect();
+    records.push(wline("990000/00000000/100", &kh[12], "open", "1"));
+    for h in &kh[1..=11] {
+        records.push(wline(W_T, h, "open", "1"));
+    }
+    records.push(wline(W_T, &kh[1], "remind", "0"));
+    let r = withheld(&fx, &records, SINCE);
+    let ten: Vec<String> = (1..=10).map(ninst).collect();
+    assert_eq!(r.get("n"), "12", "{}", r.err);
+    assert_eq!(r.get("names"), ten.join(" "));
+    assert_eq!(r.get("more"), "1");
+    assert_eq!(r.get("page"), "");
+    for since in ["-", "garbage", "1000600/abcdef01/5600"] {
+        let r = withheld(&fx, &records, since);
+        assert_eq!(r.get("n"), "13", "{since}: {}", r.err);
+        assert_eq!(r.get("more"), "2", "{since}");
+    }
+}
+
+/// A W line names an incident only through a whole record its key hash names, of a tier the tables
+/// know: a line whose record is gone, not whole or of an unknown tier, a line with a field out of
+/// form (its stamp, its key hash, its transition, its new flag), an empty field or a field too
+/// few is counted, never named and never taken for a PAGE. One that still says it withheld the
+/// open of a new incident (its transition and new flag in their places and in form) is counted
+/// among the new incidents not named, so the notice never says fewer were withheld.
+#[test]
+fn a_w_line_whose_record_is_gone_or_not_whole_or_out_of_form_is_counted_and_never_named() {
+    let fx = Fx::salted(SALT);
+    let whole = nrec(1, &nkey(1), "PAGE", &ninst(1));
+    let broken = nrec(2, &nkey(2), "PAGE", &ninst(2)).replace("\tlisten\t", "\t\tlisten\t");
+    let bogus = nrec(3, &nkey(3), "BOGUS", &ninst(3));
+    let kh1 = keyhash(&fx, &nkey(1));
+    let lines = [
+        wline(W_T, &keyhash(&fx, &nkey(9)), "open", "1"),
+        wline(W_T, &keyhash(&fx, &nkey(2)), "open", "1"),
+        wline(W_T, &keyhash(&fx, &nkey(3)), "open", "1"),
+        wline(W_T, "zzzzzzzz", "open", "1"),
+        wline("garbage", &kh1, "open", "1"),
+        wline(W_T, &kh1, "planted", "1"),
+        wline(W_T, &kh1, "open", "2"),
+        format!("W\t{W_T}\t{kh1}\t\topen\t1\t-\tpool\n"),
+        format!("W\t{W_T}\t{kh1}\topen\t1\n"),
+    ];
+    let mut records = vec![whole, broken, bogus];
+    records.extend(lines.iter().cloned());
+    let r = withheld(&fx, &records, SINCE);
+    assert_eq!(r.get("n"), "9", "{}", r.err);
+    assert_eq!(r.get("names"), "");
+    assert_eq!(r.get("more"), "5");
+    assert_eq!((r.get("page"), r.get("pagemore")), ("".into(), "0".into()));
+    // The same line in form names the PAGE incident.
+    records.push(wline(W_T, &kh1, "open", "1"));
+    let r = withheld(&fx, &records, SINCE);
+    assert_eq!(r.get("names"), ninst(1), "{}", r.err);
+    assert_eq!(r.get("page"), ninst(1));
+}
+
+/// The storm notice and the summary: the alias, the count of what was withheld since the stamp
+/// and its time, the instances of the new incidents with the rest counted, and when the next
+/// summary may go (the summary counts itself, so its next is an hour on). Priority 3. Nothing
+/// withheld renders no notice.
+#[test]
+fn the_storm_notice_and_the_summary_render_their_count_their_new_incidents_and_the_next_summary() {
+    let fx = Fx::salted(SALT);
+    let mut records: Vec<String> = (1..=12)
+        .map(|n| nrec(n, &nkey(n), "ACT", &ninst(n)))
+        .collect();
+    for n in 1..=12 {
+        records.push(wline(W_T, &keyhash(&fx, &nkey(n)), "open", "1"));
+    }
+    records.push(wline(W_T, &keyhash(&fx, &nkey(1)), "remind", "0"));
+    let ten: Vec<String> = (1..=10).map(ninst).collect();
+    let storm = notice(&fx, &records, "", "full", "storm", SINCE);
+    assert_eq!(storm.rc, "0", "{}", storm.out);
+    assert_eq!(storm.title, "host-908b: alert budget reached");
+    assert_eq!(storm.prio, "3");
+    assert_eq!(
+        storm.body,
+        [
+            format!(
+                "Withheld: 13 messages since 12:46 UTC; new incidents: {} and 2 more",
+                ten.join(" ")
+            ),
+            "Next summary 13:47 UTC. Do: status".to_string(),
+        ]
+    );
+    let summary = notice(&fx, &records, "", "full", "summary", SINCE);
+    assert_eq!(summary.rc, "0", "{}", summary.out);
+    assert_eq!(
+        summary.title,
+        "host-908b: 13 messages withheld in the last hour"
+    );
+    assert_eq!(summary.prio, "3");
+    assert_eq!(summary.body[0], storm.body[0]);
+    assert_eq!(summary.body[1], "Next summary 14:47 UTC. Do: status");
+    assert_eq!(summary.body.len(), 2);
+    // One withheld reminder, no new incident.
+    let one = vec![
+        nrec(1, &nkey(1), "ACT", &ninst(1)),
+        wline(W_T, &keyhash(&fx, &nkey(1)), "remind", "0"),
+    ];
+    let m = notice(&fx, &one, "", "full", "summary", SINCE);
+    assert_eq!(m.title, "host-908b: 1 message withheld in the last hour");
+    assert_eq!(
+        m.body[0],
+        "Withheld: 1 message since 12:46 UTC; new incidents: none"
+    );
+    // A day's summaries spent: the next is when the oldest of them leaves the day.
+    let ledger: String = (0..12)
+        .map(|i| {
+            format!(
+                "L\t{}/00000000/0\tsummary\t-\tsummary\tfull\tok\tlight\n",
+                920_000 + i * 3600
+            )
+        })
+        .collect();
+    let m = notice(&fx, &one, &ledger, "full", "storm", SINCE);
+    assert_eq!(m.body[1], "Next summary 15:34 UTC. Do: status", "{}", m.out);
+    // Nothing withheld since the stamp: no notice.
+    let none = vec![nrec(1, &nkey(1), "ACT", &ninst(1))];
+    for tx in ["storm", "summary"] {
+        let m = notice(&fx, &none, "", "full", tx, SINCE);
+        assert_eq!((m.rc.as_str(), m.title.as_str()), ("1", ""), "{tx}");
+    }
+}
+
+/// The PAGE rule: a withheld open of a PAGE incident names the first such instance in the title,
+/// adds a first body line that lists them, and raises the priority to 5, wherever its W line sits
+/// among the others and however many there are; the two lines of the notice follow unchanged.
+#[test]
+fn a_withheld_open_of_a_page_incident_names_it_at_priority_five_wherever_its_w_line_sits() {
+    let fx = Fx::salted(SALT);
+    let page_key = "unit:sensor-page.service";
+    let page_inst = "ud0ead";
+    for others in [0usize, 5, 30] {
+        for pos in [0, others / 2, others] {
+            let mut records: Vec<String> = (1..=others)
+                .map(|n| nrec(n, &nkey(n), "ACT", &ninst(n)))
+                .collect();
+            records.push(nrec(99, page_key, "PAGE", page_inst));
+            let mut ws: Vec<String> = (1..=others)
+                .map(|n| wline(W_T, &keyhash(&fx, &nkey(n)), "open", "1"))
+                .collect();
+            ws.insert(pos, wline(W_T, &keyhash(&fx, page_key), "open", "1"));
+            records.extend(ws);
+            for tx in ["storm", "summary"] {
+                let m = notice(&fx, &records, "", "full", tx, SINCE);
+                assert_eq!(m.rc, "0", "{others} {pos} {tx}: {}", m.out);
+                assert_eq!(m.title, format!("host-908b: PAGE withheld {page_inst}"));
+                assert_eq!(m.prio, "5");
+                assert_eq!(m.body[0], format!("PAGE withheld: {page_inst}"));
+                assert!(
+                    m.body[1].starts_with(&format!("Withheld: {} message", others + 1)),
+                    "{:?}",
+                    m.body
+                );
+                assert_eq!(m.body.len(), 3);
+            }
+        }
+    }
+    // Eleven PAGE opens: ten named, the rest counted, the title names the first withheld.
+    let mut records: Vec<String> = (1..=11)
+        .map(|n| nrec(n, &nkey(n), "PAGE", &ninst(n)))
+        .collect();
+    for n in (1..=11).rev() {
+        records.push(wline(W_T, &keyhash(&fx, &nkey(n)), "open", "1"));
+    }
+    let m = notice(&fx, &records, "", "full", "storm", SINCE);
+    let names: Vec<String> = (2..=11).rev().map(ninst).collect();
+    assert_eq!(m.title, format!("host-908b: PAGE withheld {}", ninst(11)));
+    assert_eq!(
+        m.body[0],
+        format!("PAGE withheld: {} and 1 more", names.join(" "))
+    );
+}
+
+/// The PAGE rule follows the record and the transition, never anything else: a withheld change,
+/// reminder or resolve of a PAGE incident, a withheld open of an ACT incident, a W line whose key
+/// hash names no record and one whose record's tier the tables do not know raise no priority and
+/// put no PAGE in the title.
+#[test]
+fn only_a_withheld_open_of_a_known_page_record_raises_the_priority_of_a_notice() {
+    let fx = Fx::salted(SALT);
+    let page = nrec(1, &nkey(1), "PAGE", &ninst(1));
+    let act = nrec(2, &nkey(2), "ACT", &ninst(2));
+    let bogus = nrec(3, &nkey(3), "page", &ninst(3));
+    let (kh1, kh2, kh3) = (
+        keyhash(&fx, &nkey(1)),
+        keyhash(&fx, &nkey(2)),
+        keyhash(&fx, &nkey(3)),
+    );
+    for w in [
+        wline(W_T, &kh1, "change", "0"),
+        wline(W_T, &kh1, "remind", "0"),
+        wline(W_T, &kh1, "resolve", "0"),
+        wline(W_T, &kh2, "open", "1"),
+        wline(W_T, &keyhash(&fx, &nkey(7)), "open", "1"),
+        wline(W_T, &kh3, "open", "1"),
+    ] {
+        let records = vec![page.clone(), act.clone(), bogus.clone(), w.clone()];
+        for tx in ["storm", "summary"] {
+            let m = notice(&fx, &records, "", "full", tx, SINCE);
+            assert_eq!(m.rc, "0", "{w:?} {tx}: {}", m.out);
+            assert_eq!(m.prio, "3", "{w:?} {tx}");
+            assert!(!m.title.contains("PAGE"), "{}", m.title);
+            assert!(m.body[0].starts_with("Withheld: 1 message"), "{:?}", m.body);
+        }
+    }
+}
+
+/// The switch summary: the open and acknowledged incidents, PAGE first, then ACT, then NOTICE,
+/// one line each with the incident id, the tier, the stage word and the instance, ten at most and
+/// the rest counted, then `Do: status`; priority 3. A resolved or pending record is not listed.
+#[test]
+fn the_switch_summary_lists_the_open_incidents_ten_at_most_and_counts_the_rest() {
+    let fx = Fx::salted(SALT);
+    let mut records: Vec<String> = Vec::new();
+    for n in 1..=4 {
+        records.push(nrec(n, &nkey(n), "ACT", &ninst(n)));
+    }
+    for n in 5..=12 {
+        records.push(nrec(n, &nkey(n), "PAGE", &ninst(n)));
+    }
+    records.push(inc_rec(&[
+        (1, "w#13"),
+        (2, "db:local"),
+        (3, "db-unreachable"),
+        (4, "ledger"),
+        (5, "-"),
+        (6, "NOTICE"),
+        (7, "acked"),
+    ]));
+    records.push(inc_rec(&[
+        (1, "w#14"),
+        (2, "unit:a.service"),
+        (7, "resolved"),
+    ]));
+    records.push(inc_rec(&[
+        (1, "w#15"),
+        (2, "unit:b.service"),
+        (7, "pending"),
+    ]));
+    let m = notice(&fx, &records, "", "full", "switch", "-");
+    assert_eq!(m.rc, "0", "{}", m.out);
+    assert_eq!(m.title, "host-908b: alerting on; 13 open");
+    assert_eq!(m.prio, "3");
+    let mut want: Vec<String> = (5..=12)
+        .map(|n| format!("w#{n} PAGE listen {}", ninst(n)))
+        .collect();
+    want.push(format!("w#1 ACT listen {}", ninst(1)));
+    want.push(format!("w#2 ACT listen {}", ninst(2)));
+    want.push("and 3 more".to_string());
+    want.push("Do: status".to_string());
+    assert_eq!(m.body, want);
+    let small = vec![
+        nrec(1, &nkey(1), "ACT", &ninst(1)),
+        inc_rec(&[
+            (1, "w#2"),
+            (2, "db:local"),
+            (3, "db-unreachable"),
+            (4, "ledger"),
+            (5, "-"),
+        ]),
+    ];
+    let m = notice(&fx, &small, "", "full", "switch", "-");
+    assert_eq!(m.title, "host-908b: alerting on; 2 open");
+    assert_eq!(
+        m.body,
+        [
+            "w#2 PAGE ledger -",
+            &format!("w#1 ACT listen {}", ninst(1)),
+            "Do: status"
+        ]
+    );
+    let m = notice(&fx, &[], "", "full", "switch", "-");
+    assert_eq!(m.title, "host-908b: alerting on; 0 open");
+    assert_eq!(m.body, ["Do: status"]);
+}
+
+/// The pointer message: the alias and the ref, priority 4, nothing else; a ref not of 6 hex, or a
+/// mode other than pointer, renders nothing.
+#[test]
+fn the_pointer_message_carries_the_alias_and_the_ref_and_nothing_else() {
+    let fx = Fx::salted(SALT);
+    let m = notice(&fx, &[], "", "pointer", "pointer", "0a1b2c");
+    assert_eq!(m.rc, "0", "{}", m.out);
+    assert_eq!(m.title, "host-908b: needs attention");
+    assert_eq!(m.prio, "4");
+    assert_eq!(m.body, ["Run the status command on host-908b. ref 0a1b2c"]);
+    for (mode, id) in [
+        ("full", "0a1b2c"),
+        ("pointer", "0A1B2C"),
+        ("pointer", "0a1b2"),
+        ("pointer", "-"),
+        ("pointer", "0a1b2c\n"),
+    ] {
+        let m = notice(&fx, &[], "", mode, "pointer", id);
+        assert_eq!(
+            (m.rc.as_str(), m.title.as_str()),
+            ("1", ""),
+            "{mode} {id:?}"
+        );
+    }
+    for tx in ["storm", "summary", "switch"] {
+        let m = notice(&fx, &[], "", "pointer", tx, SINCE);
+        assert_eq!(m.rc, "1", "{tx} in pointer mode");
+    }
+}
+
+const PLANT: &str = "plantedword";
+
+/// What a notice may never carry, whatever the state files hold.
+const PLANT_BANNED: [&str; 7] = [
+    PLANT,
+    "plantedhost",
+    "propolis",
+    "sensor",
+    "Edge07",
+    "://",
+    "t0p1c",
+];
+
+/// A fixture whose host name, env files (read by `notice_env`), meta and send ledger hold the
+/// planted word in every field, the alias the host name (which is refused, so the fallback alias
+/// stands), and the records and W lines a notice reads: an in-form PAGE record and an in-form ACT
+/// record whose every other field holds the word, a PAGE and an ACT record otherwise in form
+/// whose incident id and instance both hold the word, a record of nothing but the word, and W
+/// lines for each with the word in every field they keep beside those a line is matched by.
+fn planted_fixture() -> (Fx, Vec<String>) {
+    let fx = Fx::salted(SALT);
+    write_exec(
+        &fx.bin.join("hostname"),
+        "#!/usr/bin/env bash\necho plantedhost\n",
+    );
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!(
+            "{TARGET_ENV}PROPOLIS_OPS_NTFY_TOKEN=tk_{PLANT}\nPROPOLIS_OPS_PUSH_DETAIL={PLANT}\n\
+             PROPOLIS_OPS_HOST_ALIAS=plantedhost\n"
+        ),
+    );
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=1\nM\tclock\t{PLANT}\nM\tstorm_last\t{PLANT}\nM\tsummary_last\t{PLANT}\n\
+             M\tpointer_last\t{PLANT}\nM\tprofile_last\t{PLANT}\nM\tprofile_switched\t{PLANT}\n\
+             M\t{PLANT}\t{PLANT}\n"
+        ),
+    );
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!(
+            "#send-ledger v1 g=1\nL\t{INC_T}\tsummary\t{PLANT}\t{PLANT}\t{PLANT}\tok\t{PLANT}\t{PLANT}\n\
+             L\t{PLANT}\t{PLANT}\t{PLANT}\t{PLANT}\t{PLANT}\t{PLANT}\t{PLANT}\n"
+        ),
+    );
+    let page_key = format!("unit:sensor-{PLANT}.service");
+    let act_key = format!("finding:{PLANT}:0123456789ab");
+    let mut planted_fields: Vec<(usize, &str)> = (2..=34).map(|i| (i, PLANT)).collect();
+    planted_fields.retain(|(i, _)| ![2, 4, 6, 7].contains(i));
+    let mut page: Vec<(usize, &str)> = planted_fields.clone();
+    page.extend([
+        (1, "w#1"),
+        (2, page_key.as_str()),
+        (4, "listen"),
+        (6, "PAGE"),
+        (7, "open"),
+    ]);
+    let mut act: Vec<(usize, &str)> = planted_fields.clone();
+    act.extend([
+        (1, "w#2"),
+        (2, act_key.as_str()),
+        (4, "gateway"),
+        (5, "u1a2b3"),
+        (6, "ACT"),
+        (7, "open"),
+    ]);
+    let all: Vec<(usize, &str)> = (1..=34).map(|i| (i, PLANT)).collect();
+    let extra = format!("\t{PLANT}\n");
+    let (page_id_key, act_id_key) = (nkey(81), nkey(82));
+    let records = vec![
+        inc_rec(&page).replace('\n', &extra),
+        inc_rec(&act).replace('\n', &extra),
+        inc_rec(&all),
+        planted_id_rec(&page_id_key, "PAGE"),
+        planted_id_rec(&act_id_key, "ACT"),
+        wline(W_T, &keyhash(&fx, &page_id_key), "open", "1"),
+        wline(W_T, &keyhash(&fx, &act_id_key), "open", "1"),
+        format!(
+            "W\t{W_T}\t{}\topen\t1\t{PLANT}\t{PLANT}\t{PLANT}\n",
+            keyhash(&fx, &page_key)
+        ),
+        format!(
+            "W\t{W_T}\t{}\topen\t1\t{PLANT}\t{PLANT}\n",
+            keyhash(&fx, &act_key)
+        ),
+        format!(
+            "W\t{W_T}\t{}\topen\t1\t{PLANT}\t{PLANT}\n",
+            keyhash(&fx, PLANT)
+        ),
+        format!("W\t{PLANT}\t{PLANT}\t{PLANT}\t{PLANT}\t{PLANT}\t{PLANT}\n"),
+        format!("{PLANT}\t{PLANT}\n"),
+    ];
+    (fx, records)
+}
+
+/// A whole, open record on KEY at TIER whose incident id and instance both hold the planted word,
+/// every other field in form.
+fn planted_id_rec(key: &str, tier: &str) -> String {
+    inc_rec(&[(1, PLANT), (2, key), (5, PLANT), (6, tier)])
+}
+
+fn assert_nothing_planted(m: &Msg, what: &str) {
+    let text = format!("{}\n{}", m.title, m.body.join("\n"));
+    for word in PLANT_BANNED {
+        assert!(!text.contains(word), "{what}: {word} in:\n{text}");
+    }
+}
+
+/// A planted word in every field of every record, W line, meta value and ledger line the storm
+/// notice reads, in the env files, the alias and the host name reaches neither its title nor its
+/// body: the record whose instance is out of form is named by its incident id, one whose id and
+/// instance are both out of form is counted and not named, the tier is the record's, the times
+/// and counts are digits.
+#[test]
+fn a_planted_word_in_any_field_never_reaches_the_storm_notice() {
+    let (fx, records) = planted_fixture();
+    for since in [SINCE, PLANT] {
+        let m = notice_env(&fx, &records, "full", "storm", since);
+        assert_eq!(m.rc, "0", "{}", m.out);
+        assert_eq!(m.title, "host-908b: PAGE withheld w#1");
+        assert_eq!(m.prio, "5");
+        assert_eq!(m.body[0], "PAGE withheld: w#1");
+        assert!(
+            m.body[1].starts_with("Withheld: 6 messages since "),
+            "{:?}",
+            m.body
+        );
+        assert!(
+            m.body[1].ends_with("new incidents: w#1 u1a2b3 and 3 more"),
+            "{:?}",
+            m.body
+        );
+        assert_nothing_planted(&m, "storm");
+    }
+}
+
+/// The same planted words never reach the hourly summary.
+#[test]
+fn a_planted_word_in_any_field_never_reaches_the_summary() {
+    let (fx, records) = planted_fixture();
+    for since in [SINCE, PLANT] {
+        let m = notice_env(&fx, &records, "full", "summary", since);
+        assert_eq!(m.rc, "0", "{}", m.out);
+        assert_eq!(m.title, "host-908b: PAGE withheld w#1");
+        assert_eq!(m.body[0], "PAGE withheld: w#1");
+        assert!(m.body[2].starts_with("Next summary "), "{:?}", m.body);
+        assert_nothing_planted(&m, "summary");
+    }
+}
+
+/// A PAGE record whose incident id and instance both hold the planted word names nothing and
+/// raises no priority, in the storm notice and the summary alike.
+#[test]
+fn a_page_record_whose_id_and_instance_are_planted_raises_no_priority_and_names_nothing() {
+    let fx = Fx::salted(SALT);
+    let key = nkey(81);
+    let records = vec![
+        planted_id_rec(&key, "PAGE"),
+        wline(W_T, &keyhash(&fx, &key), "open", "1"),
+    ];
+    for tx in ["storm", "summary"] {
+        let m = notice_env(&fx, &records, "full", tx, SINCE);
+        assert_eq!(m.rc, "0", "{tx}: {}", m.out);
+        assert_eq!(m.prio, "3", "{tx}");
+        assert!(!m.title.contains("PAGE"), "{tx}: {}", m.title);
+        assert!(
+            m.body[0].ends_with("new incidents: 1 not named"),
+            "{tx}: {:?}",
+            m.body
+        );
+        assert_nothing_planted(&m, tx);
+    }
+}
+
+/// The same planted words never reach the switch summary: the ACT record is listed by its id,
+/// tier, stage word and instance; the PAGE record, whose instance holds the word, and the two
+/// whose id and instance hold it are counted and not listed; the record of nothing but the word
+/// is not counted open.
+#[test]
+fn a_planted_word_in_any_field_never_reaches_the_switch_summary() {
+    let (fx, records) = planted_fixture();
+    let m = notice_env(&fx, &records, "full", "switch", "-");
+    assert_eq!(m.rc, "0", "{}", m.out);
+    assert_eq!(m.title, "host-908b: alerting on; 4 open");
+    assert_eq!(
+        m.body,
+        ["w#2 ACT gateway u1a2b3", "and 3 more", "Do: status"]
+    );
+    assert_nothing_planted(&m, "switch");
+}
+
+/// The same planted words never reach the pointer message, which reads none of them.
+#[test]
+fn a_planted_word_in_any_field_never_reaches_the_pointer_message() {
+    let (fx, records) = planted_fixture();
+    let m = notice_env(&fx, &records, "pointer", "pointer", "0a1b2c");
+    assert_eq!(m.rc, "0", "{}", m.out);
+    assert_eq!(m.title, "host-908b: needs attention");
+    assert_eq!(m.body, ["Run the status command on host-908b. ref 0a1b2c"]);
+    assert_nothing_planted(&m, "pointer");
+}
+
+/// Values out of form, each carrying the marker `zqx`: a tab, a control byte, a newline, 300
+/// bytes, a leading dash, an escape sequence.
+fn bad_values() -> Vec<String> {
+    vec![
+        "zqx\tzqx".into(),
+        "zqx\x01".into(),
+        "zqx\nzqx".into(),
+        "zqx".repeat(100),
+        "-zqx".into(),
+        "\x1b[31mzqx".into(),
+    ]
+}
+
+/// The notice rendered with one field out of form either is refused or names nothing from it: the
+/// marker is in neither its title nor its body, and every line is printable ASCII of 200 bytes at
+/// most.
+fn assert_refused_or_clean(m: &Msg, what: &str) {
+    let text = format!("{}\n{}", m.title, m.body.join("\n"));
+    assert!(!text.contains("zqx"), "{what}: {text:?}");
+    for line in text.lines() {
+        assert!(
+            line.len() <= 200 && line.bytes().all(|b| (0x20..0x7f).contains(&b)),
+            "{what}: {line:?}"
+        );
+    }
+    if m.rc != "0" {
+        assert_eq!((m.title.as_str(), m.body.len()), ("", 0), "{what}");
+    }
+}
+
+/// For a storm notice or a summary: each field of the in-form PAGE record and of its W line in
+/// turn given each value out of form, and the stamp the notice lists since.
+fn withheld_out_of_form(tx: &str) {
+    let fx = Fx::salted(SALT);
+    let key = nkey(1);
+    for bad in bad_values() {
+        let kh = keyhash(&fx, &key);
+        let mut cases: Vec<(String, Vec<String>, String)> = Vec::new();
+        for field in [1usize, 2, 5, 6, 7] {
+            let id = if field == 1 {
+                bad.clone()
+            } else {
+                "w#1".into()
+            };
+            let k = if field == 2 { bad.clone() } else { key.clone() };
+            let inst = if field == 5 { bad.clone() } else { ninst(1) };
+            let tier = if field == 6 {
+                bad.clone()
+            } else {
+                "PAGE".into()
+            };
+            let state = if field == 7 {
+                bad.clone()
+            } else {
+                "open".into()
+            };
+            let rec = inc_rec(&[(1, &id), (2, &k), (5, &inst), (6, &tier), (7, &state)]);
+            let kh = if field == 2 {
+                keyhash(&fx, &bad)
+            } else {
+                kh.clone()
+            };
+            cases.push((
+                format!("record field {field}"),
+                vec![rec, wline(W_T, &kh, "open", "1")],
+                SINCE.into(),
+            ));
+        }
+        let rec = nrec(1, &key, "PAGE", &ninst(1));
+        for field in 1usize..=6 {
+            let mut w = [
+                W_T.to_string(),
+                kh.clone(),
+                "open".into(),
+                "1".into(),
+                ninst(9),
+                "pool".into(),
+            ];
+            w[field - 1] = bad.clone();
+            cases.push((
+                format!("W field {field}"),
+                vec![rec.clone(), format!("W\t{}\n", w.join("\t"))],
+                SINCE.into(),
+            ));
+        }
+        cases.push((
+            "since".into(),
+            vec![rec.clone(), wline(W_T, &kh, "open", "1")],
+            bad.clone(),
+        ));
+        for (what, records, since) in cases {
+            let m = notice(&fx, &records, "", "full", tx, &since);
+            assert_refused_or_clean(&m, &format!("{tx} {what} {bad:?}"));
+        }
+    }
+    // A value that holds an id's form inside a longer string, in the incident id, the instance
+    // or both: never named, and never taken for a PAGE when the record cannot be named at all.
+    let kh = keyhash(&fx, &key);
+    for near in near_miss_values() {
+        for fields in [&[1usize][..], &[5], &[1, 5]] {
+            let id = if fields.contains(&1) { near } else { "w#1" };
+            let inst = if fields.contains(&5) {
+                near.to_string()
+            } else {
+                ninst(1)
+            };
+            let rec = inc_rec(&[(1, id), (2, &key), (5, &inst), (6, "PAGE")]);
+            let m = notice(
+                &fx,
+                &[rec, wline(W_T, &kh, "open", "1")],
+                "",
+                "full",
+                tx,
+                SINCE,
+            );
+            let text = format!("{}\n{}", m.title, m.body.join("\n"));
+            assert_eq!(m.rc, "0", "{tx} {fields:?} {near:?}: {}", m.out);
+            assert!(!text.contains(near), "{tx} {fields:?} {near:?}: {text}");
+            if fields.contains(&1) {
+                assert_eq!(m.prio, "3", "{tx} {fields:?} {near:?}: {text}");
+            } else {
+                assert_eq!(m.title, "host-908b: PAGE withheld w#1", "{near:?}");
+            }
+        }
+    }
+}
+
+/// Values that hold an instance id's or an incident id's form inside a longer string.
+fn near_miss_values() -> [&'static str; 6] {
+    [
+        "u1a2b3x",
+        "xu1a2b3",
+        "u1a2b3-zqx",
+        "w#1x",
+        "zqxw#12",
+        "w#12 zqx",
+    ]
+}
+
+#[test]
+fn a_value_out_of_form_in_any_field_the_storm_notice_reads_is_refused_or_counted_and_not_named() {
+    withheld_out_of_form("storm");
+}
+
+#[test]
+fn a_value_out_of_form_in_any_field_the_summary_reads_is_refused_or_counted_and_not_named() {
+    withheld_out_of_form("summary");
+}
+
+/// For the switch summary: each field it lists (the id, the tier, the stage word, the instance)
+/// and the state, in turn given each value out of form: the record is counted or not, never
+/// listed with the value.
+#[test]
+fn a_value_out_of_form_in_any_field_the_switch_summary_reads_is_counted_and_not_named() {
+    let fx = Fx::salted(SALT);
+    for bad in bad_values() {
+        for field in [1usize, 4, 5, 6, 7] {
+            let mut set: Vec<(usize, String)> = vec![
+                (1, "w#1".into()),
+                (2, nkey(1)),
+                (4, "listen".into()),
+                (5, ninst(1)),
+                (6, "ACT".into()),
+                (7, "open".into()),
+            ];
+            for s in set.iter_mut() {
+                if s.0 == field {
+                    s.1 = bad.clone();
+                }
+            }
+            let set: Vec<(usize, &str)> = set.iter().map(|(i, v)| (*i, v.as_str())).collect();
+            let m = notice(&fx, &[inc_rec(&set)], "", "full", "switch", "-");
+            assert_refused_or_clean(&m, &format!("switch field {field} {bad:?}"));
+            assert!(
+                !m.body.iter().any(|l| l.starts_with("w#1")),
+                "{field} {bad:?}: {:?}",
+                m.body
+            );
+        }
+    }
+    // A value that holds an id's form inside a longer string, in the incident id, the instance
+    // or both: the record is counted and never listed.
+    for near in near_miss_values() {
+        for fields in [&[1usize][..], &[5], &[1, 5]] {
+            let id = if fields.contains(&1) { near } else { "w#1" };
+            let inst = if fields.contains(&5) {
+                near.to_string()
+            } else {
+                ninst(1)
+            };
+            let rec = inc_rec(&[(1, id), (2, &nkey(1)), (5, &inst), (6, "ACT")]);
+            let m = notice(&fx, &[rec], "", "full", "switch", "-");
+            assert_eq!(m.rc, "0", "{fields:?} {near:?}: {}", m.out);
+            assert_eq!(m.body, ["and 1 more", "Do: status"], "{fields:?} {near:?}");
+        }
+    }
+}
+
+/// For the pointer message: a ref out of form is refused, and an alias out of form gives way to
+/// the fallback alias.
+#[test]
+fn a_value_out_of_form_given_to_the_pointer_message_is_refused_or_replaced() {
+    let fx = Fx::salted(SALT);
+    for bad in bad_values() {
+        let m = notice(&fx, &[], "", "pointer", "pointer", &bad);
+        assert_refused_or_clean(&m, &format!("ref {bad:?}"));
+        assert_eq!(m.rc, "1");
+        // A newline makes the line before it a value in form, which is the alias written.
+        if bad.contains('\n') {
+            continue;
+        }
+        fx.write(
+            "etc/propolis/propolis.env",
+            &format!("PROPOLIS_OPS_HOST_ALIAS={bad}\n"),
+        );
+        let mut env = NOW.to_vec();
+        env.push(("TX", "pointer"));
+        let r = fx.run_env(
+            "pa_settings_load\npa_render pointer pointer 0a1b2c\n\
+             printf 'title=%s\\nbody=%s\\n' \"$PA_TITLE\" \"$PA_BODY\"",
+            &env,
+        );
+        assert_eq!(r.get("title"), "host-908b: needs attention", "{bad:?}");
+        assert_eq!(
+            r.get("body"),
+            "Run the status command on host-908b. ref 0a1b2c"
+        );
+    }
+    fx.write("etc/propolis/propolis.env", "");
+}
+
+/// Every new shape fits the sender's rules at its largest: the longest alias, ten ids of nine
+/// characters and counts of five digits keep every line within the 200 bytes of the line rule
+/// with room for more digits, and the body under the 1024 bytes the sender cuts at.
+#[test]
+fn every_notice_fits_the_line_rule_and_the_senders_cut_at_its_largest() {
+    let fx = Fx::salted(SALT);
+    let alias = format!("a{}", "z".repeat(31));
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!("PROPOLIS_OPS_HOST_ALIAS={alias}\n"),
+    );
+    let mut records = Vec::new();
+    let inst = |n: usize| format!("u{:08x}", 0xabc0_0000usize + n);
+    for n in 0..30 {
+        let id = format!("w#{}", 999_999_900 + n);
+        let key = nkey(n);
+        let i = inst(n);
+        records.push(inc_rec(&[
+            (1, &id),
+            (2, &key),
+            (4, "publish"),
+            (5, &i),
+            (6, "PAGE"),
+        ]));
+    }
+    for n in 0..30 {
+        records.push(wline(W_T, &keyhash(&fx, &nkey(n)), "open", "1"));
+    }
+    let filler = wline(W_T, "0badc0de", "remind", "0");
+    for _ in 0..9970 {
+        records.push(filler.clone());
+    }
+    let check = |m: &Msg, what: &str| {
+        assert_eq!(m.rc, "0", "{what}: {}", m.out);
+        assert!(m.title.len() <= 180, "{what}: {}", m.title);
+        for l in &m.body {
+            assert!(l.len() <= 180, "{what}: {} bytes: {l}", l.len());
+        }
+        assert!(m.body.join("\n").len() < 1024, "{what}");
+    };
+    for tx in ["storm", "summary"] {
+        let m = notice_env(&fx, &records, "full", tx, SINCE);
+        check(&m, tx);
+        assert!(
+            m.body[1].starts_with("Withheld: 10000 messages"),
+            "{:?}",
+            m.body
+        );
+        assert!(m.body[0].ends_with(" and 20 more"), "{:?}", m.body);
+        assert!(m.body[1].ends_with(" and 20 more"), "{:?}", m.body);
+        assert_eq!(
+            m.body[0].split(' ').filter(|w| w.starts_with('u')).count(),
+            10
+        );
+    }
+    let m = notice_env(&fx, &records, "full", "switch", "-");
+    check(&m, "switch");
+    assert_eq!(m.title, format!("{alias}: alerting on; 30 open"));
+    assert_eq!(m.body.len(), 12);
+    assert_eq!(m.body[10], "and 20 more");
+    let m = notice_env(&fx, &records, "pointer", "pointer", "0a1b2c");
+    check(&m, "pointer");
+    assert_eq!(m.title, format!("{alias}: needs attention"));
+}
+
+/// `notice` with the settings loaded first, so the alias the env file sets is the one used.
+fn notice_env(fx: &Fx, records: &[String], mode: &str, tx: &str, id: &str) -> Msg {
+    notice_with(fx, records, "", "pa_settings_load\n", mode, tx, id)
+}
+
+const EMPTY_LEDGER: &str = "#send-ledger v1 g=1\n";
+
+/// The send ledger's lines after its header.
+fn ledger_body(fx: &Fx) -> Vec<String> {
+    let text =
+        std::fs::read_to_string(fx.p("var/lib/propolis/witness/send-ledger")).unwrap_or_default();
+    text.lines()
+        .filter(|l| l.starts_with("L\t"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Each exempt class is admitted by its own cap alone, with one ledger line written under the lock
+/// before the post, claimed (`sending`) as the daily message's is, in mode full for the notices
+/// and pointer for the pointer message, and its result written after the post. A second message
+/// inside the class's window is withheld by its cap; a line that cannot be written sends nothing;
+/// an unknown class or sender is refused before anything is read.
+#[test]
+fn a_notice_is_claimed_in_the_ledger_before_its_post_and_its_result_written_after() {
+    let fx = Fx::salted(SALT);
+    for (class, mode, second) in [
+        ("storm", "full", "withhold:storm-cap"),
+        ("summary", "full", "withhold:summary-cap"),
+        ("switch", "full", "withhold:switch-cap"),
+        ("pointer", "pointer", "admit"),
+    ] {
+        fx.write("var/lib/propolis/witness/send-ledger", EMPTY_LEDGER);
+        let r = fx.run_env(
+            &format!(
+                "pa_lock 5\npa_notice_admit {class} light > \"$D/v\"\n\
+                 echo \"v=$(cat \"$D/v\") $PA_ADMIT_VERDICT\"\necho \"stamp=$PA_NOTICE_STAMP\"\npa_unlock\n\
+                 rc=0; pa_notice_result \"$PA_NOTICE_STAMP\" {class} ok light || rc=$?\necho \"rc=$rc\""
+            ),
+            &NOW,
+        );
+        assert_eq!(r.get("v"), "admit admit", "{class}: {}", r.err);
+        assert_eq!(r.get("stamp"), "1000000/abcdef01/5000");
+        assert_eq!(r.get("rc"), "0");
+        assert_eq!(
+            ledger_body(&fx),
+            [format!(
+                "L\t1000000/abcdef01/5000\t{class}\t-\t{class}\t{mode}\tok\tlight"
+            )],
+            "{class}"
+        );
+        // A second one now: the class's own cap, after the first was admitted and counted.
+        let r = fx.run_env(
+            &format!("pa_lock 5\npa_notice_admit {class} hourly > /dev/null\necho \"v=$PA_ADMIT_VERDICT\"\necho \"stamp=$PA_NOTICE_STAMP\""),
+            &NOW,
+        );
+        assert_eq!(r.get("v"), second, "{class}");
+        if second != "admit" {
+            assert_eq!(r.get("stamp"), "", "{class}");
+            assert_eq!(ledger_body(&fx).len(), 1, "{class}");
+        }
+        // A line that cannot be written: nothing admitted, nothing to post.
+        fx.write("var/lib/propolis/witness/send-ledger", EMPTY_LEDGER);
+        let r = fx.run_env(
+            &format!(
+                "pa_lock 5\n_pa_ledger_put() {{ return 1; }}\nrc=0; pa_notice_admit {class} light > /dev/null || rc=$?\n\
+                 echo \"v=$PA_ADMIT_VERDICT rc=$rc\"\necho \"stamp=$PA_NOTICE_STAMP\""
+            ),
+            &NOW,
+        );
+        assert_eq!(r.get("v"), "withhold:ledger rc=1", "{class}");
+        assert_eq!(r.get("stamp"), "");
+    }
+    for (args, want) in [
+        ("daily light", "withhold:class"),
+        ("pool light", "withhold:class"),
+        ("storm planted", "withhold:unknown"),
+        ("storm", "withhold:unknown"),
+    ] {
+        let r = fx.run_env(
+            &format!("pa_lock 5\npa_notice_admit {args} > /dev/null\necho \"v=$PA_ADMIT_VERDICT\""),
+            &NOW,
+        );
+        assert_eq!(r.get("v"), want, "{args}");
+    }
+    // A result for a class that is not one of the four, or one whose line is gone, writes nothing.
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        "#send-ledger v1 g=1\nL\t1000000/abcdef01/5000\tdaily\t-\tdaily\tfull\tsending\tlight\n",
+    );
+    let r = fx.run_env(
+        "rc=0; pa_notice_result 1000000/abcdef01/5000 daily ok light || rc=$?; echo \"a=$rc\"\n\
+         rc=0; pa_notice_result 1000000/abcdef01/5000 storm ok light || rc=$?; echo \"b=$rc\"",
+        &NOW,
+    );
+    assert_eq!((r.get("a"), r.get("b")), ("2".into(), "1".into()));
+    assert!(ledger_body(&fx)[0].ends_with("\tsending\tlight"));
+}
+
+/// The exempt classes and the incident classes never count against each other: with the pool, the
+/// listener caps and a key spent, every notice and the pointer are admitted; with every exempt
+/// class spent, an incident message is admitted. A claimed or pending line of an exempt class
+/// counts within each window of its own cap, whatever its result, as a sent one does.
+#[test]
+fn the_exempt_classes_and_the_incident_classes_never_count_against_each_other() {
+    let fx = Fx::salted(SALT);
+    let rec = nrec(1, &nkey(1), "PAGE", &ninst(1));
+    let kh = keyhash(&fx, &nkey(1));
+    let mut spent: Vec<String> = Vec::new();
+    spent.extend(lines_of(16, "pool", "00000000", 600));
+    spent.extend(lines_of(16, "stage1", &kh, 600));
+    spent.extend(lines_of(4, "reserve", "00000000", 600));
+    spent.extend(lines_of(4, "late", &kh, 600));
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&rec),
+            &spent,
+            &nkey(1),
+            "reopen",
+            "0"
+        ),
+        "withhold:key-cap"
+    );
+    for class in ["storm", "summary", "switch", "pointer"] {
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!("#send-ledger v1 g=1\n{}", spent.concat()),
+        );
+        let r = fx.run_env(
+            &format!(
+                "pa_lock 5\npa_notice_admit {class} light > /dev/null\necho \"v=$PA_ADMIT_VERDICT\""
+            ),
+            &NOW,
+        );
+        assert_eq!(r.get("v"), "admit", "{class}");
+    }
+    let mut exempt: Vec<String> = Vec::new();
+    for class in ["storm", "summary", "switch", "pointer"] {
+        exempt.extend(lines_of(48, class, "-", 600));
+    }
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&rec),
+            &exempt,
+            &nkey(1),
+            "open",
+            "1"
+        ),
+        "admit stage1"
+    );
+    // A claimed or pending line counts as a sent one, for as long as its window holds it.
+    for (class, result, ago, want) in [
+        ("storm", "pending", 21_000, "withhold:storm-cap"),
+        ("storm", "sending", 21_000, "withhold:storm-cap"),
+        ("storm", "pending", 21_700, "admit"),
+        ("summary", "pending", 3_000, "withhold:summary-cap"),
+        ("summary", "sending", 3_700, "admit"),
+        ("switch", "sending", 80_000, "withhold:switch-cap"),
+        ("switch", "pending", 86_500, "admit"),
+        ("pointer", "norender", 60, "admit"),
+    ] {
+        let line = ledger_line(class, "-", ago, result);
+        let doubled = if class == "pointer" {
+            format!("{line}{line}")
+        } else {
+            line
+        };
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!("#send-ledger v1 g=1\n{doubled}"),
+        );
+        let r = fx.run_env(
+            &format!(
+                "pa_lock 5\npa_notice_admit {class} light > /dev/null\necho \"v=$PA_ADMIT_VERDICT\""
+            ),
+            &NOW,
+        );
+        assert_eq!(r.get("v"), want, "{class} {result} {ago}");
+    }
+}
+
+/// Each meta key of the notices is read only in its form: storm_last, summary_last and
+/// profile_switched a stamp not ahead of the clock, pointer_last such a stamp and a ref of 6 hex,
+/// profile_last legacy or v2; anything else reads as nothing. A value out of form is never
+/// written, a key outside the five is refused, and pointer_last is never written by pa_meta_put:
+/// it stands for a pointer that arrived, which only a pointer's result may record.
+#[test]
+fn each_meta_key_of_the_notices_is_read_and_written_only_in_its_form() {
+    let fx = Fx::salted(SALT);
+    let past = lib_at(600);
+    let ahead = "1000300/abcdef01/5300";
+    for (key, value, read) in [
+        ("storm_last", past.clone(), true),
+        ("storm_last", ahead.to_string(), false),
+        ("storm_last", "plantedword".into(), false),
+        ("summary_last", past.clone(), true),
+        ("summary_last", format!("{past}/0a1b2c"), false),
+        ("profile_switched", past.clone(), true),
+        ("profile_switched", "".into(), false),
+        ("pointer_last", format!("{past}/0a1b2c"), true),
+        ("pointer_last", past.clone(), false),
+        ("pointer_last", format!("{ahead}/0a1b2c"), false),
+        ("pointer_last", format!("{past}/0a1b2"), false),
+        ("profile_last", "legacy".into(), true),
+        ("profile_last", "v2".into(), true),
+        ("profile_last", "V2".into(), false),
+        ("profile_last", "v2 ".into(), false),
+    ] {
+        fx.write(
+            "var/lib/propolis/witness/meta",
+            &format!("#meta v1 g=1\nM\t{key}\t{value}\n"),
+        );
+        let mut env = NOW.to_vec();
+        env.push(("K", key));
+        env.push(("V", &value));
+        let r = fx.run_env(
+            "rc=0; v=\"$(pa_meta_value \"$K\")\" || rc=$?; echo \"v=$v\"; echo \"rc=$rc\"\n\
+             pa_lock 5; rm -f \"$PA_STATE/meta\"; rc=0; pa_meta_put \"$K\" \"$V\" || rc=$?; echo \"put=$rc\"\n\
+             echo \"stored=$(cat \"$PA_STATE/meta\" 2> /dev/null | grep -c '^M')\"",
+            &env,
+        );
+        if read {
+            assert_eq!(
+                (r.get("v"), r.get("rc")),
+                (value.clone(), "0".into()),
+                "{key} {value:?}"
+            );
+            // pointer_last is for the step that records a pointer's result, not pa_meta_put.
+            let put = if key == "pointer_last" {
+                ("2".to_string(), "0".to_string())
+            } else {
+                ("0".to_string(), "1".to_string())
+            };
+            assert_eq!((r.get("put"), r.get("stored")), put, "{key} {value:?}");
+        } else {
+            assert_eq!(
+                (r.get("v"), r.get("rc")),
+                ("".into(), "1".into()),
+                "{key} {value:?}"
+            );
+        }
+        if !read && value != ahead && !value.starts_with(ahead) {
+            assert_eq!(
+                (r.get("put"), r.get("stored")),
+                ("2".into(), "0".into()),
+                "{key} {value:?}"
+            );
+        }
+    }
+    let r = fx.run_env(
+        "rc=0; pa_meta_value clock || rc=$?; echo \"a=$rc\"; rc=0; pa_meta_put clock x || rc=$?; echo \"b=$rc\"",
+        &NOW,
+    );
+    assert_eq!((r.get("a"), r.get("b")), ("2".into(), "2".into()));
+}
+
+// ---- what a W line says ------------------------------------------------------------------------
+
+/// `nrec`, with its last open (field 9) at OPENED.
+fn nrec_opened(n: usize, key: &str, tier: &str, inst: &str, opened: &str) -> String {
+    let id = format!("w#{n}");
+    inc_rec(&[(1, &id), (2, key), (5, inst), (6, tier), (9, opened)])
+}
+
+/// A W line at stamp AT for KEYHASH with the instance and the reason it keeps.
+fn wline_full(at: &str, kh: &str, tx: &str, new: &str, inst: &str, reason: &str) -> String {
+    format!("W\t{at}\t{kh}\t{tx}\t{new}\t{inst}\t{reason}\n")
+}
+
+/// A W line stamped exactly at the stamp a notice lists since is counted: a line written in the
+/// same second as the notice before it may come after it, and counting it twice errs toward
+/// more. For the withheld open of a PAGE incident the notice names it at priority 5.
+#[test]
+fn a_w_line_stamped_exactly_at_the_stamp_a_notice_lists_since_is_counted_and_keeps_the_page_rule() {
+    let fx = Fx::salted(SALT);
+    let records = vec![
+        nrec_opened(1, &nkey(1), "PAGE", &ninst(1), "996000/abcdef01/1000"),
+        wline(SINCE, &keyhash(&fx, &nkey(1)), "open", "1"),
+    ];
+    let r = withheld(&fx, &records, SINCE);
+    assert_eq!(
+        (r.get("n"), r.get("page")),
+        ("1".to_string(), ninst(1)),
+        "{}",
+        r.err
+    );
+    for tx in ["storm", "summary"] {
+        let m = notice(&fx, &records, "", "full", tx, SINCE);
+        assert_eq!(m.prio, "5", "{tx}: {}", m.out);
+        assert_eq!(m.title, format!("host-908b: PAGE withheld {}", ninst(1)));
+    }
+}
+
+/// pa_w_line stamps the line when it is written, not when the caller's pass began, and leaves the
+/// caller's own stamp as it was, so a line written after a notice always counts after it.
+#[test]
+fn pa_w_line_stamps_the_line_with_the_time_it_is_written_and_restores_the_callers_stamp() {
+    let fx = Fx::salted(SALT);
+    let key = nkey(1);
+    let r = withheld_script(
+        &fx,
+        &[],
+        "PA_WALL=999400 PA_BOOT=abcdef01 PA_UP=4400 PA_STAMP=999400/abcdef01/4400\n\
+         rc=0; pa_w_line \"$K\" reopen 0 u0a0001 stage1-cap || rc=$?\necho \"rc=$rc\"\n\
+         echo \"now=$PA_STAMP $PA_WALL $PA_BOOT $PA_UP\"\n\
+         for l in \"${_PA_INC_REST[@]}\"; do [[ $l != W$'\\t'* ]] || echo \"w=$l\"; done",
+        &[("K", key.as_str())],
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    assert_eq!(r.get("now"), "999400/abcdef01/4400 999400 abcdef01 4400");
+    assert_eq!(
+        r.get("w"),
+        format!(
+            "W\t1000000/abcdef01/5000\t{}\treopen\t0\tu0a0001\tstage1-cap",
+            keyhash(&fx, &key)
+        )
+    );
+}
+
+/// Runs SCRIPT after the records RECORDS are loaded, with ENV beside the test clock.
+fn withheld_script(fx: &Fx, records: &[String], script: &str, env: &[(&str, &str)]) -> Run {
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", records.concat()),
+    );
+    let mut all = NOW.to_vec();
+    all.extend(env.iter().copied());
+    fx.run_env(&format!("pa_incident_load\n{script}"), &all)
+}
+
+/// A pass that began before a summary was claimed and withholds a message after it: its W line,
+/// written by pa_w_line, is counted by the next summary, which lists since the claim.
+#[test]
+fn a_w_line_written_after_a_summary_was_claimed_is_counted_by_the_next_summary() {
+    let fx = Fx::salted(SALT);
+    fx.write("var/lib/propolis/witness/send-ledger", EMPTY_LEDGER);
+    let key = nkey(1);
+    let r = withheld_script(
+        &fx,
+        &[nrec(1, &key, "PAGE", &ninst(1))],
+        "pa_lock 5\npa_notice_admit summary hourly > /dev/null\nS=\"$PA_NOTICE_STAMP\"\n\
+         PA_WALL=999400 PA_BOOT=abcdef01 PA_UP=4400 PA_STAMP=999400/abcdef01/4400\n\
+         PA_TEST_WALL=1000060 PA_TEST_UP=5060\n\
+         pa_w_line \"$K\" open 1 \"$I\" pool\npa_now\npa_withheld_since \"$S\"\n\
+         echo \"s=$S\"\necho \"n=$PA_WH_N\"\necho \"page=$PA_WH_PAGE\"",
+        &[("K", key.as_str()), ("I", ninst(1).as_str())],
+    );
+    assert_eq!(r.get("s"), "1000000/abcdef01/5000", "{}", r.err);
+    assert_eq!((r.get("n"), r.get("page")), ("1".to_string(), ninst(1)));
+}
+
+/// A withheld reopen of a PAGE incident keeps the PAGE rule: a dead listener whose reopen the
+/// stage-1 cap holds back is named in the title and the first line at priority 5, and is not a
+/// new incident. A withheld reopen of an ACT incident stays at priority 3.
+#[test]
+fn a_withheld_reopen_of_a_page_incident_names_it_at_priority_five_and_is_no_new_incident() {
+    let fx = Fx::salted(SALT);
+    let inst = ninst(1);
+    let page = vec![
+        nrec(1, &nkey(1), "PAGE", &inst),
+        wline_full(
+            W_T,
+            &keyhash(&fx, &nkey(1)),
+            "reopen",
+            "0",
+            &inst,
+            "stage1-cap",
+        ),
+    ];
+    for tx in ["storm", "summary"] {
+        let m = notice(&fx, &page, "", "full", tx, SINCE);
+        assert_eq!(m.rc, "0", "{tx}: {}", m.out);
+        assert_eq!(m.title, format!("host-908b: PAGE withheld {inst}"), "{tx}");
+        assert_eq!(m.prio, "5", "{tx}");
+        assert_eq!(m.body[0], format!("PAGE withheld: {inst}"), "{tx}");
+        assert!(
+            m.body[1].ends_with("new incidents: none"),
+            "{tx}: {:?}",
+            m.body
+        );
+    }
+    let act = vec![
+        nrec(2, &nkey(2), "ACT", &ninst(2)),
+        wline_full(
+            W_T,
+            &keyhash(&fx, &nkey(2)),
+            "reopen",
+            "0",
+            &ninst(2),
+            "key-cap",
+        ),
+    ];
+    for tx in ["storm", "summary"] {
+        let m = notice(&fx, &act, "", "full", tx, SINCE);
+        assert_eq!(m.prio, "3", "{tx}: {}", m.out);
+        assert!(!m.title.contains("PAGE"), "{tx}: {}", m.title);
+    }
+    // A reopen line that says it is new (a line no writer makes) is still no new incident.
+    let odd = vec![
+        nrec(1, &nkey(1), "PAGE", &inst),
+        nrec(2, &nkey(2), "ACT", &ninst(2)),
+        wline_full(
+            W_T,
+            &keyhash(&fx, &nkey(1)),
+            "reopen",
+            "1",
+            &inst,
+            "stage1-cap",
+        ),
+        wline_full(
+            W_T,
+            &keyhash(&fx, &nkey(2)),
+            "reopen",
+            "1",
+            &ninst(2),
+            "key-cap",
+        ),
+    ];
+    for tx in ["storm", "summary"] {
+        let m = notice(&fx, &odd, "", "full", tx, SINCE);
+        assert_eq!(m.title, format!("host-908b: PAGE withheld {inst}"), "{tx}");
+        assert_eq!(m.prio, "5", "{tx}");
+        assert!(
+            m.body[1].ends_with("new incidents: none"),
+            "{tx}: {:?}",
+            m.body
+        );
+    }
+}
+
+/// A summary's title says `in the last hour` only when it lists what was withheld since a stamp
+/// about an hour old; over a longer span (the day's summaries were spent, the pass was down) or
+/// a stamp that cannot be placed it names the time its count starts at, as its body does, and
+/// with no time to name it gives the count alone.
+#[test]
+fn a_summary_over_more_than_an_hour_names_the_time_it_counts_from_in_its_title() {
+    let fx = Fx::salted(SALT);
+    let recs = vec![
+        nrec(1, &nkey(1), "ACT", &ninst(1)),
+        wline(W_T, &keyhash(&fx, &nkey(1)), "open", "1"),
+    ];
+    let m = notice(&fx, &recs, "", "full", "summary", SINCE);
+    assert_eq!(m.title, "host-908b: 1 message withheld in the last hour");
+    let m = notice(&fx, &recs, "", "full", "summary", &lib_at(4000));
+    assert_eq!(m.title, "host-908b: 1 message withheld since 12:40 UTC");
+    assert!(m.body[0].starts_with("Withheld: 1 message since 12:40 UTC"));
+    let m = notice(&fx, &recs, "", "full", "summary", "-");
+    assert_eq!(m.title, "host-908b: 1 message withheld since 13:36 UTC");
+    let odd = vec![
+        nrec(1, &nkey(1), "ACT", &ninst(1)),
+        format!(
+            "W\tnot-a-stamp\t{}\topen\t1\t-\tpool\n",
+            keyhash(&fx, &nkey(1))
+        ),
+    ];
+    let m = notice(&fx, &odd, "", "full", "summary", "-");
+    assert_eq!(m.title, "host-908b: 1 message withheld");
+    // The edge of `the last hour`: 65 minutes, and a second past it.
+    let m = notice(&fx, &recs, "", "full", "summary", &lib_at(3900));
+    assert_eq!(m.title, "host-908b: 1 message withheld in the last hour");
+    let m = notice(&fx, &recs, "", "full", "summary", &lib_at(3901));
+    assert_eq!(m.title, "host-908b: 1 message withheld since 12:41 UTC");
+}
+
+/// In the library one function adds a W line to the records in memory, stamped at the moment it
+/// is written, and the failure hook's path writes its withheld transitions through it: a line
+/// added anywhere else would carry the stamp its caller took when it began, which can fall
+/// before a notice claimed in between and so never be listed. Beside it only the reader of the
+/// file adds a line it does not judge. (The witness still builds its own line: its send step
+/// moves to this function with the notices it will send.)
+#[test]
+fn the_library_adds_a_w_line_in_one_place_and_the_hooks_path_writes_through_it() {
+    let lib = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/alert-lib.sh"
+    ))
+    .unwrap();
+    let mut function = String::new();
+    let mut adders = Vec::new();
+    let mut hook_calls = 0;
+    for line in lib.lines() {
+        let t = line.trim_start();
+        if let Some(f) = t.strip_suffix("() {")
+            && !line.starts_with(' ')
+        {
+            function = f.to_string();
+            continue;
+        }
+        if t.starts_with('#') {
+            continue;
+        }
+        if t.contains("_PA_INC_REST+=") {
+            adders.push(function.clone());
+        }
+        if function == "pa_hook_v2" && t.starts_with("pa_w_line ") {
+            hook_calls += 1;
+        }
+    }
+    assert_eq!(adders, ["pa_incident_load", "pa_w_line"]);
+    assert_eq!(
+        hook_calls, 1,
+        "pa_hook_v2 writes its W line through pa_w_line"
+    );
+}
+
+/// A line of this boot comes after every stamp of an earlier boot, whatever the wall clock says:
+/// a host whose clock came up behind after a restart must not lose what it withheld since.
+#[test]
+fn a_w_line_of_this_boot_counts_after_a_stamp_of_an_earlier_boot_whatever_its_wall_clock_says() {
+    let fx = Fx::salted(SALT);
+    let kh = keyhash(&fx, &nkey(1));
+    let rec = nrec(1, &nkey(1), "ACT", &ninst(1));
+    let since = "999000/0000aaaa/50";
+    for (at, want) in [
+        ("998500/abcdef01/4000", "1"),
+        ("999500/abcdef01/4000", "1"),
+        ("998500/0000aaaa/20", "0"),
+        ("999500/0000aaaa/60", "1"),
+    ] {
+        let r = withheld(&fx, &[rec.clone(), wline(at, &kh, "remind", "0")], since);
+        assert_eq!(r.get("n"), want, "{at}: {}", r.err);
+    }
+}
+
+/// A W line that is not whole (an empty field or too few, which no writer makes) is still placed
+/// by its stamp when that is in form, so an old one is not counted again by every later notice
+/// and a summary cannot say `in the last hour` over lines of two days ago. One whose stamp cannot
+/// be placed is counted, as before.
+#[test]
+fn a_w_line_that_is_not_whole_is_counted_only_from_the_stamp_a_notice_lists_since() {
+    let fx = Fx::salted(SALT);
+    let kh = keyhash(&fx, &nkey(1));
+    let rec = nrec(1, &nkey(1), "ACT", &ninst(1));
+    let broken = |at: &str| format!("W\t{at}\t{kh}\topen\t1\t\tpool\n");
+    let short = |at: &str| format!("W\t{at}\t{kh}\topen\n");
+    for (lines, want) in [
+        (vec![broken(&lib_at(4500)), short(&lib_at(4500))], "0"),
+        (vec![broken(&lib_at(144_000)), short(&lib_at(144_000))], "0"),
+        (vec![broken(W_T), short(W_T)], "2"),
+        (vec![format!("W\t\t{kh}\topen\t1\t-\tpool\n")], "1"),
+    ] {
+        let mut records = vec![rec.clone()];
+        records.extend(lines.iter().cloned());
+        let r = withheld(&fx, &records, SINCE);
+        assert_eq!(r.get("n"), want, "{lines:?}: {}", r.err);
+    }
+    let records = vec![
+        rec,
+        broken(&lib_at(144_000)),
+        short(&lib_at(4500)),
+        wline(W_T, &kh, "open", "1"),
+    ];
+    let m = notice(&fx, &records, "", "full", "summary", SINCE);
+    assert_eq!(m.title, "host-908b: 1 message withheld in the last hour");
+}
+
+/// A W line whose stamp is ahead of the clock is kept only while its wall time is within two
+/// days of the wall clock: one further off (a stamp of this boot with an uptime not yet reached
+/// and a wall time of ten days ago, or a wall time three days ahead) can never age out by the
+/// usual rule, and every notice would count it for good.
+#[test]
+fn the_bounds_of_the_incidents_file_drop_a_w_line_stamped_far_from_the_wall_clock() {
+    let fx = Fx::salted(SALT);
+    let kh = keyhash(&fx, &nkey(1));
+    let records = vec![
+        nrec(1, &nkey(1), "ACT", &ninst(1)),
+        wline("136000/abcdef01/9000", &kh, "remind", "0"),
+        wline("1259300/0000aaaa/1", &kh, "remind", "0"),
+        wline("1003600/0000aaaa/1", &kh, "change", "0"),
+        wline(W_T, &kh, "remind", "0"),
+    ];
+    let r = withheld_script(
+        &fx,
+        &records,
+        "pa_incident_prune\nfor l in \"${_PA_INC_REST[@]}\"; do [[ $l != W$'\\t'* ]] || echo \"w=${l//$'\\t'/ }\"; done",
+        &[],
+    );
+    let kept: Vec<&str> = r.out.lines().filter_map(|l| l.strip_prefix("w=")).collect();
+    assert_eq!(
+        kept,
+        [
+            format!("W 1003600/0000aaaa/1 {kh} change 0 - pool"),
+            format!("W {W_T} {kh} remind 0 - pool"),
+        ],
+        "{}",
+        r.err
+    );
+}
+
+/// A notice's result that cannot take the lock writes nothing: status 2, and the line stays
+/// claimed and counted, so the class's cap still holds the next one back.
+#[test]
+fn a_notice_result_without_the_lock_leaves_its_line_claimed_and_counted() {
+    let fx = Fx::salted(SALT);
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        "#send-ledger v1 g=1\nL\t1000000/abcdef01/5000\tstorm\t-\tstorm\tfull\tsending\tlight\n",
+    );
+    let r = fx.run_env(
+        "pa_lock() { return 1; }\nrc=0; pa_notice_result 1000000/abcdef01/5000 storm ok light || rc=$?\n\
+         echo \"rc=$rc\"",
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "2", "{}", r.err);
+    assert_eq!(
+        ledger_body(&fx),
+        ["L\t1000000/abcdef01/5000\tstorm\t-\tstorm\tfull\tsending\tlight"]
+    );
+    let r = fx.run_env(
+        "pa_lock 5\npa_notice_admit storm light > /dev/null\necho \"v=$PA_ADMIT_VERDICT\"",
+        &NOW,
+    );
+    assert_eq!(r.get("v"), "withhold:storm-cap", "{}", r.err);
+}
+
+/// Two withheld opens of one PAGE incident are two messages and one name.
+#[test]
+fn two_w_lines_for_one_page_record_are_counted_twice_and_named_once() {
+    let fx = Fx::salted(SALT);
+    let kh = keyhash(&fx, &nkey(1));
+    let records = vec![
+        nrec(1, &nkey(1), "PAGE", &ninst(1)),
+        wline(W_T, &kh, "open", "1"),
+        wline(W_T, &kh, "open", "1"),
+    ];
+    let r = withheld(&fx, &records, SINCE);
+    assert_eq!(r.get("n"), "2", "{}", r.err);
+    assert_eq!(
+        (r.get("names"), r.get("page"), r.get("more")),
+        (ninst(1), ninst(1), "0".to_string())
+    );
+}
+
+/// A notice sent whole or not at all: a body of lines each in form but 1024 bytes or more is
+/// refused and leaves no title, priority or body; one under that is set.
+#[test]
+fn a_notice_body_of_valid_lines_past_the_senders_cut_is_refused_whole() {
+    let fx = Fx::salted(SALT);
+    let line = format!("line {}", "x".repeat(95));
+    let long = vec![line.clone(); 11].join("\n");
+    let short = vec![line; 9].join("\n");
+    assert!(long.len() >= 1100);
+    for (body, want) in [(long, "1"), (short, "0")] {
+        let r = fx.run_env(
+            "PA_TITLE=old PA_PRIO=3 PA_BODY=old\nrc=0; _pa_render_check 'host-908b: x' \"$B\" || rc=$?\n\
+             echo \"rc=$rc\"\necho \"title=$PA_TITLE\"\necho \"len=${#PA_BODY}\"",
+            &[("B", body.as_str())],
+        );
+        assert_eq!(r.get("rc"), want, "{}", r.err);
+        if want == "1" {
+            assert_eq!((r.get("title"), r.get("len")), ("".into(), "0".into()));
+        } else {
+            assert_eq!(r.get("title"), "host-908b: x");
+            assert_eq!(r.get("len"), body.len().to_string());
+        }
+    }
+}
+
+/// Within one boot the lines are placed by uptime, which a clock step cannot move: a line whose
+/// wall clock stepped back is counted when its uptime is after the stamp, and one whose wall
+/// clock is later but whose uptime is earlier is not. A line of an earlier boot predates every
+/// stamp of this one, whatever its wall clock says.
+#[test]
+fn within_one_boot_w_lines_are_placed_by_uptime_and_a_line_of_an_earlier_boot_predates_the_stamp() {
+    let fx = Fx::salted(SALT);
+    let kh = keyhash(&fx, &nkey(1));
+    let rec = nrec(1, &nkey(1), "ACT", &ninst(1));
+    let since = "999400/abcdef01/4400";
+    for (at, want) in [
+        ("990000/abcdef01/4500", "1"),
+        ("999500/abcdef01/4300", "0"),
+        ("1000500/0000aaaa/1", "0"),
+    ] {
+        let r = withheld(&fx, &[rec.clone(), wline(at, &kh, "remind", "0")], since);
+        assert_eq!(r.get("n"), want, "{at}: {}", r.err);
+    }
+}
+
+/// A line whose stamp is out of form is dropped by the bounds of the file, so it cannot keep a
+/// summary due for good; a line in form stays, one ahead of the clock among them.
+#[test]
+fn the_bounds_of_the_incidents_file_drop_a_w_line_whose_stamp_is_out_of_form() {
+    let fx = Fx::salted(SALT);
+    let kh = keyhash(&fx, &nkey(1));
+    let records = vec![
+        nrec(1, &nkey(1), "ACT", &ninst(1)),
+        wline("garbage", &kh, "open", "1"),
+        wline(W_T, &kh, "remind", "0"),
+        wline("1000500/abcdef01/5500", &kh, "change", "0"),
+    ];
+    let r = withheld_script(
+        &fx,
+        &records,
+        "pa_incident_prune\nfor l in \"${_PA_INC_REST[@]}\"; do [[ $l != W$'\\t'* ]] || echo \"w=${l//$'\\t'/ }\"; done",
+        &[],
+    );
+    let kept: Vec<&str> = r.out.lines().filter_map(|l| l.strip_prefix("w=")).collect();
+    assert_eq!(
+        kept,
+        [
+            format!("W {W_T} {kh} remind 0 - pool"),
+            format!("W 1000500/abcdef01/5500 {kh} change 0 - pool"),
+        ],
+        "{}",
+        r.err
+    );
+}
+
+/// A W line names the record its key holds only when the line is not older than that record's
+/// last open: an earlier line is of an earlier incident on the same key, which a new one
+/// replaced, and is counted unnamed, raising no priority.
+#[test]
+fn a_w_line_older_than_its_records_last_open_is_counted_and_not_named() {
+    let fx = Fx::salted(SALT);
+    let kh = keyhash(&fx, &nkey(1));
+    let rec = nrec_opened(1, &nkey(1), "PAGE", &ninst(1), "999500/abcdef01/4500");
+    let early = vec![rec.clone(), wline("999400/abcdef01/4400", &kh, "open", "1")];
+    let r = withheld(&fx, &early, SINCE);
+    assert_eq!(
+        (r.get("n"), r.get("page"), r.get("names"), r.get("more")),
+        ("1".into(), "".into(), "".into(), "1".into()),
+        "{}",
+        r.err
+    );
+    let m = notice(&fx, &early, "", "full", "storm", SINCE);
+    assert_eq!(m.prio, "3", "{}", m.out);
+    let late = vec![rec, wline("999600/abcdef01/4600", &kh, "open", "1")];
+    let m = notice(&fx, &late, "", "full", "storm", SINCE);
+    assert_eq!(m.prio, "5", "{}", m.out);
+    assert_eq!(m.title, format!("host-908b: PAGE withheld {}", ninst(1)));
+}
+
+/// A key hash two records share names neither: the line is counted among the new incidents not
+/// named, and is no PAGE.
+#[test]
+fn a_w_line_whose_key_two_records_share_is_counted_and_not_named() {
+    let fx = Fx::salted(SALT);
+    let kh = keyhash(&fx, &nkey(1));
+    let records = vec![
+        nrec(1, &nkey(1), "PAGE", &ninst(1)),
+        nrec(2, &nkey(1), "PAGE", &ninst(2)),
+        wline(W_T, &kh, "open", "1"),
+    ];
+    let r = withheld(&fx, &records, SINCE);
+    assert_eq!(
+        (r.get("n"), r.get("names"), r.get("more"), r.get("page")),
+        ("1".into(), "".into(), "1".into(), "".into()),
+        "{}",
+        r.err
+    );
+}
+
+/// New incidents none of which can be named are counted in words of their own.
+#[test]
+fn a_storm_notice_over_new_incidents_none_of_which_can_be_named_counts_them() {
+    let fx = Fx::salted(SALT);
+    let records: Vec<String> = (1..=5)
+        .map(|n| wline(W_T, &keyhash(&fx, &nkey(n)), "open", "1"))
+        .collect();
+    let m = notice(&fx, &records, "", "full", "storm", SINCE);
+    assert_eq!(m.rc, "0", "{}", m.out);
+    assert_eq!(
+        m.body[0],
+        "Withheld: 5 messages since 12:46 UTC; new incidents: 5 not named"
+    );
+}
+
+/// With a stamp that cannot be placed, the notice says since the earliest line it counted, or
+/// `?` when no line's stamp can be placed either.
+#[test]
+fn a_notice_over_a_stamp_out_of_form_says_since_its_earliest_line_or_a_question_mark() {
+    let fx = Fx::salted(SALT);
+    let kh = keyhash(&fx, &nkey(1));
+    let rec = nrec(1, &nkey(1), "ACT", &ninst(1));
+    let dated = vec![
+        rec.clone(),
+        wline("999360/abcdef01/4360", &kh, "remind", "0"),
+        wline("996960/abcdef01/1960", &kh, "remind", "0"),
+    ];
+    let m = notice(&fx, &dated, "", "full", "summary", "garbage");
+    assert!(
+        m.body[0].starts_with("Withheld: 2 messages since 12:56 UTC;"),
+        "{:?} {}",
+        m.body,
+        m.out
+    );
+    let undated = vec![
+        rec,
+        wline("garbage", &kh, "remind", "0"),
+        wline("x/y/z", &kh, "remind", "0"),
+    ];
+    let m = notice(&fx, &undated, "", "full", "summary", "garbage");
+    assert!(
+        m.body[0].starts_with("Withheld: 2 messages since ? UTC;"),
+        "{:?} {}",
+        m.body,
+        m.out
+    );
 }

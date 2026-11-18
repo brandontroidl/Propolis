@@ -820,6 +820,16 @@
 
 ### Added
 
+- **The witness and the failure hook can send the pointer message, under a profile no host can set
+  yet** - under `v2` alone, with the topic not proven private, a host tells its operator that
+  something needs attention with one message that carries only the alias and a ref, while a PAGE
+  or ACT incident is open and not yet told, at most once in 30 minutes whatever the result
+  (`pa_pointer_claim`, `pa_pointer_close`, library version 15, which the witness now needs; the
+  hook's v2 children still need 12); a refused or unanswered pointer opens `alert-path`, once per
+  refusal. A pointer tells only of what its claim found due. An open or a reopen
+  now sets a record's `ref` back to `-`. Nothing new is sent: the profile is still forced to
+  `legacy` ([health](docs/operations/health-and-observability.md),
+  [paths](docs/reference/filesystem-paths.md#alerting-state-and-runtime-directories)).
 - **The witness can send the storm notice and the hourly summary of withheld messages, under a
   profile no host can set yet** - under `v2` alone, with the gate full, a pass that sends for the
   host follows its incident messages with at most one notice of what the budget withheld since

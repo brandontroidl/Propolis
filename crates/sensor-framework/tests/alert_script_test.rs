@@ -2255,13 +2255,13 @@ fn shipped_lib_version() -> u32 {
 }
 
 /// The shell code sends the test page, the witness's daily message and, under profile v2 alone,
-/// the failure hook's and the witness's new-format messages: pa_send is called from exactly five
+/// the failure hook's and the witness's new-format messages: pa_send is called from exactly six
 /// places in deploy/, the hook's test-page function, the witness's daily_send, which only its two
 /// passes call, the v2 path's one post (_pa_hv2_post), which only the v2 path's own functions
 /// call, the witness's send_one, which only its send_post calls, which only its two passes
-/// call and which posts nothing unless profile v2 is in force, and the witness's notice_step (the
-/// storm notice and the summary), which only its two passes call and which posts nothing unless
-/// profile v2 is in force
+/// call and which posts nothing unless profile v2 is in force, the witness's notice_step (the
+/// storm notice and the summary) and its pointer_step (the pointer message), which only its two
+/// passes call and which post nothing unless profile v2 is in force
 /// (only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code). The test-page
 /// function is run only from the failure hook's test-page path, and the v2 path only from the
 /// hook's v2 child, which follows a decision no run without a test root passes
@@ -2277,6 +2277,7 @@ fn pa_send_is_called_only_by_the_test_page_path_the_daily_message_and_the_two_v2
     let mut one = Vec::new();
     let mut step = Vec::new();
     let mut notices = Vec::new();
+    let mut pointers = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|e| e != "sh") {
@@ -2320,6 +2321,9 @@ fn pa_send_is_called_only_by_the_test_page_path_the_daily_message_and_the_two_v2
             if t.contains("notice_step") && !t.starts_with("notice_step()") {
                 notices.push(format!("{name}:{function}"));
             }
+            if t.contains("pointer_step") && !t.starts_with("pointer_step()") {
+                pointers.push(format!("{name}:{function}"));
+            }
             if t.contains("pa_hook_test_page") && !t.starts_with("pa_hook_test_page()") {
                 runs.push(name.clone());
             }
@@ -2343,6 +2347,7 @@ fn pa_send_is_called_only_by_the_test_page_path_the_daily_message_and_the_two_v2
             "alert-lib.sh:pa_hook_test_page",
             "witness.sh:daily_send",
             "witness.sh:notice_step",
+            "witness.sh:pointer_step",
             "witness.sh:send_one"
         ],
         "pa_send call sites"
@@ -2352,6 +2357,12 @@ fn pa_send_is_called_only_by_the_test_page_path_the_daily_message_and_the_two_v2
         notices,
         ["witness.sh:hourly_pass", "witness.sh:light_pass"],
         "notice_step call sites"
+    );
+    pointers.sort();
+    assert_eq!(
+        pointers,
+        ["witness.sh:hourly_pass", "witness.sh:light_pass"],
+        "pointer_step call sites"
     );
     assert!(!one.is_empty());
     assert!(
@@ -3437,21 +3448,67 @@ fn a_repeat_failure_under_v2_only_counts_unless_the_cause_class_changes() {
 }
 
 /// With a gate other than full (no read check on record, or a target over plain http) the v2 hook
-/// records the open and admits and sends nothing: the pointer message is not built yet.
+/// records the open and admits no incident message: no incident ledger line, no pending
+/// transition, no W line. Once the record is written it claims the pointer message under the same
+/// lock, and that is the one post: the alias and a ref at priority 4, its ok written into the
+/// record's ref and pointer_last, no delivered_open. No journal line names the target, the topic
+/// or the ref.
 #[test]
-fn with_a_gate_other_than_full_the_v2_hook_records_and_sends_nothing() {
+fn with_a_gate_other_than_full_the_v2_hook_sends_the_pointer_alone_and_no_incident_message() {
     let unit = "propolis-backup.service";
     let check = |fx: &Fixture| {
         fx.show(unit, &show_answer("exit-code", "1", "no", "0"));
         assert_ok(&fx.run(unit, &V2));
-        assert!(!fx.log().contains("curl "), "{}", fx.log());
+        let titles = fx.v2_titles();
+        assert_eq!(titles.len(), 1, "{}", fx.log());
+        let alias = titles[0]
+            .strip_suffix(": needs attention")
+            .unwrap_or_else(|| panic!("{titles:?}"))
+            .to_string();
+        assert!(
+            fx.confs().contains("header = \"Priority: 4\""),
+            "{}",
+            fx.confs()
+        );
+        let body = fx.v2_body(0);
+        let reference = body
+            .strip_prefix(&format!("Run the status command on {alias}. ref "))
+            .unwrap_or_else(|| panic!("{body}"))
+            .to_string();
+        assert_eq!(reference.len(), 6, "{body}");
         let f = fx.record(unit);
         assert_eq!(
-            (f[7].as_str(), f[14].as_str(), f[26].as_str()),
-            ("open", "0", "-")
+            (
+                f[7].as_str(),
+                f[14].as_str(),
+                f[17].as_str(),
+                f[26].as_str(),
+                f[28].as_str()
+            ),
+            ("open", "0", "0", "-", reference.as_str())
         );
-        assert!(fx.ledger().is_empty(), "{:?}", fx.ledger());
+        let ledger = fx.ledger();
+        assert_eq!(ledger.len(), 1, "{ledger:?}");
+        assert_eq!(
+            ledger[0][2..].join("\t"),
+            "pointer\t-\tpointer\tpointer\tok\thook"
+        );
+        let pointer_last = fx
+            .state("meta")
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("M\tpointer_last\t"))
+            .map(str::to_string);
+        assert_eq!(pointer_last, Some(format!("{}/{reference}", ledger[0][1])));
         assert!(fx.w_lines().is_empty());
+        for line in witness_lines(&fx.log()) {
+            assert!(
+                !line.contains(&reference)
+                    && !line.contains("ntfy.example")
+                    && !line.contains("propolis-ops"),
+                "{line}"
+            );
+        }
     };
     let fx = Fixture::v2();
     std::fs::remove_file(fx.root.join("var/lib/propolis/witness/readcheck")).unwrap();
@@ -3471,6 +3528,268 @@ fn with_a_gate_other_than_full_the_v2_hook_records_and_sends_nothing() {
     )
     .unwrap();
     check(&fx);
+}
+
+/// In pointer mode the hook's pointer counts in the one class the witness's does: one attempt in
+/// 30 minutes whatever its result. After a pointer that got ok or a 503, a repeat firing and the
+/// open of another unit inside the half hour send nothing, and that open stays due (no ref).
+#[test]
+fn in_pointer_mode_the_hook_sends_one_pointer_attempt_in_thirty_minutes_whatever_its_result() {
+    for code in ["200", "503"] {
+        let fx = Fixture::v2();
+        std::fs::remove_file(fx.root.join("var/lib/propolis/witness/readcheck")).unwrap();
+        fx.light_pass_ago(1000);
+        let env = v2_env(&[("STUB_POST_CODE", code)]);
+        fx.show(BACKUP, &show_answer("exit-code", "1", "no", "0"));
+        assert_ok(&fx.run(BACKUP, &env));
+        assert_eq!(fx.tp_posts(), 1, "{code}: {}", fx.log());
+        assert_ok(&fx.run(BACKUP, &env));
+        let ssh = "sensor-ssh.service";
+        fx.show(ssh, &show_answer("exit-code", "1", "always", "2"));
+        assert_ok(&fx.run(ssh, &env));
+        assert_eq!(fx.tp_posts(), 1, "{code}: {}", fx.log());
+        let f = fx.record(ssh);
+        assert_eq!((f[7].as_str(), f[28].as_str()), ("open", "-"), "{code}");
+        let ledger = fx.ledger();
+        assert_eq!(ledger.len(), 1, "{code}: {ledger:?}");
+        let want = if code == "200" { "ok" } else { "transient:503" };
+        assert_eq!(ledger[0][6], want);
+        if code == "503" {
+            assert_eq!(
+                fx.record(BACKUP)[28],
+                "-",
+                "a pointer that failed tells nothing"
+            );
+            let lines = witness_lines(&fx.log());
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("pointer message not delivered (transient:503)")),
+                "{lines:?}"
+            );
+        }
+    }
+}
+
+/// A hook firing while the witness's pointer is in flight (its line claimed a minute ago) is held
+/// by that claim: the two claim one pointer between them, and the hook's open stays due.
+#[test]
+fn a_hook_firing_while_the_witness_pointer_is_in_flight_claims_none() {
+    let fx = Fixture::v2();
+    std::fs::remove_file(fx.root.join("var/lib/propolis/witness/readcheck")).unwrap();
+    let ledger = "#send-ledger v1 g=1\nL\t999940/abcdef01/4940\tpointer\t-\tpointer\tpointer\tsending\tlight\n";
+    std::fs::write(fx.root.join("var/lib/propolis/witness/send-ledger"), ledger).unwrap();
+    fx.show(BACKUP, &show_answer("exit-code", "1", "no", "0"));
+    assert_ok(&fx.run(BACKUP, &V2));
+    assert_eq!(fx.tp_posts(), 0, "{}", fx.log());
+    assert_eq!(fx.state("send-ledger"), ledger);
+    let f = fx.record(BACKUP);
+    assert_eq!((f[7].as_str(), f[28].as_str()), ("open", "-"));
+}
+
+/// When the hook cannot write its records (neither directory takes the incidents file) in pointer
+/// mode, it claims nothing and sends nothing: a pointer for a record no pass can find would tell
+/// of nothing.
+#[test]
+fn in_pointer_mode_a_hook_that_cannot_write_its_records_claims_and_sends_nothing() {
+    let fx = Fixture::v2();
+    std::fs::remove_file(fx.root.join("var/lib/propolis/witness/readcheck")).unwrap();
+    write_exec(
+        &fx.bin.join("sync"),
+        "#!/usr/bin/env bash\ncase \"$*\" in *incidents.tmp.*) exit 1 ;; esac\nexit 0\n",
+    );
+    fx.show(BACKUP, &show_answer("exit-code", "1", "no", "0"));
+    assert_ok(&fx.run(BACKUP, &V2));
+    assert_eq!(fx.tp_posts(), 0, "{}", fx.log());
+    assert!(fx.ledger().is_empty(), "{:?}", fx.ledger());
+    let lines = witness_lines(&fx.log());
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("neither the state directory nor /run took the write")),
+        "{lines:?}"
+    );
+}
+
+/// The hook's two v2 children need the library version V2_NEEDS names, 12, the first with
+/// pa_hook_profile and pa_hook_v2: they call nothing else, and the pointer path lives inside the
+/// library, so a later library's own version is never what they need. With a library one version
+/// older the decision leaves the failure to today's code; with the one they need, with 14 and with
+/// the shipped one the v2 path takes it.
+#[test]
+fn the_v2_children_refuse_a_library_one_version_older_than_v2_needs_and_take_the_one_they_need() {
+    let hook = shipped_hook();
+    let needs: u32 = hook
+        .lines()
+        .find_map(|l| l.strip_prefix("V2_NEEDS="))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("V2_NEEDS=<n>");
+    assert_eq!(needs, 12, "the hook's v2 children need library 12");
+    let shipped = shipped_lib_version();
+    assert!(shipped >= 14, "{shipped}");
+    for (v, v2) in [
+        (needs - 1, false),
+        (needs, true),
+        (14, true),
+        (shipped, true),
+    ] {
+        let fx = Fixture::v2();
+        let lib: String = shipped_lib()
+            .lines()
+            .map(|l| {
+                if l.starts_with("PA_LIB_VERSION=") {
+                    format!("PA_LIB_VERSION={v}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fx.install_lib(&lib);
+        fx.show(BACKUP, &show_answer("exit-code", "1", "no", "0"));
+        assert_ok(&fx.run(BACKUP, &V2));
+        let log = fx.log();
+        assert_eq!(
+            log.contains("Title: propolis: propolis-backup.service failed on"),
+            !v2,
+            "version {v}: {log}"
+        );
+        assert_eq!(fx.v2_titles().len(), usize::from(v2), "version {v}: {log}");
+    }
+}
+
+/// An open PAGE record not yet told, on a key of its own, as the incidents file holds it.
+fn due_record_file() -> String {
+    format!(
+        "#incidents v1 g=1\nN\t2\nI\tw#1\tfinding:test:000000000001\tfinding\tlisten\t-\tPAGE\topen{}\n",
+        "\t-".repeat(27)
+    )
+}
+
+/// On the host's own clock (no test clock), the hook's pointer path dates what it reads at its
+/// claim, not at the hook's start: a witness pointer claimed (sending) after the hook began, while
+/// it reads the role before its lock, holds the hook's own pointer by the half hour, so the two
+/// claim one between them and the hook posts nothing.
+#[test]
+fn a_pointer_the_witness_claims_while_the_hook_runs_is_read_on_the_clock_of_the_claim() {
+    let fx = Fixture::v2();
+    std::fs::remove_file(fx.root.join("var/lib/propolis/witness/readcheck")).unwrap();
+    std::fs::write(
+        fx.root.join("var/lib/propolis/witness/incidents"),
+        due_record_file(),
+    )
+    .unwrap();
+    let flag = fx._dir.path().join("claim.once");
+    std::fs::write(&flag, b"").unwrap();
+    let claimed = fx._dir.path().join("claim.stamp");
+    std::fs::rename(fx.bin.join("systemctl"), fx.bin.join("systemctl.real")).unwrap();
+    write_exec(
+        &fx.bin.join("systemctl"),
+        &format!(
+            "#!/usr/bin/env bash\n\
+             if [ \"${{PA_ROLE_WAIT:-}}\" = 3 ] && [ -f '{flag}' ]; then\n\
+             \x20   rm -f '{flag}'\n\
+             \x20   sleep 2\n\
+             \x20   bash -c '. \"$1/usr/local/sbin/propolis-alert-lib\" && pa_init \"$1\" && pa_lock 10 \\\n\
+             \x20       && pa_ledger_add pointer - pointer pointer sending light && echo \"$PA_LEDGER_STAMP\" > \"$2\"; pa_unlock' \\\n\
+             \x20       _ '{root}' '{claimed}' < /dev/null > /dev/null 2>&1\n\
+             fi\n\
+             exec '{real}' \"$@\"\n",
+            flag = flag.display(),
+            root = fx.root.display(),
+            claimed = claimed.display(),
+            real = fx.bin.join("systemctl.real").display()
+        ),
+    );
+    fx.show(BACKUP, &show_answer("exit-code", "1", "no", "0"));
+    assert_ok(&fx.run(BACKUP, &[("PA_TEST_PROFILE", "v2")]));
+    let stamp = std::fs::read_to_string(&claimed).unwrap_or_default();
+    let stamp = stamp.trim();
+    assert!(
+        !flag.exists() && !stamp.is_empty(),
+        "the claim ran: {}",
+        fx.log()
+    );
+    assert_eq!(fx.tp_posts(), 0, "{}", fx.log());
+    let ledger = fx.ledger();
+    assert_eq!(ledger.len(), 1, "{ledger:?}");
+    assert_eq!(
+        ledger[0].join("\t"),
+        format!("L\t{stamp}\tpointer\t-\tpointer\tpointer\tsending\tlight")
+    );
+    let text = fx.state("incidents");
+    let due = text
+        .lines()
+        .find(|l| l.contains("\tfinding:test:000000000001\t"))
+        .unwrap()
+        .split('\t')
+        .nth(28)
+        .unwrap()
+        .to_string();
+    assert_eq!(due, "-", "still due");
+}
+
+/// The journal lines of the hook's pointer whose result could not be recorded: a state lock held
+/// past the close's 10 s wait (`was not recorded: the state lock was busy`, nothing marked) and a
+/// claimed line gone by the close (`was not recorded in full`, the record still marked, since the
+/// message arrived). Neither names the ref, the target, the topic or an id.
+#[test]
+fn the_hooks_pointer_result_that_could_not_be_recorded_is_journalled_without_the_ref() {
+    for case in ["busy", "gone"] {
+        let fx = Fixture::v2();
+        std::fs::remove_file(fx.root.join("var/lib/propolis/witness/readcheck")).unwrap();
+        fx.light_pass_ago(1000);
+        fx.show(BACKUP, &show_answer("exit-code", "1", "no", "0"));
+        let lock = fx.state_lock();
+        let ledger = fx.root.join("var/lib/propolis/witness/send-ledger");
+        let during = format!("printf '#send-ledger v1 g=1\\n' > '{}'", ledger.display());
+        let extra: Vec<(&str, &str)> = if case == "busy" {
+            vec![("STUB_HOLD_LOCK", lock.to_str().unwrap())]
+        } else {
+            vec![("STUB_DURING", during.as_str())]
+        };
+        let out = fx.run(BACKUP, &v2_env(&extra));
+        if case == "busy" {
+            fx.release_holder();
+        }
+        assert_ok(&out);
+        assert_eq!(fx.tp_posts(), 1, "{case}: {}", fx.log());
+        let reference = fx
+            .v2_body(0)
+            .rsplit(" ref ")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(reference.len(), 6, "{case}");
+        let lines: Vec<String> = witness_lines(&fx.log())
+            .into_iter()
+            .filter(|l| l.contains("pointer message"))
+            .collect();
+        let want = if case == "busy" {
+            "the result of the pointer message (ok) was not recorded: the state lock was busy"
+        } else {
+            "the result of the pointer message (ok) was not recorded in full"
+        };
+        assert_eq!(lines.len(), 1, "{case}: {}", fx.log());
+        assert!(lines[0].contains(want), "{case}: {lines:?}");
+        for word in [
+            reference.as_str(),
+            "ntfy.example",
+            "propolis-ops",
+            "w#1",
+            "unit:",
+        ] {
+            assert!(!lines[0].contains(word), "{case} {word}: {lines:?}");
+        }
+        let f = fx.record(BACKUP);
+        if case == "busy" {
+            assert_eq!(f[28], "-", "nothing marked without the lock");
+            assert_eq!(fx.ledger()[0][6], "sending");
+        } else {
+            assert_eq!(f[28], reference, "marked: the message arrived");
+            assert!(fx.ledger().is_empty());
+        }
+    }
 }
 
 /// A withheld open (the pool's four an hour already spent on other keys) writes the W line that

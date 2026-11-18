@@ -105,6 +105,9 @@
 # itself, the hourly pass its own kinds' transitions. The retries, the hook's records, the storm
 # notice and the summary of what was withheld (below) and the daily message are the light
 # pass's; while the light pass is stale the hourly pass stands in for it and takes those too.
+# With the gate short of full none of those goes: the pass that sends for the host sends the
+# pointer message instead (below), the alias and a ref, at most once in 30 minutes, while an
+# incident it has not told of is open.
 # Its other network requests are the read check's GETs and the heartbeat URL's
 # GET, which carry no message, the GET of the daemon's /ready on loopback, and the read-only
 # database probe and hourly state session.
@@ -157,12 +160,13 @@
 # PROPOLIS_WITNESS_SOFT_DEADLINE replaces the 160 s by which every optional probe must end;
 # PROPOLIS_WITNESS_SPOOL_MAX replaces the 1024 entries one spool listing reads;
 # PROPOLIS_WITNESS_SEND_CUT replaces the 200 s (light) or 720 s (hourly) after which no incident
-# message, storm notice or summary is claimed for its post; PROPOLIS_WITNESS_POST_SECS counts
-# each claim of the send step, and the post of a storm notice or a summary, as taking that many
+# message, storm notice, summary or pointer message is claimed for its post;
+# PROPOLIS_WITNESS_POST_SECS counts each claim of the send step, and the post of a storm notice, a
+# summary or a pointer message, as taking that many
 # seconds, on the test clock and against the send cut, as posts in a row take time.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 14
+# needs-alert-lib: 15
 
 umask 077
 WITNESS_SELF="${BASH_SOURCE[0]}"
@@ -319,7 +323,8 @@ pa_unit_name_ok pa_incident_fold pa_env_get pa_sensor_logs pa_readcheck_binding 
 pa_readcheck_merge pa_pg pa_heartbeat_get pa_journal_patterns pa_jcursor_ok pa_vol_project pa_vol_judge
 pa_vol_stores pa_gate pa_daily_due pa_budget_admit pa_render pa_ledger_add pa_ledger_result
 pa_cred_fp pa_send pa_incident_admit pa_retry_due pa_ledger_retry pa_incident_result pa_budget_class
-pa_ledger_charge pa_w_line pa_notice_admit pa_notice_close pa_meta_value"
+pa_ledger_charge pa_w_line pa_notice_admit pa_notice_close pa_meta_value pa_pointer_claim
+pa_pointer_close"
 # shellcheck disable=SC2086 # the list is a fixed set of names
 unset -f $WITNESS_LIB_FUNCS
 # Loaded once in a subshell first: under set -u an unbound variable at the library's top level
@@ -380,13 +385,16 @@ LOCK_WAIT=60
 # summary after them is one more post on the same terms: none is claimed past the cut, its claim
 # waits 10 s at most and never past it, and its post, the lock for its result and its two notes
 # take the same 60 s, so it too ends by 260 s, and one that would start later waits for a later
-# pass. Then, once a day, the
+# pass. The pointer message takes the notice's place, never its time beside it: the notice goes
+# only with the gate full and the pointer only with it short of full, so a pass makes at most one
+# of the two posts, on the same terms. Then, once a day, the
 # daily message's post, 40 s, 30 s for the lock to note its result and a note, 5 s; then the
 # banner and the heartbeat URL's GET, 15 s, a note, 5 s, and 10 s for the lock to note its
 # result: 365 s at most, far inside the unit's 15 minutes (900 s). The hourly pass posts the
 # incident messages of its own kinds after its own 690 s, and the retries, the notice and the
 # daily message only while it stands in for a stale light pass: its incident messages and its
-# notice (cut at 720 s) end by 780 s, the daily message by 855 s, and its three notes by 870 s.
+# notice or pointer (cut at 720 s) end by 780 s, the daily message by 855 s, and its three notes
+# by 870 s.
 WITNESS_DEADLINE=240
 if [ "$INSTANCE" = hourly ]; then
     # The programs an hourly pass always runs each have their own limit: config-check 300 s; the
@@ -445,7 +453,8 @@ WITNESS_SOFT_DEADLINE=160
 if [ -n "$ROOT" ] && [[ ${PROPOLIS_WITNESS_SOFT_DEADLINE:-} =~ ^[0-9]{1,3}$ ]]; then
     WITNESS_SOFT_DEADLINE="$((10#$PROPOLIS_WITNESS_SOFT_DEADLINE))"
 fi
-# No incident message, storm notice or summary is claimed for its post once this many seconds
+# No incident message, storm notice, summary or pointer message is claimed for its post once this
+# many seconds
 # have gone (the sum is above WITNESS_DEADLINE): what is left stays as it was admitted, and a
 # later pass posts it.
 WITNESS_SEND_CUT=200
@@ -1796,8 +1805,8 @@ send_admit() {
         send_expire
     fi
     if [ "$SEND_V2" != 1 ] || [ "$SEND_GATE" != full ]; then
-        # The pointer message for a gate short of full is the profile switch's: until then the
-        # transition is only recorded.
+        # A gate short of full sends no incident message: the transition is only recorded, and
+        # the pointer step tells of what is due.
         TXQ=()
         return 0
     fi
@@ -2071,6 +2080,53 @@ notice_step() {
         1) note "the result of the $NOTICE_CLASS notice ($result) was not recorded" ;;
     esac
     [ "$result" = ok ] || note "$NOTICE_CLASS notice not delivered ($result)"
+    return 0
+}
+
+# ---- the pointer message (profile v2) -------------------------------------------------------
+#
+# With the gate short of full (the topic not proven private, or the detail setting pointer) no
+# incident message, storm notice, summary or daily message goes: the host tells its operator that
+# something needs attention with one message that carries the alias and a ref and nothing else,
+# priority 4. The library decides whether one is due (pa_pointer_claim: a PAGE or ACT incident
+# open and not yet told for its present occurrence) and holds the class to one attempt in 30
+# minutes whatever its result, so a server that fails every post is asked no more often. Only a
+# pass that sends for the host sends it, on the same terms as a notice: after the incident step
+# and within the send cut, claimed under the lock with the records read afresh, posted with the
+# lock released, its result written by pa_pointer_close, which on ok marks with the ref every
+# record the claim found due that is unchanged since. At most one a pass. The failure hook sends it too, from
+# its own locked path, under the same class.
+
+# pointer_step: the pointer message of a pass that sends for the host. See the section comment.
+# The claim's wait for the lock is 10 s and never past WITNESS_SEND_CUT, as a notice's is, so it
+# stays inside the pass's time sums. The journal line names the result alone, never the target,
+# the topic, the token, the ref, an instance or an incident id.
+pointer_step() {
+    local wait result rc=0
+    [ "$SEND_V2" = 1 ] || return 0
+    [ "$SEND_RETRY" = 1 ] && [[ $SEND_GATE == pointer:* ]] && [ "$SEND_LEDGER_BAD" = 0 ] || return 0
+    [ "${WHERE:-none}" != none ] || return 0
+    command -v curl > /dev/null 2>&1 || return 0
+    send_time_left || return 0
+    wait="$(send_lock_wait)" || return 0
+    pa_lock "$wait" || return 0
+    # The clock of the claim, as the notice step's: a pointer line the hook wrote since this pass
+    # began would read as ahead of the pass's own stamp, and so as no attempt at all.
+    pa_now
+    send_step_clock
+    pa_incident_load
+    pa_pointer_claim "$SEND_SENDER" || true
+    pa_unlock
+    [ "$PA_PTR" = send ] || return 0
+    pa_send "$PA_TITLE" "$PA_PRIO" < <(printf '%s\n' "$PA_BODY") || true
+    send_step_clock
+    result="$PA_SEND_RESULT"
+    pa_pointer_close "$PA_PTR_STAMP" "$PA_PTR_REF" "$result" "$SEND_SENDER" || rc=$?
+    case "$rc" in
+        2) note "the result of the pointer message ($result) was not recorded: the state lock was busy" ;;
+        1) note "the result of the pointer message ($result) was not recorded in full" ;;
+    esac
+    [ "$result" = ok ] || note "pointer message not delivered ($result)"
     return 0
 }
 
@@ -4665,6 +4721,15 @@ inc_class() {
     return 1
 }
 
+# stamp_elsewhere_ahead STAMP: STAMP is of another boot and its wall time is ahead of this
+# pass's: that boot's clock ran fast, and the stamp cannot be placed. A stamp of this boot can be
+# ahead of the pass's own only by the pass's length (the hook posts while a pass runs) and is
+# placed by uptime.
+stamp_elsewhere_ahead() {
+    _pa_stamp_split "${1:-}" && [[ ${PA_WALL:-} =~ ^[0-9]{1,12}$ ]] || return 1
+    [ "$_PA_B" != "${PA_BOOT:-}" ] && [ "$((10#$_PA_W))" -gt "$((10#$PA_WALL))" ]
+}
+
 # stamp_after STAMP REF: STAMP is later than REF (by uptime within a boot, by the wall clock across
 # boots); an empty REF is earlier than any stamp, and a STAMP out of form is never later.
 stamp_after() {
@@ -4676,35 +4741,79 @@ stamp_after() {
 }
 
 # ledger_perm REF SINCE: the cause, in the form the renderer reads (http.auth:403,
-# http.not_found:404, http.client:<code>), of the latest incident message a server refused for
-# good (perm:<code>) whose last attempt came after both stamps; nothing when there is none.
+# http.not_found:404, http.client:<code>), of the latest incident message or pointer message a
+# server refused for good (perm:<code>) whose attempt came after both stamps (an incident
+# message's last attempt, a pointer's stamp, the claim just before its one post), into
+# PERM_CAUSE, empty when there is none; PERM_AT is the latest of those attempts, which
+# judge_alert_path keeps as the record's cause_since so that the same refusals are not found again.
 ledger_perm() {
-    local t c r w code cause=""
-    while IFS=$'\t' read -r t _ c _ _ _ r _ _ w _; do
-        [ "$t" = L ] && inc_class "$c" && [[ ${r:-} =~ ^perm:([0-9]{3})$ ]] || continue
+    local t s c r w at code
+    PERM_CAUSE="" PERM_AT=""
+    while IFS=$'\t' read -r t s c _ _ _ r _ _ w _; do
+        [ "$t" = L ] && [[ ${r:-} =~ ^perm:([0-9]{3})$ ]] || continue
         code="${BASH_REMATCH[1]}"
-        if ! stamp_after "${w:-}" "$1" || ! stamp_after "$w" "$2"; then continue; fi
+        if inc_class "$c"; then
+            at="${w:-}"
+        elif [ "${c:-}" = pointer ]; then
+            at="${s:-}"
+        else
+            continue
+        fi
+        stamp_elsewhere_ahead "$at" && continue
+        if ! stamp_after "$at" "$1" || ! stamp_after "$at" "$2"; then continue; fi
         case "$code" in
-            401 | 403) cause="http.auth:$code" ;;
-            404) cause="http.not_found:$code" ;;
-            *) cause="http.client:$code" ;;
+            401 | 403) PERM_CAUSE="http.auth:$code" ;;
+            404) PERM_CAUSE="http.not_found:$code" ;;
+            *) PERM_CAUSE="http.client:$code" ;;
         esac
+        if [ -z "$PERM_AT" ] || stamp_after "$at" "$PERM_AT"; then PERM_AT="$at"; fi
     done < <(pa_state_read send-ledger)
-    printf '%s' "$cause"
 }
 
 # ledger_ok_after OPENED: a message of the shell senders got through (ok) on an attempt after
 # OPENED: an incident message, by its last attempt, or the witness's daily message (sender light
 # or hourly), by its stamp, the time it was claimed just before its one post (its line has no
-# attempt field). The daily message goes to the same target, so it is proof that it takes posts.
+# attempt field), and a pointer message of the witness or the hook, by its stamp in the same way.
+# Both go to the same target, so each is proof that it takes posts.
 ledger_ok_after() {
-    local t s c r m w
+    local t s c r m w at
     while IFS=$'\t' read -r t s c _ _ _ r m _ w _; do
         [ "$t" = L ] && [ "${r:-}" = ok ] || continue
         if inc_class "$c"; then
-            stamp_after "${w:-}" "$1" && return 0
+            at="${w:-}"
         elif [ "$c" = daily ]; then
-            case "${m:-}" in light | hourly) stamp_after "${s:-}" "$1" && return 0 ;; esac
+            case "${m:-}" in light | hourly) at="${s:-}" ;; *) continue ;; esac
+        elif [ "$c" = pointer ]; then
+            at="${s:-}"
+        else
+            continue
+        fi
+        stamp_elsewhere_ahead "$at" && continue
+        stamp_after "$at" "$1" && return 0
+    done < <(pa_state_read send-ledger)
+    return 1
+}
+
+# ledger_in_flight: a post may still be in flight: an incident line still pending whose last
+# attempt, or a pointer line still claimed whose stamp, is under 120 s old, or is of this boot
+# and later than this pass's own stamp (the hook posts while a pass runs). Its answer is not
+# known yet, and a refusal would be dated before anything this pass writes.
+ledger_in_flight() {
+    local t s c r w at a
+    while IFS=$'\t' read -r t s c _ _ _ r _ _ w _; do
+        [ "$t" = L ] || continue
+        if inc_class "$c" && [ "${r:-}" = pending ]; then
+            at="${w:-}"
+        elif [ "${c:-}" = pointer ] && [ "${r:-}" = sending ]; then
+            at="${s:-}"
+        else
+            continue
+        fi
+        a="$(pa_age "$at")"
+        if [ "$a" -ge 0 ]; then
+            [ "$a" -ge 120 ] || return 0
+        elif _pa_stamp_split "$at" && [ "$_PA_B" != - ] && [ "$_PA_B" = "${PA_BOOT:-}" ]; then
+            return 0
         fi
     done < <(pa_state_read send-ledger)
     return 1
@@ -4734,31 +4843,70 @@ ledger_undelivered() {
         # the record from it.
         case "$r" in pending | transient:[0-9][0-9][0-9]) ;; *) continue ;; esac
         best="$a"
-        case "$r" in
-            transient:5[0-9][0-9]) cause="http.server:${r#transient:}" ;;
-            transient:429) cause=http.rate:429 ;;
-            transient:408) cause=net.timeout ;;
-            transient:000) cause=net.connect ;;
-            *) cause=unknown ;;
-        esac
+        cause="$(undelivered_cause "$r")"
     done
     printf '%s' "$cause"
+}
+
+# undelivered_cause RESULT: the cause of a message still undelivered, from the last answer its
+# ledger line holds: a server's 5xx is http.server:<code>, 429 http.rate:429, 408 and a post with
+# no answer (000) net.timeout and net.connect; a claim never answered, or anything else, unknown.
+undelivered_cause() {
+    case "${1:-}" in
+        transient:5[0-9][0-9]) printf 'http.server:%s' "${1#transient:}" ;;
+        transient:429) printf http.rate:429 ;;
+        transient:408) printf net.timeout ;;
+        transient:000) printf net.connect ;;
+        *) printf unknown ;;
+    esac
+}
+
+# ledger_pointer_undelivered: the cause of a pointer message that has not got through, as a
+# transition undelivered for 15 minutes gives one: the latest pointer line not dated ahead of the
+# clock (an older one is no longer the push path's present state), when it holds a transient
+# answer or is still claimed (its post and result take at most 50 s, so one still claimed by
+# then was cut short), and is over 15 minutes and under an hour old. Nothing otherwise.
+# Without it a dead push path in pointer mode would open nothing: no incident message is
+# ever pending there.
+ledger_pointer_undelivered() {
+    local t s c r latest="" res="" a
+    while IFS=$'\t' read -r t s c _ _ _ r _; do
+        [ "$t" = L ] && [ "${c:-}" = pointer ] || continue
+        [ "$(pa_age "${s:-}")" -ge 0 ] || continue
+        if [ -z "$latest" ] || stamp_after "$s" "$latest"; then latest="$s" res="${r:-}"; fi
+    done < <(pa_state_read send-ledger)
+    [ -n "$latest" ] || return 0
+    a="$(pa_age "$latest")"
+    case "$res" in
+        transient:[0-9][0-9][0-9] | sending) ;;
+        *) return 0 ;;
+    esac
+    [ "$a" -gt 900 ] && [ "$a" -lt 3600 ] || return 0
+    undelivered_cause "$res"
 }
 
 # judge_alert_path: alert-path (alert:shell, PAGE) opens on first sight of a fact: the legacy hook
 # logged that it could not deliver an alert (cause from its reason: nocurl, net.connect or
 # unknown), or a failure hook failed (a failed propolis-alert@ instance whose failure is newer
 # than this key's last open or resolve; its own proc.* cause), and under profile v2 a server that
-# refused an incident message for good (ledger_perm) or a transition undelivered for more than 15
-# minutes (ledger_undelivered). It resolves sent2xx on a pass
-# whose reads all worked, on proof that an alert got through after the open (alert_delivered),
+# refused an incident message or a pointer message for good (ledger_perm), a transition
+# undelivered for more than 15 minutes (ledger_undelivered) or a pointer message that has not got
+# through for as long (ledger_pointer_undelivered). It resolves sent2xx on a pass
+# whose reads all worked, on proof that an alert got through after the open (alert_delivered;
+# under v2 after the cause the record holds, when that is later than the open),
 # with none of the legacy hook's undelivered files left (it removes its file once that unit's
 # alert goes out) and no failure hook failed since the open. Nothing seen is never the proof: a
 # hook killed by its time limit writes no undelivered file, and a reboot empties /run. Proof of a
 # delivery holds across a reboot, and a failed hook listed now that failed before the open, in its
-# boot, is the failure the record already holds.
+# boot, is the failure the record already holds. When it opens or changes from refusals for good,
+# the record's cause_since takes the latest of their attempts when that is later than its own: a
+# sender can be refused after this pass's stamp was taken (the hook posts while the pass is in
+# its unlocked probes), and without it that refusal would read as new on every pass and the
+# resolve would never be reached; a later refusal is still a new fact. Under v2 a record whose
+# cause moved is due a pointer again, it is not resolved while a post is in flight, and a ledger
+# line of another boot dated ahead of the clock is no fact (each said where it is done).
 judge_alert_path() {
-    local key=alert:shell cause="" st=none ref="" u since=""
+    local key=alert:shell cause="" st=none ref="" u since="" perm_at=""
     if pa_incident_get "$key"; then
         st="${PA_INC[7]}"
         case "$st" in
@@ -4766,14 +4914,17 @@ judge_alert_path() {
             resolved) ref="${PA_INC[21]}" ;;
         esac
     fi
-    # Under v2, an incident message the server refused, posted after the open or the resolve (and
-    # after the cause the record holds, so one refusal is one fact), by the witness or the hook;
-    # else a transition undelivered for more than 15 minutes.
+    # Under v2, an incident message or a pointer the server refused, posted after the open or the
+    # resolve (and after the cause the record holds, so one refusal is one fact), by the witness
+    # or the hook; else a transition undelivered for more than 15 minutes; else a pointer that has
+    # not got through for as long.
     if [ "$SEND_V2" = 1 ]; then
-        cause="$(ledger_perm "$ref" "$since")"
+        ledger_perm "$ref" "$since"
+        cause="$PERM_CAUSE" perm_at="$PERM_AT"
         [ -n "$cause" ] || cause="$(ledger_undelivered)"
+        [ -n "$cause" ] || cause="$(ledger_pointer_undelivered)"
     fi
-    if [ "$((HOOK_A + HOOK_B))" -gt 0 ]; then cause="${HOOK_CAUSE:-unknown}"; fi
+    if [ "$((HOOK_A + HOOK_B))" -gt 0 ]; then cause="${HOOK_CAUSE:-unknown}" perm_at=""; fi
     if [ "$AU_RESULT" = ok ]; then
         for u in "${!AU_IEM[@]}"; do
             # A failed state does not outlive a boot, so an instance failed in this one is newer
@@ -4785,15 +4936,22 @@ judge_alert_path() {
                     [ "${AU_IEM[$u]}" -gt "$((10#$_PA_U))" ] || continue
                 fi
             fi
-            cause="${AU_CAUSE[$u]}"
+            cause="${AU_CAUSE[$u]}" perm_at=""
         done
     fi
     if [ -n "$cause" ]; then
         rec_attrs alert-path PAGE alert "$cause"
         case "$st" in
-            open | acked) pa_incident_transition "$key" change && rec_set ;;
-            *) pa_incident_transition "$key" open && rec_set ;;
+            open | acked) pa_incident_transition "$key" change || return 0 ;;
+            *) pa_incident_transition "$key" open || return 0 ;;
         esac
+        if [ -n "$perm_at" ] && stamp_after "$perm_at" "${PA_INC[12]:-}"; then PA_INC[12]="$perm_at"; fi
+        # Under v2 a cause that moved needs a proof after it, and in pointer mode only a pointer
+        # that gets through is one, which goes only while a record is due: so the record is due
+        # again, though a change makes no other record so. Without it a record a pointer already
+        # told would wait for a proof that nothing would ever send.
+        if [ "$SEND_V2" = 1 ] && [ "${PA_INC[12]:-}" != "$since" ]; then PA_INC[28]=-; fi
+        rec_set
         return 0
     fi
     case "$st" in open | acked) ;; *) return 0 ;; esac
@@ -4805,6 +4963,13 @@ judge_alert_path() {
         # boot too and its uptime is later.
         [ "$_PA_B" != - ] && [ "$_PA_B" = "$PA_BOOT" ] && [ "${AU_IEM[$u]}" -le "$((10#$_PA_U))" ] || return 0
     done
+    # Under v2 the proof has to come after the cause the record holds, which a refusal can date
+    # later than the open: a message that got through before the server refused one says
+    # nothing of the path since.
+    if [ "$SEND_V2" = 1 ] && stamp_after "${PA_INC[12]:-}" "$ref"; then ref="${PA_INC[12]}"; fi
+    # And not while a post is in flight: one that is then refused would be dated before this
+    # resolve and never read. The next pass decides with its answer.
+    if [ "$SEND_V2" = 1 ] && ledger_in_flight; then return 0; fi
     alert_delivered "$ref" || return 0
     pa_incident_get "$key" || return 0
     PA_REC_PROOF=sent2xx
@@ -6503,6 +6668,7 @@ light_pass() {
     fi
     send_post
     notice_step
+    pointer_step
     daily_send
 
     PA_WHERE="$WHERE"
@@ -6669,6 +6835,7 @@ hourly_pass() {
     pa_unlock
     send_post
     notice_step
+    pointer_step
     daily_send
     [ "$CC_DONE" = 1 ] || note "config-check did not complete: ${CC_WHY:-exit $CC_RC}"
     [ "$CC_BAD" = 0 ] || note "config-check printed $CC_BAD finding lines that are not in its form; skipped, and no finding they could be is taken as gone"

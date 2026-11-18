@@ -26,8 +26,9 @@
 # (pa_vol_project, pa_vol_judge), for the same reason; the incident record; the failure hook's
 # record step (pa_hook_record), which the hook runs in a child process of its own; the hook's two
 # children of profile v2, the decision (pa_hook_profile) and the v2 path (pa_hook_v2); and the
-# storm notice, the summaries and the pointer message of profile v2, with their admission, which
-# no script calls yet.
+# storm notice, the summaries and the pointer message of profile v2, with their admission and the
+# pointer's rules (pa_pointer_claim, pa_pointer_close), which only the witness and the hook's v2
+# path call, and only under the test seam in this release.
 #
 # TEMPORARY FILES. A function that makes one appends its path to PA_CLEANUP. Each caller's single
 # EXIT handler runs pa_cleanup, which removes them.
@@ -45,7 +46,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=14
+PA_LIB_VERSION=15
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -2747,10 +2748,12 @@ _pa_reopen_window() {
 # _pa_opened: the current record opens now: from a first sighting, or as a reopen when it still
 # holds the resolve of an earlier open (a pending record kept inside its reopen window). A reopen
 # keeps the id, clears the acknowledgement and counts reopens within 24 h of the first; the third
-# holds the next resolve until its proof has held an hour (hold_until).
+# holds the next resolve until its proof has held an hour (hold_until). The ref (field 28) goes
+# back to `-` on every open: a pointer's ref tells of the occurrence it was claimed after, and a
+# reopen keeps the id, so a ref left from the occurrence before would read this one as told.
 _pa_opened() {
     local first
-    PA_INC[9]="$PA_STAMP" PA_INC[18]=0
+    PA_INC[9]="$PA_STAMP" PA_INC[18]=0 PA_INC[28]=-
     if [ "${PA_INC[21]:--}" != - ]; then
         first="${PA_INC[24]:--}"
         if [ "$first" = - ] || [ "$(pa_age "$first")" -lt 0 ] || [ "$(pa_age "$first")" -gt 86400 ]; then
@@ -3809,14 +3812,15 @@ _pa_ledger_ages() {
 
 # _pa_exempt_caps CLASS: `<window seconds> <limit>` pairs of an exempt class: storm 1 in 6 h,
 # summary 1 an hour and 12 a day, switch 1 a day where the time of the switch is not known
-# (_pa_switch_held decides it otherwise), pointer 2 an hour and 48 a day (a bound under
-# whatever rules its senders bring).
+# (_pa_switch_held decides it otherwise), pointer 1 in 30 minutes, 2 an hour and 48 a day. The
+# pointer's half hour is its rate, whatever an attempt's result: a transient answer does not
+# prove that nothing arrived, and a server that fails every post must not be asked more often.
 _pa_exempt_caps() {
     case "${1:-}" in
         storm) printf '21600 1' ;;
         summary) printf '3600 1 86400 12' ;;
         switch) printf '86400 1' ;;
-        pointer) printf '3600 2 86400 48' ;;
+        pointer) printf '1800 1 3600 2 86400 48' ;;
         *) return 1 ;;
     esac
 }
@@ -5682,9 +5686,11 @@ pa_notice_admit() {
 # pa_notice_result STAMP CLASS RESULT SENDER: the result of the post pa_notice_admit claimed at
 # STAMP, written into its ledger line under the lock (10 s), which the caller does not hold.
 # Status 0 when written, 1 when no claimed line of that class and stamp is left, 2 for a class not
-# of the four or when the lock was not had: the line then stays claimed, and counted.
+# of the four or when the lock was not had: the line then stays claimed, and counted. The pointer
+# message is refused here: its result decides which records it told (pa_pointer_close).
 pa_notice_result() {
     local rc=0
+    [ "${2:-}" != pointer ] || return 2
     _pa_notice_mode "${2:-}" > /dev/null || return 2
     pa_lock 10 || return 2
     pa_ledger_result "${1:-}" "$2" "${3:-}" "${4:-}" || rc=1
@@ -5699,9 +5705,11 @@ pa_notice_result() {
 # notice lists it, one written in the same second twice rather than never. A key moved under a
 # lock of its own could fall to another writer in between; and a post that failed, a result that
 # was not written or a lock not had leaves the key as it was, so those lines are listed again.
-# The switch summary and the pointer message keep no key here. Statuses as pa_notice_result's.
+# The switch summary keeps no key here, and the pointer message is refused, as pa_notice_result
+# refuses it. Statuses as pa_notice_result's.
 pa_notice_close() {
     local rc=0
+    [ "${2:-}" != pointer ] || return 2
     _pa_notice_mode "${2:-}" > /dev/null || return 2
     pa_lock 10 || return 2
     if pa_ledger_result "${1:-}" "$2" "${3:-}" "${4:-}"; then
@@ -5746,12 +5754,176 @@ pa_meta_value() {
 
 # pa_meta_put KEY VALUE: sets meta KEY, one of the five of _pa_meta_form but pointer_last, to
 # VALUE when VALUE has its form; status 2, nothing written, otherwise. pointer_last stands for a
-# pointer that arrived, so only the step that records a pointer's result writes it; that step
-# comes with the pointer's senders, so nothing writes it yet. The caller holds the lock.
+# pointer that arrived, so only the step that records a pointer's result writes it
+# (pa_pointer_close). The caller holds the lock.
 pa_meta_put() {
     [ "${1:-}" != pointer_last ] || return 2
     _pa_meta_form "${1:-}" "${2:-}" || return 2
     _pa_meta_set "$1" "$2"
+}
+
+# ---- the pointer message -----------------------------------------------------------------------
+#
+# Under profile v2 with a gate short of full (the topic not proven private, or the detail setting
+# pointer) a sender tells its operator that something needs attention with one message that
+# carries the alias and a ref and nothing else. A record is due while it is open (not pending,
+# acknowledged or resolved), PAGE or ACT, counts (_pa_counts: no parent, not a duplicate) and has
+# not been told for its present occurrence: told means a ref of 6 lower-case hex in field 28,
+# which an open or a reopen sets back to `-` (_pa_opened). A record whose line is not whole is
+# never due, since none of its fields can be placed. The rule reads the record's state, not what
+# a pass did to it: a reminder or a resolve makes nothing due, and a change makes a record due
+# only when it raises one that never counted to ACT or PAGE (a NOTICE record whose tier rose),
+# which was never told. One record is made due again after it was told, by the witness's
+# alert-path judge: alert-path, once a new fact moves its cause, since in pointer mode only a
+# pointer that gets through can prove the path, and none goes while nothing is due. A record
+# stays due on every pass until a pointer that covers it got ok.
+# One attempt in 30 minutes per host whatever its result, two an hour, 48 a day: the class's caps
+# (_pa_exempt_caps), which a claim and every counted result hold. The half hour is a rate and
+# never a cover: a pointer covers what its claim saw due (PA_PTR_KEYS), and nothing a stamp says,
+# since an opener's stamp (field 9) is taken before its lock and can be older than the claim of a
+# message that never told of it. A record that became due after the claim, or that reopened
+# before the close, stays due and the next pointer tells of it.
+
+# _pa_inc_at I: the record at place I among those in memory, into PA_INC, PA_INC_AT and
+# PA_INC_EXTRA, as pa_incident_get reads one. Status 1 when there is none.
+_pa_inc_at() {
+    local -a f
+    PA_INC=() PA_INC_AT=-1 PA_INC_EXTRA=""
+    [ -n "${_PA_INC_I[$1]+set}" ] || return 1
+    IFS=$'\t' read -r -a f <<< "${_PA_INC_I[$1]}"
+    PA_INC=("${f[@]:0:35}")
+    while [ "${#PA_INC[@]}" -lt 35 ]; do PA_INC+=(-); done
+    if [ "${#f[@]}" -gt 35 ]; then
+        PA_INC_EXTRA="$(
+            IFS=$'\t'
+            printf '%s' "${f[*]:35}"
+        )"
+    fi
+    PA_INC_AT="$1"
+}
+
+# _pa_ptr_due: the current record is due a pointer (see the section comment).
+_pa_ptr_due() {
+    _pa_inc_whole && [ "${PA_INC[7]:-}" = open ] || return 1
+    case "${PA_INC[6]:-}" in PAGE | ACT) ;; *) return 1 ;; esac
+    _pa_counts || return 1
+    ! [[ ${PA_INC[28]:-} =~ ^[0-9a-f]{6}$ ]]
+}
+
+# _pa_not_after A B: stamp A is not after stamp B. Within one boot by uptime; across boots a stamp
+# of this boot (PA_BOOT) is after one of an earlier boot whatever the wall clock says, as a clock
+# that came up behind would say otherwise; two stamps of other boots go by the wall clock. An A
+# that cannot be placed is after. Only meta pointer_last's forward rule reads it: no stamp
+# decides which records a pointer told.
+_pa_not_after() {
+    local w b u
+    _pa_stamp_split "${1:-}" || return 1
+    w="$_PA_W" b="$_PA_B" u="$_PA_U"
+    _pa_stamp_split "${2:-}" || return 1
+    if [ "$b" != - ] && [ "$b" = "$_PA_B" ]; then
+        [ "$((10#$u))" -le "$((10#$_PA_U))" ]
+    elif [ "$b" != - ] && [ "$_PA_B" != - ] && [ "$_PA_B" = "${PA_BOOT:-}" ]; then
+        return 0
+    elif [ "$b" != - ] && [ "$_PA_B" != - ] && [ "$b" = "${PA_BOOT:-}" ]; then
+        return 1
+    else
+        [ "$((10#$w))" -le "$((10#$_PA_W))" ]
+    fi
+}
+
+# pa_pointer_claim SENDER: whether SENDER (hook, light, hourly) sends a pointer now, under the
+# caller's lock, with the time taken afresh and the records loaded (pa_incident_load). Sets
+# PA_PTR_KEYS to what is due at this moment, one line per record, its key (field 2), a tab and
+# its last open (field 9) as stored: the one list pa_pointer_close marks from. Sets PA_PTR: none
+# when nothing is due; else withhold:noref when no fresh ref can be made, withhold:norender when
+# the message cannot be rendered, or the verdict of the class's admission (pa_notice_admit
+# pointer SENDER), which claims the ledger line `L stamp pointer - pointer pointer sending SENDER`
+# before the post; on admit PA_PTR is send, with PA_PTR_REF, PA_PTR_STAMP (the claim's stamp) and
+# the message in PA_TITLE, PA_PRIO and PA_BODY, to be posted with the lock released and its
+# result written by pa_pointer_close in this same process. Status 0 only for send. It writes no
+# record and no meta key.
+pa_pointer_claim() {
+    local sender="${1:-}" i ref
+    PA_PTR="" PA_PTR_REF="" PA_PTR_STAMP="" PA_PTR_KEYS="" PA_TITLE="" PA_PRIO="" PA_BODY=""
+    if declare -p _PA_INC_I > /dev/null 2>&1; then
+        for i in "${!_PA_INC_I[@]}"; do
+            _pa_inc_at "$i" || continue
+            _pa_ptr_due || continue
+            PA_PTR_KEYS+="${PA_PTR_KEYS:+$'\n'}${PA_INC[2]}"$'\t'"${PA_INC[9]}"
+        done
+    fi
+    PA_INC=() PA_INC_AT=-1 PA_INC_EXTRA=""
+    if [ -z "$PA_PTR_KEYS" ]; then
+        PA_PTR=none
+        return 1
+    fi
+    if ! ref="$(pa_ref)"; then
+        PA_PTR=withhold:noref
+        return 1
+    fi
+    if ! pa_render pointer pointer "$ref"; then
+        PA_PTR=withhold:norender
+        return 1
+    fi
+    if ! pa_notice_admit pointer "$sender" > /dev/null; then
+        PA_PTR="$PA_ADMIT_VERDICT" PA_TITLE="" PA_PRIO="" PA_BODY=""
+        return 1
+    fi
+    PA_PTR=send PA_PTR_REF="$ref" PA_PTR_STAMP="$PA_NOTICE_STAMP"
+    return 0
+}
+
+# pa_pointer_close STAMP REF RESULT SENDER: the result of the pointer claimed at STAMP with REF,
+# in one locked section (10 s), which the caller does not hold. It writes the ledger line's result;
+# then, only for ok and only when STAMP is the claim this same process made (PA_PTR_STAMP), it
+# loads the records afresh and writes REF into every record whose key the claim listed
+# (PA_PTR_KEYS), that is still due, and whose last open (field 9) is byte for byte the one listed:
+# a record that became due after the claim (written later, whatever its stamp; a NOTICE that rose
+# to ACT or PAGE) is not listed, and one that reopened since no longer matches, so neither was
+# told by this message and both stay due. A process that dies between its claim and its close
+# marks nothing. The records are marked even when the ledger line's result could not be written,
+# since the message arrived; they are written once, and a write that fails leaves them as they
+# were on disk, due and never told. Last, meta pointer_last takes `STAMP/REF` only when that is
+# later than the stamp stored there or what is stored is out of form, so an older claim's result
+# written after a newer pointer's leaves the newer one; this is the key's one writer. A pointer
+# that got ok sets no delivered_open: once the gate is full again a record's late open and its
+# reminders still go in full. Status 0 when everything was written, 1 when a part was not, 2 for
+# a STAMP or REF out of form or a lock not had: nothing is then written, and the line stays
+# claimed and counted.
+pa_pointer_close() {
+    local stamp="${1:-}" ref="${2:-}" result="${3:-}" sender="${4:-}" rc=0 i marked=0 old k v
+    local -A listed=()
+    _pa_stamp_split "$stamp" && [[ $ref =~ ^[0-9a-f]{6}$ ]] || return 2
+    pa_lock 10 || return 2
+    pa_ledger_result "$stamp" pointer "$result" "$sender" || rc=1
+    if [ "$result" = ok ]; then
+        if [ "$stamp" = "${PA_PTR_STAMP:-}" ]; then
+            while IFS=$'\t' read -r k v; do
+                [ -z "$k" ] || listed["$k"]="$v"
+            done <<< "${PA_PTR_KEYS:-}"
+        fi
+        if [ "${#listed[@]}" != 0 ]; then
+            pa_incident_load
+            for i in "${!_PA_INC_I[@]}"; do
+                _pa_inc_at "$i" || continue
+                k="${PA_INC[2]:-}"
+                if [ -z "$k" ] || [ -z "${listed[$k]+set}" ] || [ "${listed[$k]}" != "${PA_INC[9]:-}" ] \
+                    || ! _pa_ptr_due; then
+                    continue
+                fi
+                PA_INC[28]="$ref"
+                if pa_incident_set; then marked=1; else rc=1; fi
+            done
+            PA_INC=() PA_INC_AT=-1 PA_INC_EXTRA=""
+            if [ "$marked" = 1 ] && ! pa_incident_write; then rc=1; fi
+        fi
+        old="$(_pa_meta_get pointer_last)"
+        if ! _pa_meta_form pointer_last "$old" || ! _pa_not_after "$stamp" "${old%/*}"; then
+            _pa_meta_set pointer_last "$stamp/$ref" || rc=1
+        fi
+    fi
+    pa_unlock
+    return "$rc"
 }
 
 # ---- the failure hook under profile v2 ---------------------------------------------------------
@@ -5863,8 +6035,12 @@ _pa_hv2_firing() {
 # tier rose), which is a change. A transition that sends is claimed under the lock
 # (pa_incident_admit: its pending ledger line, then the record's pending transition), posted with
 # the lock released, and its result written under the lock again (_pa_hv2_result). The record the
-# hook opens carries the flag hookopen. With the gate anything but full the transition is only
-# recorded; a withheld one leaves its W line. A change while the incident's open or reopen is
+# hook opens carries the flag hookopen. With the gate pointer the transition is recorded and,
+# once the records are written, the pointer message is claimed under the same lock and posted
+# with it released (_pa_hv2_pointer); with no target it is only recorded; a withheld incident
+# message leaves its W line. Nothing goes in pointer mode on the lockless path or in journal
+# mode: no ledger keeps the pointer's rate there, and the light pass takes in the spooled firing
+# within five minutes and sends the pointer itself. A change while the incident's open or reopen is
 # still pending (not yet through) is only recorded, and the pending transition is left for the
 # retry, so the open is neither lost nor sent twice. A first
 # sighting or a claim that neither directory takes is sent with the journal as the memory
@@ -5952,6 +6128,11 @@ pa_hook_v2() {
         esac
         return 0
     fi
+    # With the gate pointer no incident message goes: the pointer path tells of what is due.
+    if [[ $gate == pointer:* ]]; then
+        _pa_hv2_pointer "$unit"
+        return 0
+    fi
     if [ "$whole" = 0 ] || [ "$gate" != full ] || [ "$held" = 1 ] \
         || ! [[ $PA_TX_DONE == open || $PA_TX_DONE == change ]]; then
         # A first sighting that neither directory took cannot be kept for a light pass to judge,
@@ -6014,18 +6195,46 @@ pa_hook_v2() {
     return 0
 }
 
-# _pa_hv2_write UNIT: the records in memory written, where they landed noted in meta, and the
-# lock released; one journal line, status 1 and PA_WHERE left as the write set it when they could
-# not be written. Sends nothing.
+# _pa_hv2_write UNIT [held]: the records in memory written, where they landed noted in meta, and
+# the lock released, unless the word held keeps it for a caller that goes on under it after a
+# write that worked; one journal line, status 1, the lock released and PA_WHERE left as the write
+# set it when they could not be written. Sends nothing.
 _pa_hv2_write() {
     local rc=0
     pa_incident_write || rc=$?
     [ "$rc" != 0 ] || _pa_meta_set where "${PA_WHERE:-none}" > /dev/null 2>&1 || true
-    pa_unlock
+    [ "$rc" = 0 ] && [ "${2:-}" = held ] || pa_unlock
     if [ "$rc" != 0 ]; then
         _pa_hook_unrecorded "$1" "neither the state directory nor /run took the write"
         return 1
     fi
+    return 0
+}
+
+# _pa_hv2_pointer UNIT: the firing under a gate short of full, still under the lock, with its
+# transition applied in memory: the records are written first, and only once they are on disk is
+# a pointer claimed, under that same lock, with the time taken afresh (pa_pointer_claim hook): a
+# claim made over records that could not be kept would tell of an incident no pass can find, and
+# the hook's own stamp, taken before its role read, its gate and its wait for the lock, would
+# read a pointer line another sender wrote since as ahead of it. The lock is released, the
+# pointer posted with the hook's own poster and its result written by pa_pointer_close, which
+# marks what this claim saw due. Nothing else is sent: no incident message, no W line. A journal
+# line names the result alone, never the target, the topic, the token, the ref or an id.
+_pa_hv2_pointer() {
+    local unit="$1" rc=0 result
+    _pa_hv2_write "$unit" held || return 0
+    pa_now
+    pa_pointer_claim hook || true
+    pa_unlock
+    [ "$PA_PTR" = send ] || return 0
+    _pa_hv2_post "$PA_TITLE" "$PA_PRIO" "$PA_BODY" || true
+    result="$PA_SEND_RESULT"
+    pa_pointer_close "$PA_PTR_STAMP" "$PA_PTR_REF" "$result" hook || rc=$?
+    case "$rc" in
+        2) _pa_hv2_log "the result of the pointer message ($result) was not recorded: the state lock was busy" ;;
+        1) _pa_hv2_log "the result of the pointer message ($result) was not recorded in full" ;;
+    esac
+    [ "$result" = ok ] || _pa_hv2_log "pointer message not delivered ($result)"
     return 0
 }
 

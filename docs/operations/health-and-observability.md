@@ -517,17 +517,15 @@ transition that adds to `would_push` in the default profile is sent as an incide
 (`deploy/witness.sh#send_admit`, `deploy/witness.sh#send_post`), and nothing else changes:
 
 - Under the state lock, in the same locked section that applied the transitions, the gate is
-  asked once; with it short of full nothing is admitted or sent and the transition is only
-  recorded. Otherwise each transition is put to the send budget
+  asked once; with it short of full no incident message is admitted or sent and the transition is
+  only recorded (the pointer message below tells of it). Otherwise each transition is put to the
+  send budget
   (`deploy/alert-lib.sh#pa_incident_admit`): an admitted one gets its `pending` line in the send
   ledger and then its pending transition in the record, both written before anything is posted;
   a withheld one gets a `W` line in the incidents file naming the budget's reason (none for a
   RESOLVED whose open never got through), stamped when it is written
   (`deploy/alert-lib.sh#pa_w_line`, the one writer of a `W` line, the failure hook's included);
-  the storm notice and the summary below list them. The library also holds the pointer message
-  for a topic not proven private, with a ref and nothing else (`deploy/alert-lib.sh#pa_render`),
-  and can admit and record it in its own budget class (`deploy/alert-lib.sh#pa_notice_admit`).
-  Nothing sends it yet: the rules for when a pointer is sent come with its senders. A record
+  the storm notice and the summary below list them. A record
   that is not whole, a kind the tables do not
   know and a send ledger no copy of which can be read are each withheld, never sent. A change or
   a reminder of an incident whose open or reopen is still pending is only recorded: the retry of
@@ -578,11 +576,84 @@ transition that adds to `would_push` in the default profile is sent as an incide
   once do not tell the same lines twice. No notice is claimed once the pass's send cut has
   passed; a later pass sends it. With the gate short of full (pointer mode) there is neither a
   storm notice nor a summary: pointers are not withheld by the pool or the listener caps.
+- **Pointer mode.** When the gate is short of full (`gate pointer:<reason>`: the topic is not
+  proven private, or `PROPOLIS_OPS_PUSH_DETAIL=pointer`, which on a topic proven private is a gate
+  short of full like any other), no incident message, storm notice, summary or daily message
+  goes. Instead the host tells its operator that something needs attention with one message,
+  `<alias>: needs attention` at priority 4, whose body is `Run the status command on <alias>. ref
+  <ref>`: the alias and a fresh 6-hex ref, and never a tier, a time, an incident id, a stage, a
+  count, a unit, a host name or anything the host holds. With the gate full, or with no target
+  (`none:notarget`), no pointer is sent. Pointer messages go to the configured URL even when it is
+  plain http (`gate pointer:insecure`), as today's failure hook posts there, and then carry the
+  access token in clear on the network path, as today's hook does: use https.
+  - **When one is due.** A record is due while it is open (not pending, acknowledged or
+    resolved), PAGE or ACT, counts (not folded under a parent, not a standing duplicate) and has
+    not been told for its present occurrence: its `ref` field holds no 6-hex ref, which an open
+    or a reopen sets back to `-`. A record whose stored line is not whole is never due. The rule
+    reads each record's state, not what a pass did: a reminder or a resolve makes nothing due,
+    and a change makes a record due only when it raises one that never counted to ACT or PAGE (a
+    NOTICE record whose tier rose), which was never told. One record is due again after it was
+    told: `alert-path`, once a new fact moves its cause, since only a pointer that gets through
+    can prove the path (below). A record stays due on every pass until a pointer that covers it
+    got `ok`.
+  - **The rate.** One attempt in 30 minutes per host whatever its result, two an hour, 48 a day,
+    from the witness and the failure hook together: the claim (`sending`) and every answer
+    counted (`ok`, a refusal, a transient answer) hold the next attempt, so a pointer in flight,
+    one cut short and one a server failed are each one attempt, and two senders at once claim one
+    between them. A transient answer does not prove that nothing arrived, so it is not tried
+    again sooner. The 30 minutes are a rate, never a cover: a pointer covers what its claim saw
+    due, the key and the last open of each such record as stored at the claim, and nothing a
+    stamp says, so an incident written after the claim (whatever time its opener stamped it
+    with) stays due and the next pointer, 30 minutes after the first, tells of it. On `ok` the
+    ref is written into every record the claim listed that is still due with the same last open
+    (`deploy/alert-lib.sh#pa_pointer_close`), and meta `pointer_last` takes the claim's stamp
+    and the ref, only ever moving forward. A record that reopened, or rose to ACT or PAGE, after
+    the claim is not marked by it. A write of the records that fails leaves them due; a pass
+    killed between its claim and its result marks nothing, leaves the line claimed and the
+    records due, and the next pointer goes 30 minutes later.
+  - **Who sends it.** The pass that sends for the host (the light pass, or the hourly pass while it
+    stands in for a stale light pass) after its incident step and within its send cut
+    (`deploy/witness.sh#pointer_step`): claimed under the lock with the records read afresh
+    (`deploy/alert-lib.sh#pa_pointer_claim`), posted with the lock released, its result written
+    under the lock. The failure hook's v2 path claims one on its locked path once the firing's
+    record is written, under the same lock, and posts it with the lock released. Journal lines
+    name the result alone, never the target, the topic, the token, the ref, an instance or an
+    incident id.
+  - **What it costs the operator.** No reminders, no storm notice or summary and no daily
+    message: a pointer that was missed is learnt of only from the banner or the walk. On a topic
+    anyone can read, one pointer gives an onset, to within seconds when the failure hook sends it
+    and within five minutes otherwise; pointers that repeat each half hour (a server that takes
+    the message and then answers an error, a server that fails, the `alert-path` record's own
+    pointer) show that something is still open, and so roughly for how long. A private topic,
+    which `--setup` recommends, avoids both.
+  - **Limits.** A host that falls from full detail with incidents open sends one pointer for
+    them though their opens went in full (no fact is kept for "told in full"). The failure hook
+    sends no pointer when the state lock is busy or when neither the state directory nor `/run`
+    takes a write: the light pass takes in its spooled firing within five minutes and sends the
+    pointer, and a host where no directory takes a write sends nothing in pointer mode. A record
+    whose stored line was damaged is stored whole again by the sender that next writes it, and
+    when what is left no longer reads as a record that counts, nothing is told of it under either
+    detail level; the walk shows it. A server that refuses every post is still tried 48 times a
+    day while a record is due.
 - `alert-path` opens on the next light pass when a server refused a message for good
-  (`perm:<code>`, the cause the message names, such as `http.auth:403`) or when a transition has
-  been undelivered for more than 15 minutes (the cause its last answer names: `http.server:<code>`
-  for a 5xx, `net.connect` for no answer). A later incident message or daily message that gets
-  through resolves it (`sent2xx`).
+  (`perm:<code>`, the cause the message names, such as `http.auth:403`), an incident message or a
+  pointer, or when a transition has been undelivered for more than 15 minutes (the cause its last
+  answer names: `http.server:<code>` for a 5xx, `net.connect` for no answer). In pointer mode,
+  where nothing is pending, the latest pointer line not dated ahead of the clock opens it the
+  same way when it holds a transient answer, or is still claimed (the cause then reads unknown),
+  and is between 15 minutes and an hour old. A line of another boot dated ahead of the clock is
+  read neither as a refusal nor as a delivery. A refusal is one fact:
+  the record's `cause_since` takes the latest attempt of the refusals it was opened or changed
+  from, so the same refusal is not found again on every pass (a sender can be refused after the
+  pass's own clock was read), while a later refusal is still read. An incident message, daily
+  message or pointer that gets through after the open, and under `v2` after the cause the record
+  holds when that is later, resolves it (`sent2xx`): a message that got through before the
+  server refused one proves nothing of the path since. Under `v2` it is not resolved on a pass
+  that finds a post still in flight (claimed under 120 s ago, or since the pass began), whose
+  refusal would otherwise never be read; the next pass decides. In pointer mode only a pointer
+  that gets through is such a proof, so an `alert-path` record a pointer already told is due
+  again once its cause moves (a refusal, or a cause of another kind): the next pointer tells of
+  it, and its `ok` resolves it. Under the default profile no pointer line is read.
 - Each pending transition, the hook's among them, in id order: at least 120 s after its
   admission and its last attempt it is claimed again under the lock (its ledger line rewritten,
   none added, so a retry is never counted twice) and posted. An hour after its admission, at once
@@ -593,8 +664,8 @@ transition that adds to `would_push` in the default profile is sent as an incide
   left as the previous release leaves it.
 - No claim starts once the pass has run 200 s, and its wait for the lock ends by then; what is
   claimed is posted, and what is left stays as it was admitted for a later pass. The storm
-  notice or summary is claimed by the same rule, after the incident messages, so it adds no time
-  past the last post the cut allows. Each post is
+  notice or summary, or in pointer mode the pointer in its place, is claimed by the same rule,
+  after the incident messages, so it adds no time past the last post the cut allows. Each post is
   bounded by the sender's 40 s, each lock wait by 10 s and each journal line by 5 s, so a light
   pass ends by 365 s with the daily message and the heartbeat URL, inside the unit's 15 minutes.
 - A message the failure hook sent without the lock is charged to the send ledger once, when the

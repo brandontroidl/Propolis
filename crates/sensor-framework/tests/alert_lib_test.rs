@@ -377,7 +377,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "14");
+    assert_eq!(version, "15");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);
@@ -11406,11 +11406,14 @@ fn a_role_out_of_its_list_reads_unknown() {
 /// library, the witness's notice step: notice_since reads their meta keys (pa_meta_value),
 /// notice_claim renders and admits them (pa_render, pa_notice_admit), notice_step writes the
 /// result and the key (pa_notice_close), and notice_step does nothing unless SEND_V2 is 1, the
-/// pass retries (sends for the host) and the gate is full. The switch summary and the pointer
-/// message (their renderers, the W-line reader, the result written alone, the meta key writer)
-/// are called by no script at all: no other function renders a notice (pa_render with a class
-/// other than the test page's and the daily message's), asks the budget about its class, or names
-/// one of their functions.
+/// pass retries (sends for the host) and the gate is full. The pointer message has two callers,
+/// the witness's pointer step and the hook's pointer path in the library (pointer_step and
+/// _pa_hv2_pointer name pa_pointer_claim and pa_pointer_close, which render and admit it), and
+/// the pointer step does nothing unless SEND_V2 is 1, the pass sends for the host and the gate is
+/// pointer. The switch summary (its renderer, the W-line reader, the result written alone, the
+/// meta key writer) is called by no script at all: no other function renders a notice (pa_render
+/// with a class other than the test page's and the daily message's), asks the budget about its
+/// class, or names one of their functions.
 #[test]
 fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
@@ -11430,6 +11433,7 @@ fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
                 | "_pa_render_withheld"
                 | "pa_notice_admit"
                 | "pa_notice_close"
+                | "pa_pointer_claim"
         ) || f.starts_with("_pa_hv2_")
     };
     // Which of the guarded names each part of the witness's send step may use: send_expire, which
@@ -11481,6 +11485,24 @@ fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
         ],
         "the notice step does nothing under legacy, on a pass that does not send for the host, \
          or with the gate short of full"
+    );
+    let pointer: Vec<&str> = witness
+        .split("\npointer_step() {\n")
+        .nth(1)
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("local "))
+        .take(2)
+        .collect();
+    assert_eq!(
+        pointer,
+        [
+            "[ \"$SEND_V2\" = 1 ] || return 0",
+            "[ \"$SEND_RETRY\" = 1 ] && [[ $SEND_GATE == pointer:* ]] && [ \"$SEND_LEDGER_BAD\" = 0 ] || return 0"
+        ],
+        "the pointer step does nothing under legacy, on a pass that does not send for the host, \
+         or with a gate other than pointer"
     );
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -11559,6 +11581,13 @@ fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
                         found.push(format!("{name}: {t}"));
                     }
                 }
+                if name != "alert-lib.sh" {
+                    for f in POINTER_NAMES {
+                        if t.contains(f) {
+                            found.push(format!("{name}: {t}"));
+                        }
+                    }
+                }
             }
             // Each use of a function, wherever it stands on the line (after `$(`, `if`, `!` or
             // an assignment), with the words that follow it: a list of names is no call.
@@ -11597,6 +11626,9 @@ fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
     }
     assert!(seen >= 6, "the scripts in deploy/");
     found.extend(notice_calls_out_of_place(&witness));
+    found.extend(pointer_calls_out_of_place(&witness, "pointer_step"));
+    let lib = std::fs::read_to_string(LIB).unwrap();
+    found.extend(pointer_calls_out_of_place(&lib, "_pa_hv2_pointer"));
     assert!(found.is_empty(), "calls of the new code: {found:#?}");
     // In the hook: the decision first, then the v2 child, once each.
     let profile: Vec<usize> = hook_lines
@@ -11619,6 +11651,88 @@ fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
 /// The library functions of the storm notice and the summary that only the witness's notice step
 /// may name, each in one function of it.
 const NOTICE_STEP_NAMES: [&str; 3] = ["pa_notice_admit", "pa_notice_close", "pa_meta_value"];
+
+/// The pointer message's claim and close, which only the witness's pointer step and the failure
+/// hook's pointer path (in the library) may name.
+const POINTER_NAMES: [&str; 2] = ["pa_pointer_claim", "pa_pointer_close"];
+
+/// Every line of TEXT (the witness, or the library) that names one of POINTER_NAMES outside the
+/// function OWN, as `<function>: <line>`. Comments, the lines that define the two functions and
+/// the witness's list of the library functions it needs are passed over.
+fn pointer_calls_out_of_place(text: &str, own: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut function = String::new();
+    let mut in_list = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(f) = t.strip_suffix("() {")
+            && !line.starts_with(' ')
+        {
+            function = f.to_string();
+            continue;
+        }
+        if t.starts_with('#') {
+            continue;
+        }
+        if in_list || t.starts_with("WITNESS_LIB_FUNCS=\"") {
+            in_list = !t.ends_with('"');
+            continue;
+        }
+        if POINTER_NAMES.iter().any(|f| t.contains(f)) && function != own {
+            found.push(format!("{function}: {t}"));
+        }
+    }
+    found
+}
+
+/// The pointer's claim and close are refused anywhere but their own place: a copy of the witness
+/// with either planted in the notice step or the send step, or of the library with either planted
+/// in the hook's incident path, fails the check, and the shipped scripts pass.
+#[test]
+fn the_pointer_functions_are_refused_outside_the_pointer_step_and_the_hooks_pointer_path() {
+    let deploy = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
+    let witness = std::fs::read_to_string(format!("{deploy}/witness.sh")).unwrap();
+    let lib = std::fs::read_to_string(LIB).unwrap();
+    assert_eq!(
+        pointer_calls_out_of_place(&witness, "pointer_step"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        pointer_calls_out_of_place(&lib, "_pa_hv2_pointer"),
+        Vec::<String>::new()
+    );
+    assert!(witness.contains("\npointer_step() {\n") && lib.contains("\n_pa_hv2_pointer() {\n"));
+    for (text, own, hosts) in [
+        (
+            &witness,
+            "pointer_step",
+            &["notice_step", "send_post", "send_admit", "light_pass"][..],
+        ),
+        (
+            &lib,
+            "_pa_hv2_pointer",
+            &["pa_hook_v2", "_pa_hv2_lockless", "_pa_hv2_journal_send"][..],
+        ),
+    ] {
+        for host in hosts {
+            let head = format!("\n{host}() {{\n");
+            assert!(text.contains(&head), "{host}");
+            for f in POINTER_NAMES {
+                let planted = text.replacen(&head, &format!("{head}    {f} light || true\n"), 1);
+                let found = pointer_calls_out_of_place(&planted, own);
+                assert_eq!(found.len(), 1, "{f} in {host}: {found:#?}");
+                assert!(found[0].starts_with(&format!("{host}: {f} ")), "{found:#?}");
+            }
+        }
+    }
+    // The notice step's own functions stay refused in the pointer step.
+    let planted = witness.replacen(
+        "\npointer_step() {\n",
+        "\npointer_step() {\n    pa_notice_admit pointer light > /dev/null || true\n",
+        1,
+    );
+    assert_eq!(notice_calls_out_of_place(&planted).len(), 1);
+}
 
 /// Every line of the witness TEXT that names one of NOTICE_STEP_NAMES outside its one function:
 /// notice_since reads the keys (pa_meta_value), notice_claim admits (pa_notice_admit) and
@@ -13114,9 +13228,10 @@ fn a_summary_that_names_a_withheld_page_is_held_only_by_the_hour() {
 
 /// Each exempt class is admitted by its own cap alone, with one ledger line written under the lock
 /// before the post, claimed (`sending`) as the daily message's is, in mode full for the notices
-/// and pointer for the pointer message, and its result written after the post. A second message
-/// inside the class's window is withheld by its cap; a line that cannot be written sends nothing;
-/// an unknown class or sender is refused before anything is read.
+/// and pointer for the pointer message, and its result written after the post (the pointer's by
+/// pa_pointer_close, which pa_notice_result refuses it for). A second message inside the class's
+/// window is withheld by its cap; a line that cannot be written sends nothing; an unknown class
+/// or sender is refused before anything is read.
 #[test]
 fn a_notice_is_claimed_in_the_ledger_before_its_post_and_its_result_written_after() {
     let fx = Fx::salted(SALT);
@@ -13124,20 +13239,26 @@ fn a_notice_is_claimed_in_the_ledger_before_its_post_and_its_result_written_afte
         ("storm", "full", "withhold:storm-cap"),
         ("summary", "full", "withhold:summary-cap"),
         ("switch", "full", "withhold:switch-cap"),
-        ("pointer", "pointer", "admit"),
+        ("pointer", "pointer", "withhold:pointer-cap"),
     ] {
         fx.write("var/lib/propolis/witness/send-ledger", EMPTY_LEDGER);
+        let writer = if class == "pointer" {
+            "pa_pointer_close \"$PA_NOTICE_STAMP\" 0a1b2c ok light"
+        } else {
+            "pa_notice_result \"$PA_NOTICE_STAMP\" {class} ok light"
+        }
+        .replace("{class}", class);
         let r = fx.run_env(
             &format!(
                 "pa_lock 5\npa_notice_admit {class} light > \"$D/v\"\n\
                  echo \"v=$(cat \"$D/v\") $PA_ADMIT_VERDICT\"\necho \"stamp=$PA_NOTICE_STAMP\"\npa_unlock\n\
-                 rc=0; pa_notice_result \"$PA_NOTICE_STAMP\" {class} ok light || rc=$?\necho \"rc=$rc\""
+                 rc=0; {writer} || rc=$?\necho \"rc=$rc\""
             ),
             &NOW,
         );
         assert_eq!(r.get("v"), "admit admit", "{class}: {}", r.err);
         assert_eq!(r.get("stamp"), "1000000/abcdef01/5000");
-        assert_eq!(r.get("rc"), "0");
+        assert_eq!(r.get("rc"), "0", "{class}: {}", r.err);
         assert_eq!(
             ledger_body(&fx),
             [format!(
@@ -13750,8 +13871,9 @@ fn a_notice_result_without_the_lock_leaves_its_line_claimed_and_counted() {
 /// stamp of its claim, in the locked section that writes its result and under one lock: the
 /// next notice lists what was withheld from that claim on, a line written while the post was in
 /// flight among it. Any other result, a claimed line that is gone and a lock not had leave the key
-/// as it was, so the next notice lists those lines again. The switch summary and the pointer
-/// message keep no key here: their results are written as pa_notice_result writes them. The claim
+/// as it was, so the next notice lists those lines again. The switch summary keeps no key here:
+/// its result is written as pa_notice_result writes it; the pointer message is refused (status
+/// 2, its line left claimed), since only pa_pointer_close writes its result. The claim
 /// is fifty seconds before the clock at the close, as a post takes time: the key is the claim's
 /// stamp, never one taken when the result is written, which would pass over a line written while
 /// the post was in flight.
@@ -13769,7 +13891,7 @@ fn a_notice_that_got_ok_keeps_its_claim_as_its_meta_key_and_any_other_result_kee
         ("summary", "perm:403", "0", false),
         ("storm", "transient:000", "0", false),
         ("switch", "ok", "0", false),
-        ("pointer", "ok", "0", false),
+        ("pointer", "ok", "2", false),
     ] {
         fx.write(
             "var/lib/propolis/witness/send-ledger",
@@ -13791,11 +13913,17 @@ fn a_notice_that_got_ok_keeps_its_claim_as_its_meta_key_and_any_other_result_kee
             &NOW,
         );
         assert_eq!(r.get("rc"), want_rc, "{class} {result}: {}", r.err);
-        assert_eq!(r.get("locks").trim(), "1", "{class} {result}: one lock");
+        let (locks, written) = if class == "pointer" {
+            // No lock taken, so no count of them was made.
+            ("", "sending")
+        } else {
+            ("1", result)
+        };
+        assert_eq!(r.get("locks").trim(), locks, "{class} {result}: locks");
         assert_eq!(
             ledger_body(&fx),
             [format!(
-                "L\t{claim}\t{class}\t-\t{class}\tfull\t{result}\tlight"
+                "L\t{claim}\t{class}\t-\t{class}\tfull\t{written}\tlight"
             )],
             "{class} {result}"
         );
@@ -14036,4 +14164,915 @@ fn a_notice_over_a_stamp_out_of_form_says_since_its_earliest_line_or_a_question_
         m.body,
         m.out
     );
+}
+
+// ---- pointer mode ------------------------------------------------------------------------------
+
+/// A stamp OFFSET seconds after the library tests' NOW, in the same boot.
+fn ptr_at(offset: u64) -> String {
+    format!("{}/abcdef01/{}", 1_000_000 + offset, 5000 + offset)
+}
+
+/// `nrec` for a pointer case: incident `w#<n>` on its own key, opened at OPENED, with the fields
+/// in SET replaced as well.
+fn prec(n: usize, opened: &str, set: &[(usize, &str)]) -> String {
+    let id = format!("w#{n}");
+    let key = nkey(n);
+    let inst = ninst(n);
+    let mut all: Vec<(usize, &str)> = vec![(1, &id), (2, &key), (5, &inst), (9, opened)];
+    all.extend_from_slice(set);
+    inc_rec(&all)
+}
+
+/// Field N (numbered from 1 after the `I`) of the stored record of incident ID.
+fn stored_field(fx: &Fx, id: &str, n: usize) -> String {
+    let text = fx.read("var/lib/propolis/witness/incidents");
+    text.lines()
+        .filter(|l| l.starts_with("I\t"))
+        .map(|l| l.split('\t').map(str::to_string).collect::<Vec<_>>())
+        .find(|f| f.get(1).map(String::as_str) == Some(id))
+        .and_then(|f| f.get(n).cloned())
+        .unwrap_or_else(|| panic!("no record {id} in:\n{text}"))
+}
+
+fn write_records(fx: &Fx, records: &[String]) {
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", records.concat()),
+    );
+}
+
+fn write_ledger(fx: &Fx, lines: &str) {
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!("#send-ledger v1 g=1\n{lines}"),
+    );
+}
+
+/// The shell lines that print what a claim set: PA_PTR, its status (`rc`), the ref, the claim's
+/// stamp, the message, and the records it saw due (`keys`: `<key>=<field 9>`, `;` between them).
+const PTR_SHOW: &str = "k=\"${PA_PTR_KEYS//$'\\t'/=}\"; k=\"${k//$'\\n'/;}\"\n\
+     printf 'ptr=%s\\nrc=%s\\nref=%s\\nstamp=%s\\ntitle=%s\\nprio=%s\\nbody=%s\\nkeys=%s\\n' \
+     \"$PA_PTR\" \"$rc\" \"$PA_PTR_REF\" \"$PA_PTR_STAMP\" \"$PA_TITLE\" \"$PA_PRIO\" \"$PA_BODY\" \"$k\"\n";
+
+/// `pa_pointer_claim ARGS` at OFFSET seconds after NOW, under the lock, over the stored records
+/// and ledger, with the shell lines PRE run first: what it decided and set (PTR_SHOW).
+fn ptr_claim(fx: &Fx, offset: u64, args: &str, pre: &str) -> Run {
+    let wall = (1_000_000 + offset).to_string();
+    let up = (5000 + offset).to_string();
+    fx.run_env(
+        &format!(
+            "{pre}pa_now\npa_lock 5\npa_incident_load\nrc=0; pa_pointer_claim {args} || rc=$?\npa_unlock\n\
+             {PTR_SHOW}"
+        ),
+        &[
+            ("PA_TEST_WALL", &wall),
+            ("PA_TEST_BOOT", "abcdef01"),
+            ("PA_TEST_UP", &up),
+        ],
+    )
+}
+
+/// Shell lines that claim a pointer as `light` at NOW, under the lock, and then put the clock back
+/// where it was: a close run after them in the same process is that claim's, as a sender runs the
+/// two.
+const CLAIM_AT_NOW: &str = "_w=\"$PA_TEST_WALL\" _u=\"$PA_TEST_UP\"; PA_TEST_WALL=1000000 PA_TEST_UP=5000\n\
+     pa_now\npa_lock 5\npa_incident_load\npa_pointer_claim light || true\npa_unlock\n\
+     [ \"$PA_PTR\" = send ] || echo \"no claim: $PA_PTR\" >&2\nPA_TEST_WALL=\"$_w\" PA_TEST_UP=\"$_u\"\n";
+
+/// In one process, as a sender runs them: `pa_pointer_claim SENDER` at CLAIM seconds after NOW
+/// under the lock, the shell lines BETWEEN (at the claim's clock), then, when it claimed,
+/// `pa_pointer_close` of that claim with RESULT at CLOSE seconds. What the claim set (PTR_SHOW)
+/// and the close's status (`crc`, `-` when nothing was claimed).
+fn ptr_cycle(fx: &Fx, claim: u64, between: &str, close: u64, result: &str, sender: &str) -> Run {
+    fx.run_env(
+        &format!(
+            "PA_TEST_WALL={cw} PA_TEST_UP={cu}\npa_now\npa_lock 5\npa_incident_load\n\
+             rc=0; pa_pointer_claim {sender} || rc=$?\npa_unlock\n{between}\n\
+             PA_TEST_WALL={dw} PA_TEST_UP={du}\npa_now\ncrc=-\n\
+             if [ \"$PA_PTR\" = send ]; then crc=0; pa_pointer_close \"$PA_PTR_STAMP\" \"$PA_PTR_REF\" {result} {sender} || crc=$?; fi\n\
+             echo \"crc=$crc\"\n{PTR_SHOW}",
+            cw = 1_000_000 + claim,
+            cu = 5000 + claim,
+            dw = 1_000_000 + close,
+            du = 5000 + close,
+        ),
+        &[
+            ("PA_TEST_WALL", "1000000"),
+            ("PA_TEST_BOOT", "abcdef01"),
+            ("PA_TEST_UP", "5000"),
+        ],
+    )
+}
+
+/// Shell lines that append RECORD to the stored incidents, as another writer would.
+fn append_record(record: &str) -> String {
+    format!(
+        "printf '%s' '{}' >> \"$ROOT/var/lib/propolis/witness/incidents\"\n",
+        record.replace('\t', "'$'\\t''").replace('\n', "'$'\\n''")
+    )
+}
+
+/// `pa_pointer_close STAMP REF RESULT SENDER` at OFFSET seconds after NOW, with PRE run first:
+/// its status.
+fn ptr_close(fx: &Fx, offset: u64, args: &str, pre: &str) -> String {
+    let wall = (1_000_000 + offset).to_string();
+    let up = (5000 + offset).to_string();
+    let r = fx.run_env(
+        &format!("{pre}pa_now\nrc=0; pa_pointer_close {args} || rc=$?\necho \"rc=$rc\""),
+        &[
+            ("PA_TEST_WALL", &wall),
+            ("PA_TEST_BOOT", "abcdef01"),
+            ("PA_TEST_UP", &up),
+        ],
+    );
+    assert!(!r.err.contains("unbound"), "{}", r.err);
+    r.get("rc")
+}
+
+/// A case of the close: what it is, the record's last open, other fields of the record, and
+/// whether the close marks it.
+type PtrCase<'a> = (&'a str, &'a str, Vec<(usize, &'a str)>, bool);
+
+fn stored_meta(fx: &Fx, key: &str) -> String {
+    std::fs::read_to_string(fx.p("var/lib/propolis/witness/meta"))
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix(&format!("M\t{key}\t")))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A record is told for its present occurrence only by a ref in field 28, and an open or a
+/// reopen sets that field to `-` under either profile: a reopen keeps its id, and the ref of
+/// the occurrence before must not make the new one read as told.
+#[test]
+fn an_open_and_a_reopen_set_the_ref_to_a_dash_under_either_profile() {
+    let fx = Fx::salted(SALT);
+    let resolved_at = lib_at(600);
+    for profile in ["legacy", "v2"] {
+        write_records(
+            &fx,
+            &[
+                prec(
+                    1,
+                    &lib_at(1200),
+                    &[
+                        (7, "resolved"),
+                        (21, &resolved_at),
+                        (22, "active10"),
+                        (19, "-"),
+                        (28, "0a1b2c"),
+                        (17, "1"),
+                    ],
+                ),
+                prec(
+                    2,
+                    &lib_at(1200),
+                    &[(7, "pending"), (9, "-"), (28, "1a2b3c")],
+                ),
+            ],
+        );
+        let mut env = NOW.to_vec();
+        env.push(("PA_TEST_PROFILE", profile));
+        let r = fx.run_env(
+            &format!(
+                "pa_settings_load\npa_lock 5\npa_incident_load\n\
+                 PA_REC_TIER=PAGE PA_REC_KIND=unit-failed PA_REC_STAGE=listen\n\
+                 pa_incident_transition '{}' open\necho \"tx1=$PA_TX\"\npa_incident_set\n\
+                 pa_incident_transition '{}' open\necho \"tx2=$PA_TX\"\npa_incident_set\n\
+                 pa_incident_write\npa_unlock",
+                nkey(1),
+                nkey(2)
+            ),
+            &env,
+        );
+        assert_eq!(
+            (r.get("tx1"), r.get("tx2")),
+            ("reopen".into(), "open".into()),
+            "{}",
+            r.err
+        );
+        assert_eq!(stored_field(&fx, "w#1", 28), "-", "{profile}: a reopen");
+        assert_eq!(stored_field(&fx, "w#2", 28), "-", "{profile}: an open");
+        // The delivered open of the occurrence before is not touched.
+        assert_eq!(stored_field(&fx, "w#1", 17), "1", "{profile}");
+    }
+    // A repeat on an open record is no open: its ref stays.
+    write_records(&fx, &[prec(3, &lib_at(1200), &[(28, "0a1b2c")])]);
+    fx.run_env(
+        &format!(
+            "pa_lock 5\npa_incident_load\nPA_REC_TIER=PAGE\npa_incident_transition '{}' open\n\
+             pa_incident_set\npa_incident_write\npa_unlock",
+            nkey(3)
+        ),
+        &NOW,
+    );
+    assert_eq!(stored_field(&fx, "w#3", 28), "0a1b2c");
+}
+
+/// The pointer class: one attempt in 30 minutes, two an hour, 48 a day, whatever the result. A
+/// claim (sending) and every counted result hold the next attempt; a result that sent nothing
+/// does not, and a line dated ahead of the clock holds nothing back.
+#[test]
+fn the_pointer_class_holds_one_attempt_in_thirty_minutes_whatever_its_result() {
+    let fx = Fx::salted(SALT);
+    let caps = fx.run("_pa_exempt_caps pointer; echo");
+    assert_eq!(caps.out.trim(), "1800 1 3600 2 86400 48");
+    let line = |ago: u64, result: &str| {
+        format!(
+            "L\t{}\tpointer\t-\tpointer\tpointer\t{result}\thook\n",
+            lib_at(ago)
+        )
+    };
+    let admit = |ledger: &str| {
+        write_ledger(&fx, ledger);
+        fx.run_env(
+            "pa_lock 5\npa_notice_admit pointer light > /dev/null\necho \"v=$PA_ADMIT_VERDICT\"",
+            &NOW,
+        )
+        .get("v")
+    };
+    for result in [
+        "sending",
+        "ok",
+        "perm:403",
+        "transient:503",
+        "transient:000",
+    ] {
+        assert_eq!(
+            admit(&line(1700, result)),
+            "withhold:pointer-cap",
+            "{result}"
+        );
+        assert_eq!(admit(&line(1800, result)), "admit", "{result}");
+    }
+    for result in ["norender", "nocurl", "notarget"] {
+        assert_eq!(admit(&line(60, result)), "admit", "{result}");
+    }
+    // Two in the hour, the newer over 30 minutes old: the hour's cap.
+    assert_eq!(
+        admit(&format!("{}{}", line(1900, "ok"), line(3500, "ok"))),
+        "withhold:pointer-cap"
+    );
+    let ahead = "L\t1000600/abcdef01/5600\tpointer\t-\tpointer\tpointer\tsending\tlight\n";
+    assert_eq!(admit(ahead), "admit", "a line ahead of the clock");
+}
+
+/// A record is due when its line is whole, it is open, PAGE or ACT, counts and has no ref of 6
+/// lower-case hex; a pending, acknowledged or resolved record, a NOTICE, a folded or duplicate
+/// one and one told is never due. The claim writes the class's line and no record.
+#[test]
+fn a_pointer_is_claimed_only_for_an_open_page_or_act_record_not_yet_told() {
+    let fx = Fx::salted(SALT);
+    let opened = lib_at(600);
+    let due: Vec<(&str, Vec<(usize, &str)>)> = vec![
+        ("PAGE", vec![]),
+        ("ACT", vec![(6, "ACT")]),
+        ("ref upper case", vec![(28, "0A1B2C")]),
+        ("ref too short", vec![(28, "0a1b2")]),
+        ("ref planted", vec![(28, "planted")]),
+    ];
+    for (what, set) in due {
+        write_records(&fx, &[prec(1, &opened, &set)]);
+        write_ledger(&fx, "");
+        let r = ptr_claim(&fx, 0, "light", "");
+        assert_eq!(
+            (r.get("ptr"), r.get("rc")),
+            ("send".into(), "0".into()),
+            "{what}: {}",
+            r.err
+        );
+        assert!(r.get("ref").len() == 6, "{what}");
+        assert_eq!(r.get("stamp"), "1000000/abcdef01/5000");
+        assert_eq!(r.get("prio"), "4");
+        assert_eq!(r.get("title"), "host-908b: needs attention", "{what}");
+        assert_eq!(
+            r.get("body"),
+            format!("Run the status command on host-908b. ref {}", r.get("ref"))
+        );
+        assert_eq!(
+            ledger_body(&fx),
+            ["L\t1000000/abcdef01/5000\tpointer\t-\tpointer\tpointer\tsending\tlight"],
+            "{what}"
+        );
+        // The claim marks nothing.
+        assert_eq!(
+            stored_field(&fx, "w#1", 28),
+            set.iter()
+                .find(|(n, _)| *n == 28)
+                .map(|(_, v)| *v)
+                .unwrap_or("-")
+        );
+    }
+    let not_due: Vec<(&str, Vec<(usize, &str)>)> = vec![
+        ("told", vec![(28, "0a1b2c")]),
+        ("pending", vec![(7, "pending")]),
+        ("acked", vec![(7, "acked")]),
+        ("resolved", vec![(7, "resolved")]),
+        ("NOTICE", vec![(6, "NOTICE")]),
+        ("folded", vec![(13, "w#9")]),
+        ("duplicate", vec![(30, "dup")]),
+        ("not whole", vec![(30, "")]),
+    ];
+    for (what, set) in not_due {
+        write_records(&fx, &[prec(1, &opened, &set)]);
+        write_ledger(&fx, "");
+        let r = ptr_claim(&fx, 0, "light", "");
+        assert_eq!(
+            (r.get("ptr"), r.get("rc")),
+            ("none".into(), "1".into()),
+            "{what}: {}",
+            r.err
+        );
+        assert_eq!(
+            (r.get("title"), r.get("ref")),
+            ("".into(), "".into()),
+            "{what}"
+        );
+        assert!(ledger_body(&fx).is_empty(), "{what}");
+        // The claim takes its sender alone: a word after it asks for nothing.
+        let r = ptr_claim(&fx, 0, "hook unknown", "");
+        assert_eq!(r.get("ptr"), "none", "{what} with a word after the sender");
+        assert!(ledger_body(&fx).is_empty(), "{what}");
+    }
+    write_records(&fx, &[]);
+    write_ledger(&fx, "");
+    assert_eq!(ptr_claim(&fx, 0, "light planted", "").get("ptr"), "none");
+}
+
+/// The claim's order: nothing due; a fresh ref, else withhold:noref; the message, else
+/// withhold:norender; the class's admission, whose verdict it then is. With the pool, the
+/// listener caps and a key spent the pointer is still claimed, and a ledger that cannot be
+/// counted claims nothing on that read and counts from empty on the next.
+#[test]
+fn the_pointer_claim_asks_for_a_ref_then_the_message_then_its_class() {
+    let fx = Fx::salted(SALT);
+    write_records(&fx, &[prec(1, &lib_at(600), &[])]);
+    write_ledger(&fx, "");
+    let r = ptr_claim(&fx, 0, "light", "pa_ref() { return 1; }\n");
+    assert_eq!(
+        (r.get("ptr"), r.get("rc")),
+        ("withhold:noref".into(), "1".into())
+    );
+    assert!(ledger_body(&fx).is_empty());
+    let r = ptr_claim(&fx, 0, "light", "pa_render() { return 1; }\n");
+    assert_eq!(r.get("ptr"), "withhold:norender");
+    assert!(ledger_body(&fx).is_empty());
+    let r = ptr_claim(&fx, 0, "planted", "");
+    assert_eq!(r.get("ptr"), "withhold:unknown");
+    assert_eq!(r.get("title"), "");
+    // The incident classes spent: the pointer goes on its own class.
+    let kh = keyhash(&fx, &nkey(1));
+    let mut spent: Vec<String> = Vec::new();
+    spent.extend(lines_of(16, "pool", "00000000", 600));
+    spent.extend(lines_of(16, "stage1", &kh, 600));
+    spent.extend(lines_of(4, "reserve", "00000000", 600));
+    write_ledger(&fx, &spent.concat());
+    assert_eq!(ptr_claim(&fx, 0, "light", "").get("ptr"), "send");
+    // ... and the class's own cap is its verdict.
+    let r = ptr_claim(&fx, 600, "hook", "");
+    assert_eq!(
+        (r.get("ptr"), r.get("title")),
+        ("withhold:pointer-cap".into(), "".into())
+    );
+    // A ledger with no readable copy: nothing on this read, and the next counts from empty.
+    fx.write("var/lib/propolis/witness/send-ledger", "garbage\n");
+    assert_eq!(ptr_claim(&fx, 0, "light", "").get("ptr"), "withhold:ledger");
+    assert_eq!(ptr_claim(&fx, 0, "light", "").get("ptr"), "send");
+}
+
+/// A pointer that got ok marks with its ref every record its claim found due, whatever the
+/// record's last open says (one of this boot with the wall clock ahead, one of an earlier boot,
+/// one that cannot be placed, none): what it covers is what the claim saw, not what stamps say.
+/// It marks no record the claim did not find due, sets no delivered_open and moves pointer_last
+/// to the claim and its ref.
+#[test]
+fn a_pointer_that_got_ok_marks_every_record_its_claim_found_due_and_no_other() {
+    let fx = Fx::salted(SALT);
+    let claim = "1000000/abcdef01/5000";
+    let cases: Vec<PtrCase> = vec![
+        ("before, this boot", "999000/abcdef01/4000", vec![], true),
+        (
+            "this boot, wall clock far ahead",
+            "1999999/abcdef01/4900",
+            vec![],
+            true,
+        ),
+        (
+            "an earlier boot, wall clock after",
+            "1000500/0000aaaa/1",
+            vec![],
+            true,
+        ),
+        ("cannot be placed", "garbage", vec![], true),
+        ("none", "-", vec![], true),
+        ("acked", "999000/abcdef01/4000", vec![(7, "acked")], false),
+        ("NOTICE", "999000/abcdef01/4000", vec![(6, "NOTICE")], false),
+        ("told", "999000/abcdef01/4000", vec![(28, "aaaaaa")], false),
+    ];
+    let records: Vec<String> = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (_, opened, set, _))| prec(i + 1, opened, set))
+        .collect();
+    write_records(&fx, &records);
+    write_ledger(&fx, "");
+    let r = ptr_cycle(&fx, 0, "", 50, "ok", "light");
+    assert_eq!(
+        (r.get("ptr"), r.get("crc")),
+        ("send".into(), "0".into()),
+        "{}",
+        r.err
+    );
+    let listed: Vec<String> = cases
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.3)
+        .map(|(i, (_, opened, _, _))| format!("{}={opened}", nkey(i + 1)))
+        .collect();
+    assert_eq!(r.get("keys"), listed.join(";"));
+    let reference = r.get("ref");
+    for (i, (what, _, set, marked)) in cases.iter().enumerate() {
+        let id = format!("w#{}", i + 1);
+        let before = set
+            .iter()
+            .find(|(n, _)| *n == 28)
+            .map(|(_, v)| *v)
+            .unwrap_or("-");
+        let want = if *marked { reference.as_str() } else { before };
+        assert_eq!(stored_field(&fx, &id, 28), want, "{what}");
+        assert_eq!(stored_field(&fx, &id, 17), "0", "{what}: delivered_open");
+    }
+    assert_eq!(
+        ledger_body(&fx),
+        [format!(
+            "L\t{claim}\tpointer\t-\tpointer\tpointer\tok\tlight"
+        )]
+    );
+    assert_eq!(
+        stored_meta(&fx, "pointer_last"),
+        format!("{claim}/{reference}")
+    );
+}
+
+/// What a pointer covers is what its claim saw: a record written between the claim and its close
+/// is not marked by an ok, whether its last open (field 9, the opener's stamp, which can be older
+/// than the moment it was written) is three seconds before the claim or in the claim's own
+/// second; a record the claim listed is marked. The record left unmarked is due at the next
+/// claim, half an hour on.
+#[test]
+fn a_record_written_between_a_claim_and_its_close_is_not_marked_whatever_its_last_open() {
+    let fx = Fx::salted(SALT);
+    for (what, opened) in [
+        ("three seconds before the claim", "999997/abcdef01/4997"),
+        ("in the claim's own second", "1000000/abcdef01/5000"),
+    ] {
+        write_records(&fx, &[prec(1, &lib_at(600), &[])]);
+        write_ledger(&fx, "");
+        let r = ptr_cycle(
+            &fx,
+            0,
+            &append_record(&prec(2, opened, &[])),
+            50,
+            "ok",
+            "light",
+        );
+        assert_eq!(
+            (r.get("ptr"), r.get("crc")),
+            ("send".into(), "0".into()),
+            "{what}: {}",
+            r.err
+        );
+        assert_eq!(
+            r.get("keys"),
+            format!("{}={}", nkey(1), lib_at(600)),
+            "{what}"
+        );
+        assert_eq!(stored_field(&fx, "w#1", 28), r.get("ref"), "{what}");
+        assert_eq!(stored_field(&fx, "w#2", 28), "-", "{what}");
+        let next = ptr_claim(&fx, 1800, "light", "");
+        assert_eq!(next.get("ptr"), "send", "{what}");
+        assert_eq!(next.get("keys"), format!("{}={opened}", nkey(2)), "{what}");
+    }
+}
+
+/// A record the claim listed that changed before the close is not marked: one that resolved and
+/// reopened (its last open is no longer the one listed) stays due, and so does one whose last
+/// open was rewritten in the claim's own second. A record that became due only after the claim
+/// (a NOTICE raised to ACT) is not in the list and stays due too.
+#[test]
+fn a_record_the_claim_listed_that_reopened_before_the_close_is_not_marked() {
+    let fx = Fx::salted(SALT);
+    let reopen = format!(
+        "pa_lock 5\npa_incident_load\npa_incident_get '{k}'\n\
+         PA_INC[7]=resolved PA_INC[21]=1000005/abcdef01/5005 PA_INC[22]=active10\npa_incident_set\n\
+         PA_TEST_WALL=1000010 PA_TEST_UP=5010\npa_now\nPA_REC_TIER=PAGE\n\
+         pa_incident_transition '{k}' open\necho \"tx=$PA_TX\"\npa_incident_set\npa_incident_write\npa_unlock\n",
+        k = nkey(1)
+    );
+    let raise = format!(
+        "pa_lock 5\npa_incident_load\npa_incident_get '{k}'\nPA_INC[6]=ACT\npa_incident_set\n\
+         pa_incident_write\npa_unlock\n",
+        k = nkey(3)
+    );
+    let same_second = format!(
+        "pa_lock 5\npa_incident_load\npa_incident_get '{k}'\nPA_INC[9]=1000000/abcdef01/5000\n\
+         pa_incident_set\npa_incident_write\npa_unlock\n",
+        k = nkey(2)
+    );
+    write_records(
+        &fx,
+        &[
+            prec(1, &lib_at(600), &[]),
+            prec(2, &lib_at(300), &[]),
+            prec(3, &lib_at(600), &[(6, "NOTICE")]),
+            prec(4, &lib_at(900), &[]),
+        ],
+    );
+    write_ledger(&fx, "");
+    let r = ptr_cycle(
+        &fx,
+        0,
+        &format!("{reopen}{raise}{same_second}"),
+        50,
+        "ok",
+        "light",
+    );
+    assert_eq!(
+        (r.get("ptr"), r.get("crc")),
+        ("send".into(), "0".into()),
+        "{}",
+        r.err
+    );
+    assert_eq!(r.get("tx"), "reopen", "{}", r.err);
+    assert_eq!(
+        r.get("keys"),
+        format!(
+            "{}={};{}={};{}={}",
+            nkey(1),
+            lib_at(600),
+            nkey(2),
+            lib_at(300),
+            nkey(4),
+            lib_at(900)
+        )
+    );
+    assert_eq!(stored_field(&fx, "w#1", 28), "-", "reopened");
+    assert_eq!(stored_field(&fx, "w#2", 28), "-", "last open rewritten");
+    assert_eq!(stored_field(&fx, "w#3", 28), "-", "due after the claim");
+    assert_eq!(stored_field(&fx, "w#4", 28), r.get("ref"), "unchanged");
+    let next = ptr_claim(&fx, 1800, "light", "");
+    assert_eq!(next.get("ptr"), "send");
+    assert_eq!(
+        next.get("keys").split(';').count(),
+        3,
+        "{}",
+        next.get("keys")
+    );
+}
+
+/// A close marks nothing unless its stamp is the claim this same process made: a close run in
+/// another process (which made no claim), and one in the claiming process with the stamp of
+/// another claimed line, leave every record due. Each still writes the result of the line its
+/// stamp names, and an ok still moves pointer_last forward, since that message arrived.
+#[test]
+fn a_close_whose_stamp_is_not_this_process_claim_marks_nothing() {
+    let fx = Fx::salted(SALT);
+    let claim = "1000000/abcdef01/5000";
+    write_records(&fx, &[prec(1, &lib_at(600), &[])]);
+    write_ledger(
+        &fx,
+        &format!("L\t{claim}\tpointer\t-\tpointer\tpointer\tsending\thook\n"),
+    );
+    assert_eq!(
+        ptr_close(&fx, 50, &format!("{claim} 0a1b2c ok hook"), ""),
+        "0"
+    );
+    assert_eq!(stored_field(&fx, "w#1", 28), "-");
+    assert_eq!(
+        ledger_body(&fx),
+        [format!(
+            "L\t{claim}\tpointer\t-\tpointer\tpointer\tok\thook"
+        )]
+    );
+    assert_eq!(stored_meta(&fx, "pointer_last"), format!("{claim}/0a1b2c"));
+
+    let older = lib_at(1800);
+    write_ledger(
+        &fx,
+        &format!("L\t{older}\tpointer\t-\tpointer\tpointer\tsending\thook\n"),
+    );
+    fx.write("var/lib/propolis/witness/meta", "#meta v1 g=1\n");
+    let r = fx.run_env(
+        &format!(
+            "{CLAIM_AT_NOW}rc=0; pa_pointer_close '{older}' 0b1b2c ok hook || rc=$?\necho \"rc=$rc\"\n\
+             echo \"stamp=$PA_PTR_STAMP\""
+        ),
+        &NOW,
+    );
+    assert_eq!(
+        (r.get("rc"), r.get("stamp")),
+        ("0".into(), claim.into()),
+        "{}",
+        r.err
+    );
+    assert!(!r.err.contains("no claim"), "{}", r.err);
+    assert_eq!(stored_field(&fx, "w#1", 28), "-");
+    assert_eq!(
+        ledger_body(&fx),
+        [
+            format!("L\t{older}\tpointer\t-\tpointer\tpointer\tok\thook"),
+            format!("L\t{claim}\tpointer\t-\tpointer\tpointer\tsending\tlight"),
+        ]
+    );
+    assert_eq!(stored_meta(&fx, "pointer_last"), format!("{older}/0b1b2c"));
+}
+
+/// Any result but ok marks nothing and leaves pointer_last as it was: the records stay due. A
+/// claimed line that is gone still lets an ok mark the records (the message arrived), with
+/// status 1. A lock not had writes nothing (status 2) and the line stays claimed and counted.
+/// Each close follows its claim in the same process, as a sender runs them.
+#[test]
+fn only_an_ok_marks_the_records_and_a_lost_line_or_lock_is_reported() {
+    let fx = Fx::salted(SALT);
+    let claim = "1000000/abcdef01/5000";
+    let claimed = format!("L\t{claim}\tpointer\t-\tpointer\tpointer\tsending\tlight\n");
+    for result in ["transient:503", "perm:403", "transient:000", "norender"] {
+        write_records(&fx, &[prec(1, &lib_at(600), &[])]);
+        write_ledger(&fx, "");
+        fx.write("var/lib/propolis/witness/meta", "#meta v1 g=1\n");
+        assert_eq!(
+            ptr_close(
+                &fx,
+                50,
+                &format!("{claim} 0a1b2c {result} light"),
+                CLAIM_AT_NOW
+            ),
+            "0"
+        );
+        assert_eq!(stored_field(&fx, "w#1", 28), "-", "{result}");
+        assert_eq!(stored_meta(&fx, "pointer_last"), "", "{result}");
+        assert_eq!(
+            ledger_body(&fx),
+            [format!(
+                "L\t{claim}\tpointer\t-\tpointer\tpointer\t{result}\tlight"
+            )]
+        );
+        // Still due at the next attempt, half an hour on.
+        assert_eq!(
+            ptr_claim(&fx, 1800, "light", "").get("ptr"),
+            "send",
+            "{result}"
+        );
+    }
+    // The line is gone (a damaged ledger replaced by an empty one): marked all the same.
+    write_records(&fx, &[prec(1, &lib_at(600), &[])]);
+    write_ledger(&fx, "");
+    assert_eq!(
+        ptr_close(
+            &fx,
+            50,
+            &format!("{claim} 0a1b2c ok light"),
+            &format!(
+                "{CLAIM_AT_NOW}printf '#send-ledger v1 g=1\\n' > \"$ROOT/var/lib/propolis/witness/send-ledger\"\n"
+            )
+        ),
+        "1"
+    );
+    assert_eq!(stored_field(&fx, "w#1", 28), "0a1b2c");
+    assert_eq!(stored_meta(&fx, "pointer_last"), format!("{claim}/0a1b2c"));
+    // No lock: nothing written.
+    write_records(&fx, &[prec(1, &lib_at(600), &[])]);
+    write_ledger(&fx, "");
+    fx.write("var/lib/propolis/witness/meta", "#meta v1 g=1\n");
+    assert_eq!(
+        ptr_close(
+            &fx,
+            50,
+            &format!("{claim} 0a1b2c ok light"),
+            &format!("{CLAIM_AT_NOW}pa_lock() {{ return 1; }}\n")
+        ),
+        "2"
+    );
+    assert_eq!(stored_field(&fx, "w#1", 28), "-");
+    assert_eq!(ledger_body(&fx), [claimed.trim_end().to_string()]);
+    assert_eq!(stored_meta(&fx, "pointer_last"), "");
+    assert_eq!(
+        ptr_claim(&fx, 600, "light", "").get("ptr"),
+        "withhold:pointer-cap"
+    );
+    // A claim or a ref out of form: nothing written.
+    write_ledger(&fx, &claimed);
+    assert_eq!(ptr_close(&fx, 50, "garbage 0a1b2c ok light", ""), "2");
+    assert_eq!(
+        ptr_close(&fx, 50, &format!("{claim} 0A1B2C ok light"), ""),
+        "2"
+    );
+    assert_eq!(stored_field(&fx, "w#1", 28), "-");
+}
+
+/// A write of the records that fails leaves them as they were on disk: due, never told, and the
+/// next pointer goes. pointer_last only moves forward: an older claim's ok after a newer one
+/// leaves the newer value, and a value out of form is replaced.
+#[test]
+fn a_failed_record_write_leaves_the_records_due_and_pointer_last_only_moves_forward() {
+    let fx = Fx::salted(SALT);
+    let claim = "1000000/abcdef01/5000";
+    write_records(&fx, &[prec(1, &lib_at(600), &[])]);
+    write_ledger(&fx, "");
+    let before = fx.read("var/lib/propolis/witness/incidents");
+    assert_eq!(
+        ptr_close(
+            &fx,
+            50,
+            &format!("{claim} 0a1b2c ok light"),
+            &format!("{CLAIM_AT_NOW}pa_incident_write() {{ return 1; }}\n")
+        ),
+        "1"
+    );
+    assert_eq!(fx.read("var/lib/propolis/witness/incidents"), before);
+    assert_eq!(
+        ledger_body(&fx),
+        [format!(
+            "L\t{claim}\tpointer\t-\tpointer\tpointer\tok\tlight"
+        )]
+    );
+    assert_eq!(ptr_claim(&fx, 1800, "light", "").get("ptr"), "send");
+
+    let newer = "1000100/abcdef01/5100";
+    for (stored, want) in [
+        (format!("{newer}/0f0f0f"), format!("{newer}/0f0f0f")),
+        (format!("{claim}/0f0f0f"), format!("{claim}/0f0f0f")),
+        (format!("{}/0f0f0f", lib_at(100)), format!("{claim}/0a1b2c")),
+        ("garbage".to_string(), format!("{claim}/0a1b2c")),
+        (
+            format!("{}/0f0f0f", "1000500/0000aaaa/9999"),
+            format!("{claim}/0a1b2c"),
+        ),
+    ] {
+        write_records(&fx, &[prec(1, &lib_at(600), &[])]);
+        write_ledger(&fx, "");
+        fx.write(
+            "var/lib/propolis/witness/meta",
+            &format!("#meta v1 g=1\nM\tpointer_last\t{stored}\n"),
+        );
+        assert_eq!(
+            ptr_close(&fx, 150, &format!("{claim} 0a1b2c ok light"), CLAIM_AT_NOW),
+            "0",
+            "{stored}"
+        );
+        assert_eq!(stored_meta(&fx, "pointer_last"), want, "{stored}");
+        assert_eq!(stored_field(&fx, "w#1", 28), "0a1b2c", "{stored}");
+    }
+    // pa_meta_put still refuses the key: the close is its one writer.
+    let r = fx.run_env(
+        &format!(
+            "pa_lock 5\nrc=0; pa_meta_put pointer_last {claim}/0a1b2c || rc=$?\necho \"rc=$rc\""
+        ),
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "2");
+}
+
+/// The notices' result writers no longer take the class pointer: pa_pointer_close is its one.
+#[test]
+fn the_notice_result_writers_refuse_the_pointer_class() {
+    let fx = Fx::salted(SALT);
+    let claim = "1000000/abcdef01/5000";
+    let claimed = format!("L\t{claim}\tpointer\t-\tpointer\tpointer\tsending\tlight\n");
+    for f in ["pa_notice_result", "pa_notice_close"] {
+        write_ledger(&fx, &claimed);
+        let r = fx.run_env(
+            &format!("rc=0; {f} {claim} pointer ok light || rc=$?\necho \"rc=$rc\""),
+            &NOW,
+        );
+        assert_eq!(r.get("rc"), "2", "{f}");
+        assert_eq!(ledger_body(&fx), [claimed.trim_end().to_string()], "{f}");
+    }
+}
+
+/// The rules over time: an open five minutes after a pointer that arrived is not marked by it and
+/// is told by the next pointer, 30 minutes after the first; a record that reopened between a
+/// claim and its result is not marked by that result; a reopen after a pointer told the
+/// occurrence before is due again; a pass killed during its post leaves the line claimed and the
+/// records due, and the next pointer goes 30 minutes later.
+#[test]
+fn an_open_after_a_pointer_is_told_by_the_next_one_half_an_hour_after_the_first() {
+    let fx = Fx::salted(SALT);
+    write_records(&fx, &[prec(1, &lib_at(600), &[])]);
+    write_ledger(&fx, "");
+    // w#2 opens five minutes after the claim, while the post is still in flight.
+    let first = ptr_cycle(
+        &fx,
+        0,
+        &append_record(&prec(2, &ptr_at(300), &[])),
+        310,
+        "ok",
+        "light",
+    );
+    assert_eq!(
+        (first.get("ptr"), first.get("crc")),
+        ("send".into(), "0".into()),
+        "{}",
+        first.err
+    );
+    assert_eq!(stored_field(&fx, "w#1", 28), first.get("ref"));
+    assert_eq!(stored_field(&fx, "w#2", 28), "-");
+    for at in [320, 900, 1799] {
+        assert_eq!(
+            ptr_claim(&fx, at, "light", "").get("ptr"),
+            "withhold:pointer-cap",
+            "{at}"
+        );
+    }
+    let second = ptr_cycle(&fx, 1800, "", 1810, "ok", "hook");
+    assert_eq!(
+        (second.get("ptr"), second.get("crc")),
+        ("send".into(), "0".into())
+    );
+    assert_eq!(stored_field(&fx, "w#2", 28), second.get("ref"));
+    assert_ne!(second.get("ref"), first.get("ref"));
+    // Both told: nothing due.
+    assert_eq!(ptr_claim(&fx, 3700, "light", "").get("ptr"), "none");
+
+    // w#1 resolves and reopens at 3800; it is due again.
+    let r = fx.run_env(
+        &format!(
+            "pa_lock 5\npa_incident_load\npa_incident_get '{}'\n\
+             PA_INC[7]=resolved PA_INC[21]=1003750/abcdef01/8750 PA_INC[22]=active10\n\
+             pa_incident_set\nPA_REC_TIER=PAGE\npa_incident_transition '{}' open\necho \"tx=$PA_TX\"\n\
+             pa_incident_set\npa_incident_write\npa_unlock",
+            nkey(1),
+            nkey(1)
+        ),
+        &[("PA_TEST_WALL", "1003800"), ("PA_TEST_BOOT", "abcdef01"), ("PA_TEST_UP", "8800")],
+    );
+    assert_eq!(r.get("tx"), "reopen", "{}", r.err);
+    assert_eq!(stored_field(&fx, "w#1", 28), "-");
+    let third = ptr_claim(&fx, 3900, "light", "");
+    assert_eq!(third.get("ptr"), "send");
+    // The pass is killed during the post: the line stays claimed, the record due.
+    for at in [4000, 5699] {
+        assert_eq!(
+            ptr_claim(&fx, at, "hook", "").get("ptr"),
+            "withhold:pointer-cap",
+            "{at}"
+        );
+    }
+    assert_eq!(stored_field(&fx, "w#1", 28), "-");
+    // w#1 reopens again between the claim and its result: the result does not mark it.
+    let reopen = format!(
+        "pa_lock 5\npa_incident_load\npa_incident_get '{k}'\n\
+         PA_INC[7]=resolved PA_INC[21]=1005750/abcdef01/10750 PA_INC[22]=active10\n\
+         pa_incident_set\nPA_TEST_WALL=1005760 PA_TEST_UP=10760\npa_now\nPA_REC_TIER=PAGE\n\
+         pa_incident_transition '{k}' open\npa_incident_set\npa_incident_write\npa_unlock\n",
+        k = nkey(1)
+    );
+    let fourth = ptr_cycle(&fx, 5700, &reopen, 5770, "ok", "light");
+    assert_eq!(
+        (fourth.get("ptr"), fourth.get("crc")),
+        ("send".into(), "0".into()),
+        "{}",
+        fourth.err
+    );
+    assert_eq!(stored_field(&fx, "w#1", 28), "-");
+    assert_eq!(ptr_claim(&fx, 7500, "light", "").get("ptr"), "send");
+}
+
+/// A server that answers 503 to every post, one that refuses every post (403), one that never
+/// answers and a pass killed during every post each get one attempt in 30 minutes, two an hour
+/// and 48 a day, from the witness and the hook together, while a record stays due; a claim
+/// every five minutes for a day.
+#[test]
+fn a_server_that_fails_every_pointer_gets_one_attempt_in_thirty_minutes_and_48_a_day() {
+    for result in ["transient:503", "perm:403", "transient:000", "killed"] {
+        let fx = Fx::salted(SALT);
+        write_records(&fx, &[prec(1, &lib_at(600), &[])]);
+        write_ledger(&fx, "");
+        let mut env = NOW.to_vec();
+        env.push(("RESULT", result));
+        let r = fx.run_env(
+            "sent=\"\"\n\
+             for ((i = 0; i < 288; i++)); do\n\
+             PA_TEST_WALL=$((1000000 + i * 300)) PA_TEST_UP=$((5000 + i * 300)); pa_now\n\
+             sender=light; [ $((i % 2)) = 0 ] || sender=hook\n\
+             pa_lock 5; pa_incident_load; pa_pointer_claim \"$sender\" || true; pa_unlock\n\
+             [ \"$PA_PTR\" = send ] || continue\n\
+             sent+=\" $((i * 300))\"\n\
+             [ \"$RESULT\" = killed ] || pa_pointer_close \"$PA_PTR_STAMP\" \"$PA_PTR_REF\" \"$RESULT\" \"$sender\" || echo close-failed\n\
+             done\necho \"sent=${sent# }\"",
+            &env,
+        );
+        assert!(!r.out.contains("close-failed"), "{result}: {}", r.out);
+        let sent: Vec<u64> = r
+            .get("sent")
+            .split(' ')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        let want: Vec<u64> = (0..48).map(|i| i * 1800).collect();
+        assert_eq!(sent, want, "{result}: {}", r.err);
+        assert_eq!(stored_field(&fx, "w#1", 28), "-", "{result}");
+    }
 }

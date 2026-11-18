@@ -12036,15 +12036,66 @@ impl Fx {
         self.setenv("PA_TEST_PROFILE", "v2");
     }
 
-    /// The send ledger's lines of incident messages (every class but the daily message's and the
-    /// test page's), split into their fields.
+    /// The send ledger's lines of incident messages (every class but the daily message's, the
+    /// test page's and the notices'), split into their fields.
     fn incident_lines(&self) -> Vec<Vec<String>> {
         self.read("var/lib/propolis/witness/send-ledger")
             .lines()
             .filter(|l| l.starts_with("L\t"))
             .map(|l| l.split('\t').map(str::to_string).collect::<Vec<_>>())
-            .filter(|f| f[2] != "daily" && f[2] != "test")
+            .filter(|f| !NOTICE_CLASSES.contains(&f[2].as_str()))
             .collect()
+    }
+
+    /// The send ledger's lines of the storm notice and the summary, split into their fields.
+    fn notice_lines(&self) -> Vec<Vec<String>> {
+        self.read("var/lib/propolis/witness/send-ledger")
+            .lines()
+            .filter(|l| l.starts_with("L\t"))
+            .map(|l| l.split('\t').map(str::to_string).collect::<Vec<_>>())
+            .filter(|f| f[2] == "storm" || f[2] == "summary")
+            .collect()
+    }
+
+    /// Each post as (title, priority, body), in order.
+    fn sent(&self) -> Vec<(String, String, String)> {
+        let conf = self.stub_text("curl.post.conf");
+        let mut heads: Vec<(String, String)> = Vec::new();
+        for l in conf.lines() {
+            if let Some(t) = l.strip_prefix("header = \"Title: ") {
+                heads.push((t.trim_end_matches('"').to_string(), String::new()));
+            } else if let Some(p) = l.strip_prefix("header = \"Priority: ")
+                && let Some(last) = heads.last_mut()
+            {
+                last.1 = p.trim_end_matches('"').to_string();
+            }
+        }
+        heads
+            .into_iter()
+            .zip(self.posts())
+            .map(|((t, p), b)| (t, p, b))
+            .collect()
+    }
+
+    /// The storm notices and summaries posted, as (title, priority, body), in order.
+    fn notices(&self) -> Vec<(String, String, String)> {
+        self.sent()
+            .into_iter()
+            .filter(|(t, _, b)| is_notice(t, b))
+            .collect()
+    }
+
+    /// Adds these W lines to the incidents file as it now stands.
+    fn add_w(&self, lines: &[String]) {
+        let mut text = self.read("var/lib/propolis/witness/incidents");
+        if text.is_empty() {
+            text = "#incidents v1 g=1\nN\t50\n".to_string();
+        }
+        for l in lines {
+            text.push_str(l);
+            text.push('\n');
+        }
+        self.write("var/lib/propolis/witness/incidents", &text);
     }
 
     /// The title of each post, in order.
@@ -12393,7 +12444,9 @@ fn the_hook_and_a_pass_that_see_one_failure_send_one_message_between_them() {
 
 /// Unknown never counts as good: a record with an empty field, which the reader would place a
 /// field early, a kind the tables do not know, and a send ledger no copy of which can be read
-/// each send nothing; each leaves a W line that says so.
+/// each send no incident message; each leaves a W line that says so, which the storm notice of
+/// the same pass counts (a ledger no copy of which can be read holds the notice too, for that
+/// pass).
 #[test]
 fn a_record_not_whole_a_kind_not_known_or_a_ledger_not_countable_sends_nothing() {
     let due = stamp(0);
@@ -12419,7 +12472,21 @@ fn a_record_not_whole_a_kind_not_known_or_a_ledger_not_countable_sends_nothing()
     let broken = with_field(&open("push:cron", "push-failing"), 28, "");
     fx.incidents(&[unknown, broken]);
     fx.pass(300);
-    assert!(fx.posts().is_empty(), "{}", fx.log());
+    assert!(incident_titles(&fx).is_empty(), "{}", fx.log());
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 1, "{:?}", fx.sent());
+    assert_eq!(
+        fx.sent().len(),
+        1,
+        "the notice is the one post: {:?}",
+        fx.sent()
+    );
+    assert!(
+        notices[0].0.ends_with(": alert budget reached")
+            && notices[0].2.starts_with("Withheld: 2 messages since "),
+        "{:?}",
+        notices[0]
+    );
     let mut reasons: Vec<(String, String)> = fx
         .w_lines()
         .iter()
@@ -12994,10 +13061,29 @@ fn the_daily_message_is_the_same_under_either_profile() {
 
 /// The titles of the incident messages posted, in order (every post but the daily message).
 fn incident_titles(fx: &Fx) -> Vec<String> {
-    fx.titles()
+    fx.sent()
         .into_iter()
-        .filter(|t| !t.ends_with(": daily"))
+        .filter(|(t, _, b)| !t.ends_with(": daily") && !is_notice(t, b))
+        .map(|(t, _, _)| t)
         .collect()
+}
+
+/// The ledger classes that are not an incident message's.
+const NOTICE_CLASSES: [&str; 6] = ["daily", "test", "storm", "summary", "switch", "pointer"];
+
+/// A post is a storm notice or a summary: its body says what was withheld.
+fn is_notice(_title: &str, body: &str) -> bool {
+    body.lines().any(|l| l.starts_with("Withheld: "))
+}
+
+/// A W line as the senders write it, `W stamp keyhash tx new inst reason`.
+fn w_text(s: &str, key: &str, tx: &str, new: &str, inst: &str, reason: &str) -> String {
+    format!("W\t{s}\t{}\t{tx}\t{new}\t{inst}\t{reason}", kh8(key))
+}
+
+/// A ledger line of a notice, `L stamp class - class full result sender`.
+fn notice_text(s: &str, class: &str, result: &str, sender: &str) -> String {
+    format!("L\t{s}\t{class}\t-\t{class}\tfull\t{result}\t{sender}")
 }
 
 /// A hook spool file at `rel` for one firing at time `t` (`count` in all), with that cause and the
@@ -14289,5 +14375,1322 @@ fn a_spool_file_given_back_charges_nothing_and_is_charged_once_when_taken_in() {
             1,
             "{key}: {lines:?}"
         );
+    }
+}
+
+// ---- the storm notice and the summary ----------------------------------------------------------
+
+/// A v2 fixture whose pool is full for the hour (four pool messages at time 0) and whose shipper
+/// fails, on a proven private topic: the second pass, at 300, withholds the shipper's open (W
+/// reason pool). Each claim counts one second on the test clock, so a notice's claim falls a
+/// second after the W lines its pass wrote.
+fn pool_full_shipper() -> Fx {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    fx.setenv("PROPOLIS_WITNESS_POST_SECS", "1");
+    let others: Vec<(&str, String, &str, &str)> = ["push:a", "push:b", "push:c", "push:d"]
+        .iter()
+        .map(|k| (*k, stamp(0), "pool", "ok"))
+        .collect();
+    ledger_of(&fx, &others);
+    failed_shipper(&fx);
+    fx
+}
+
+/// The shipper's instance id, as the notices name it.
+fn shipper_inst(fx: &Fx) -> String {
+    fx.record("unit:shipper.service").unwrap()[5].clone()
+}
+
+/// The storm notice goes at once, on the pass that withheld the open, as the class's one message
+/// in six hours: titled `alert budget reached` at priority 3 (an ACT incident), it counts the W
+/// line and names the new incident by its instance id. Its ledger line is of class storm and got
+/// ok, and meta storm_last holds its claim's stamp, so a pass after it lists nothing again.
+#[test]
+fn a_withheld_open_sends_one_storm_notice_at_once_and_its_claim_becomes_storm_last() {
+    let fx = pool_full_shipper();
+    fx.pass(0);
+    fx.pass(300);
+    let inst = shipper_inst(&fx);
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+    let (title, prio, body) = &notices[0];
+    assert!(
+        title.starts_with("host-") && title.ends_with(": alert budget reached"),
+        "{title}"
+    );
+    assert_eq!(prio, "3");
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), 2, "{body}");
+    assert!(
+        lines[0].starts_with("Withheld: 1 message since ")
+            && lines[0].ends_with(&format!("; new incidents: {inst}")),
+        "{body}"
+    );
+    assert!(lines[1].starts_with("Next summary "), "{body}");
+    assert!(incident_titles(&fx).is_empty(), "{:?}", fx.titles());
+    let claim = stamp(301);
+    assert_eq!(
+        fx.notice_lines(),
+        [notice_text(&claim, "storm", "ok", "light")
+            .split('\t')
+            .map(str::to_string)
+            .collect::<Vec<_>>()]
+    );
+    assert_eq!(fx.meta("storm_last").as_deref(), Some(claim.as_str()));
+    assert_eq!(fx.meta("summary_last"), None);
+    let w = fx.w_lines();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert_eq!(w[0][1], stamp(300), "stamped when it was written");
+    fx.pass(600);
+    fx.pass(900);
+    assert_eq!(fx.notices().len(), 1, "{:?}", fx.sent());
+}
+
+/// The entry's own case, end to end. After eight listener opens in a day, two of them in the last
+/// hour, a new listener's open is withheld for the hour (stage1-cap); while withheld it is named
+/// in the title of the storm notice at priority 5, among any number of other withheld lines; and
+/// it goes as its late open within the next hour.
+#[test]
+fn after_eight_listener_opens_in_a_day_a_new_one_is_named_at_priority_five_and_goes_within_the_hour()
+ {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    fx.setenv("PROPOLIS_WITNESS_POST_SECS", "1");
+    let keys: Vec<String> = (0..8)
+        .map(|i| format!("unit:sensor-a{i}.service"))
+        .collect();
+    let lines: Vec<(&str, String, &str, &str)> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let at = if i < 2 { stamp(0) } else { before(7200) };
+            (k.as_str(), at, "stage1", "ok")
+        })
+        .collect();
+    ledger_of(&fx, &lines);
+    fx.unit(
+        "sensor-http.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+        ],
+    );
+    fx.pass(0);
+    // Twenty-five other transitions withheld between the two passes, of keys no record names.
+    let others: Vec<String> = (0..25)
+        .map(|i| w_text(&stamp(60), &format!("push:{i}"), "remind", "0", "-", "pool"))
+        .collect();
+    fx.add_w(&others);
+    fx.pass(300);
+    let key = "unit:sensor-http.service";
+    let rec = fx.record(key).unwrap();
+    let inst = rec[5].clone();
+    assert_eq!((rec[6].as_str(), rec[7].as_str()), ("PAGE", "open"));
+    assert!(
+        fx.w_lines()
+            .iter()
+            .any(|w| w[2] == kh8(key) && w[3] == "open" && w[6] == "stage1-cap"),
+        "{:?}",
+        fx.w_lines()
+    );
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+    let (title, prio, body) = &notices[0];
+    assert!(
+        title.starts_with("host-") && title.ends_with(&format!(": PAGE withheld {inst}")),
+        "{title}"
+    );
+    assert_eq!(prio, "5");
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines[0], format!("PAGE withheld: {inst}"), "{body}");
+    assert!(
+        lines[1].starts_with("Withheld: 26 messages since ")
+            && lines[1].ends_with(&format!("; new incidents: {inst}")),
+        "{body}"
+    );
+    let mut t = 600;
+    while t <= 4200 && incident_titles(&fx).is_empty() {
+        fx.pass(t);
+        t += 300;
+    }
+    let titles = incident_titles(&fx);
+    assert_eq!(titles.len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+    assert!(titles[0].starts_with("PAGE host-"), "{titles:?}");
+}
+
+/// With the storm notice spent for six hours, the summary carries the PAGE rule: a withheld open
+/// of a PAGE incident is named in its title at priority 5 and on its first line, whatever else it
+/// counts. Its ledger line is of class summary, and summary_last takes its claim while storm_last
+/// stays as it was.
+#[test]
+fn a_summary_names_a_withheld_page_open_at_priority_five_when_the_storm_notice_is_spent() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    fx.setenv("PROPOLIS_WITNESS_POST_SECS", "1");
+    let mut ledger = String::from("#send-ledger v1 g=1\n");
+    ledger.push_str(&notice_text(&before(3600), "storm", "ok", "light"));
+    ledger.push('\n');
+    for (i, k) in ["unit:sensor-a.service", "unit:sensor-b.service"]
+        .iter()
+        .enumerate()
+    {
+        let id = format!("w#{}", 300 + i);
+        let s = stamp(0);
+        ledger.push_str(&inc_line(k, [&s, "stage1", "open", "ok", "light", &id, &s]).join("\t"));
+        ledger.push('\n');
+    }
+    fx.write("var/lib/propolis/witness/send-ledger", &ledger);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!("#meta v1 g=1\nM\tstorm_last\t{}\n", before(3600)),
+    );
+    fx.unit(
+        "sensor-http.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+        ],
+    );
+    fx.pass(0);
+    // Twelve other transitions withheld between the two passes.
+    let others: Vec<String> = (0..12)
+        .map(|i| w_text(&stamp(60), &format!("push:{i}"), "change", "0", "-", "pool"))
+        .collect();
+    fx.add_w(&others);
+    fx.pass(300);
+    let inst = fx.record("unit:sensor-http.service").unwrap()[5].clone();
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+    let (title, prio, body) = &notices[0];
+    assert!(
+        title.ends_with(&format!(": PAGE withheld {inst}")),
+        "{title}"
+    );
+    assert_eq!(prio, "5");
+    assert!(body.starts_with(&format!(
+        "PAGE withheld: {inst}\nWithheld: 13 messages since "
+    )));
+    let claim = stamp(301);
+    let classes: Vec<(String, String)> = fx
+        .notice_lines()
+        .iter()
+        .map(|f| (f[2].clone(), f[6].clone()))
+        .collect();
+    assert_eq!(
+        classes,
+        [
+            ("storm".to_string(), "ok".to_string()),
+            ("summary".to_string(), "ok".to_string())
+        ]
+    );
+    assert_eq!(fx.meta("summary_last").as_deref(), Some(claim.as_str()));
+    assert_eq!(
+        fx.meta("storm_last").as_deref(),
+        Some(before(3600).as_str())
+    );
+}
+
+/// Once the day's twelve summaries are spent (a storm that lasts, or a server that failed them),
+/// a summary still goes for a withheld open of a PAGE incident, held only by the hour, and names
+/// it at priority 5: the next storm notice could be six hours off. With nothing of PAGE tier
+/// withheld the day's cap holds and the lines wait, a withheld new open of an ACT incident among
+/// them (the backup's, in both cases).
+#[test]
+fn a_spent_day_of_summaries_still_names_a_withheld_page_open_within_the_hour() {
+    for page in [true, false] {
+        let mut fx = Fx::new();
+        fx.v2();
+        fx.private_topic(0);
+        let mut ledger = String::from("#send-ledger v1 g=1\n");
+        ledger.push_str(&notice_text(&before(3600), "storm", "ok", "light"));
+        ledger.push('\n');
+        for i in 0..12u64 {
+            ledger.push_str(&notice_text(
+                &before(3900 + i * 6000),
+                "summary",
+                "ok",
+                "light",
+            ));
+            ledger.push('\n');
+        }
+        // The hour's listener messages and the hour's pool are both spent, so a new open of
+        // either kind is withheld.
+        let spent = [
+            ("unit:sensor-a.service", "stage1"),
+            ("unit:sensor-b.service", "stage1"),
+            ("push:a", "pool"),
+            ("push:b", "pool"),
+            ("push:c", "pool"),
+            ("push:d", "pool"),
+        ];
+        for (i, (k, class)) in spent.iter().enumerate() {
+            let id = format!("w#{}", 300 + i);
+            let s = stamp(0);
+            ledger.push_str(&inc_line(k, [&s, class, "open", "ok", "light", &id, &s]).join("\t"));
+            ledger.push('\n');
+        }
+        fx.write("var/lib/propolis/witness/send-ledger", &ledger);
+        fx.write(
+            "var/lib/propolis/witness/meta",
+            &format!(
+                "#meta v1 g=1\nM\tstorm_last\t{}\nM\tsummary_last\t{}\n",
+                before(3600),
+                before(3900)
+            ),
+        );
+        failed_backup(&fx);
+        if page {
+            fx.unit(
+                "sensor-http.service",
+                &[
+                    ("ActiveState", "failed"),
+                    ("SubState", "failed"),
+                    ("Result", "exit-code"),
+                ],
+            );
+        }
+        fx.pass(0);
+        let others: Vec<String> = (0..3)
+            .map(|i| w_text(&stamp(60), &format!("push:{i}"), "change", "0", "-", "pool"))
+            .collect();
+        fx.add_w(&others);
+        fx.pass(300);
+        let backup = kh8("unit:propolis-backup.service");
+        assert!(
+            fx.w_lines()
+                .iter()
+                .any(|w| w[2] == backup && w[3] == "open" && w[4] == "1" && w[6] == "pool"),
+            "{:?}",
+            fx.w_lines()
+        );
+        let notices = fx.notices();
+        if !page {
+            assert!(notices.is_empty(), "{:?}\n{}", fx.sent(), fx.log());
+            assert_eq!(fx.notice_lines().len(), 13);
+            continue;
+        }
+        let inst = fx.record("unit:sensor-http.service").unwrap()[5].clone();
+        assert_eq!(notices.len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+        let (title, prio, _) = &notices[0];
+        assert!(
+            title.ends_with(&format!(": PAGE withheld {inst}")),
+            "{title}"
+        );
+        assert_eq!(prio, "5");
+        let lines = fx.notice_lines();
+        assert_eq!(lines.len(), 14, "{lines:?}");
+        assert_eq!(
+            (lines[13][2].as_str(), lines[13][6].as_str()),
+            ("summary", "ok")
+        );
+    }
+}
+
+/// A W line the failure hook writes while a notice is being posted (after its claim, before its
+/// result; here in the claim's own second) is listed by the next notice: the meta key takes the
+/// claim's stamp, and lines are listed from it on.
+#[test]
+fn a_w_line_the_hook_writes_while_a_notice_is_in_flight_is_in_the_next_notice() {
+    let fx = pool_full_shipper();
+    fx.pass(0);
+    fx.stub_file(
+        "curl.post.run",
+        "lib=\"$1/root/usr/local/sbin/propolis-alert-lib\"\n\
+         . \"$lib\" && pa_init \"$1/root\" && pa_lock 5 && pa_incident_load \\\n\
+         && pa_w_line unit:sensor-ftp.service open 1 - stage1-cap && pa_incident_write \\\n\
+         && echo wrote > \"$1/hook.wrote\"\npa_unlock\nrm -f \"$1/curl.post.run\"\n",
+    );
+    fx.pass(300);
+    assert_eq!(fx.stub_text("hook.wrote"), "wrote\n", "{}", fx.log());
+    let hook = fx
+        .w_lines()
+        .into_iter()
+        .find(|w| w[2] == kh8("unit:sensor-ftp.service"))
+        .unwrap();
+    assert_eq!(hook[1], stamp(301), "in the claim's second");
+    assert_eq!(fx.meta("storm_last").as_deref(), Some(stamp(301).as_str()));
+    fx.pass(600);
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 2, "{:?}\n{}", fx.sent(), fx.log());
+    let (title, _, body) = &notices[1];
+    assert!(
+        title.ends_with(": 1 message withheld in the last hour"),
+        "{title}"
+    );
+    assert!(
+        body.starts_with("Withheld: 1 message since ")
+            && body.contains("; new incidents: 1 not named"),
+        "{body}"
+    );
+    assert_eq!(
+        fx.meta("summary_last").as_deref(),
+        Some(stamp(601).as_str())
+    );
+    fx.pass(900);
+    assert_eq!(fx.notices().len(), 2);
+}
+
+/// A notice whose post failed, was refused for good or got no answer counts in its class (its line
+/// holds the result) and leaves storm_last as it was: the next notice that goes, here the summary,
+/// lists the same line again. The journal line names the class and the result alone.
+#[test]
+fn a_notice_that_failed_was_refused_or_got_no_answer_lists_its_lines_again() {
+    for (code, result) in [
+        ("503", "transient:503"),
+        ("403", "perm:403"),
+        ("000", "transient:000"),
+    ] {
+        let fx = pool_full_shipper();
+        fx.pass(0);
+        fx.stub_file("curl.post", code);
+        fx.pass(300);
+        let inst = shipper_inst(&fx);
+        let lines = fx.notice_lines();
+        assert_eq!(lines.len(), 1, "{code}: {lines:?}");
+        assert_eq!(
+            (lines[0][2].as_str(), lines[0][6].as_str()),
+            ("storm", result)
+        );
+        assert_eq!(fx.meta("storm_last"), None, "{code}");
+        let log = fx.log();
+        assert!(
+            log.contains(&format!("storm notice not delivered ({result})")),
+            "{code}: {log}"
+        );
+        for l in log
+            .lines()
+            .filter(|l| l.starts_with("logger ") && l.contains("notice"))
+        {
+            assert!(!l.contains(&inst) && !l.contains("w#"), "{l}");
+            assert!(!l.contains("t0p1c") && !l.contains("ntfy.example"), "{l}");
+        }
+        std::fs::remove_file(fx.dir.path().join("curl.post")).unwrap();
+        fx.pass(600);
+        let notices = fx.notices();
+        assert_eq!(notices.len(), 2, "{code}: {:?}", fx.sent());
+        let (title, _, body) = &notices[1];
+        assert!(title.contains(": 1 message withheld"), "{code}: {title}");
+        assert!(
+            body.starts_with("Withheld: 1 message since ")
+                && body.contains(&format!("; new incidents: {inst}")),
+            "{code}: {body}"
+        );
+        assert_eq!(
+            fx.meta("summary_last").as_deref(),
+            Some(stamp(601).as_str()),
+            "{code}"
+        );
+    }
+}
+
+/// A notice that got through but whose result could not be written (the lock held by another
+/// writer past the 10 s its result waits) stays claimed and counted, storm_last stays as it was,
+/// and the next notice lists its lines again.
+#[test]
+fn a_notice_whose_result_cannot_be_written_lists_its_lines_again() {
+    let fx = pool_full_shipper();
+    fx.pass(0);
+    fx.stub_file(
+        "curl.post.hold",
+        &fx.p("var/lib/propolis/witness/state.lock")
+            .display()
+            .to_string(),
+    );
+    fx.pass(300);
+    let holder: i32 = fx.stub_text("curl.post.holder").trim().parse().unwrap();
+    // SAFETY: kill has no memory preconditions; the pid is the stub's own holder.
+    unsafe { libc::kill(holder, libc::SIGKILL) };
+    std::fs::remove_file(fx.dir.path().join("curl.post.hold")).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let lines = fx.notice_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(
+        (lines[0][2].as_str(), lines[0][6].as_str()),
+        ("storm", "sending")
+    );
+    assert_eq!(fx.meta("storm_last"), None);
+    assert!(
+        fx.log().contains(
+            "the result of the storm notice (ok) was not recorded: the state lock was busy"
+        ),
+        "{}",
+        fx.log()
+    );
+    fx.pass(600);
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 2, "{:?}", fx.sent());
+    assert!(
+        notices[1].2.starts_with("Withheld: 1 message since "),
+        "{:?}",
+        notices[1]
+    );
+    assert!(notices[1].2.contains(&shipper_inst(&fx)));
+}
+
+/// A pass killed while its notice is posted leaves the notice claimed and counted (its line says
+/// sending) and the meta key unchanged. A pass inside the 120 s such a post and its result can
+/// take sends no notice of its own for the same lines; a later one lists them again.
+#[test]
+fn a_pass_killed_during_a_notice_leaves_it_claimed_and_the_next_one_lists_its_lines() {
+    let fx = pool_full_shipper();
+    fx.pass(0);
+    fx.stub_file("curl.post.sleep", "30");
+    let mut child = fx.start(&["light"], 300, false);
+    let pid_file = fx.dir.path().join("curl.post.pid");
+    let mut waited = 0;
+    while !pid_file.exists() && waited < 600 {
+        std::thread::sleep(Duration::from_millis(50));
+        waited += 1;
+    }
+    assert!(pid_file.exists(), "the post began: {}", fx.log());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: kill has no memory preconditions; the pid is the stub's own.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    std::fs::remove_file(fx.dir.path().join("curl.post.sleep")).unwrap();
+    let lines = fx.notice_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(
+        (
+            lines[0][1].as_str(),
+            lines[0][2].as_str(),
+            lines[0][6].as_str()
+        ),
+        (stamp(301).as_str(), "storm", "sending")
+    );
+    assert_eq!(fx.meta("storm_last"), None);
+    fx.pass(360);
+    assert_eq!(fx.posts().len(), 1, "none inside 120 s of the claim");
+    fx.pass(600);
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 2, "{:?}", fx.sent());
+    assert!(
+        notices[1].2.contains(&shipper_inst(&fx)),
+        "{:?}",
+        notices[1]
+    );
+    assert_eq!(fx.notice_lines()[1][2], "summary");
+}
+
+/// Two passes at once cannot both tell the same lines: while the hourly pass, standing in for a
+/// light pass that has not run, posts its storm notice, a light pass finds that notice claimed
+/// moments ago with no result and sends no summary of its own for the same lines.
+#[test]
+fn while_one_pass_posts_a_notice_another_pass_sends_none_for_the_same_lines() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.curl_answers("403|text/plain");
+    fx.private_topic(0);
+    fx.add_w(&[w_text(&before(60), "push:a", "open", "1", "-", "pool")]);
+    fx.stub_file("curl.post.sleep", "30");
+    let mut child = fx.start(&["hourly"], 0, false);
+    let pid_file = fx.dir.path().join("curl.post.pid");
+    let mut waited = 0;
+    while !pid_file.exists() && waited < 1200 {
+        std::thread::sleep(Duration::from_millis(50));
+        waited += 1;
+    }
+    assert!(
+        pid_file.exists(),
+        "the hourly pass's post began: {}",
+        fx.log()
+    );
+    let lines = fx.notice_lines();
+    assert_eq!(
+        (lines.len(), lines[0][2].as_str(), lines[0][7].as_str()),
+        (1, "storm", "hourly")
+    );
+    fx.pass(30);
+    assert_eq!(fx.posts().len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+    assert_eq!(fx.notice_lines().len(), 1);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: kill has no memory preconditions; the pid is the stub's own.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    std::fs::remove_file(fx.dir.path().join("curl.post.sleep")).unwrap();
+}
+
+/// A notice held back by its class's cap leaves its lines for the next one admitted: with a storm
+/// notice an hour old and a summary ten minutes old, the withheld open waits, and the first pass
+/// at which the summary has room again (an hour after the last) lists it.
+#[test]
+fn a_notice_held_back_by_its_caps_leaves_its_lines_for_the_next_one_admitted() {
+    let fx = pool_full_shipper();
+    let mut ledger = String::from("#send-ledger v1 g=1\n");
+    for (i, k) in ["push:a", "push:b", "push:c", "push:d"].iter().enumerate() {
+        let id = format!("w#{}", 300 + i);
+        let s = stamp(0);
+        ledger.push_str(&inc_line(k, [&s, "pool", "open", "ok", "light", &id, &s]).join("\t"));
+        ledger.push('\n');
+    }
+    for (s, class) in [(before(3600), "storm"), (before(600), "summary")] {
+        ledger.push_str(&notice_text(&s, class, "ok", "light"));
+        ledger.push('\n');
+    }
+    fx.write("var/lib/propolis/witness/send-ledger", &ledger);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=1\nM\tstorm_last\t{}\nM\tsummary_last\t{}\n",
+            before(3600),
+            before(600)
+        ),
+    );
+    fx.pass(0);
+    fx.pass(300);
+    assert!(fx.notices().is_empty(), "{:?}", fx.sent());
+    assert_eq!(fx.w_lines().len(), 1);
+    let mut t = 600;
+    while t <= 3300 && fx.notices().is_empty() {
+        fx.pass(t);
+        t += 300;
+    }
+    assert_eq!(t - 300, 3000, "the summary's hour ends at 3000");
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 1, "{:?}", fx.sent());
+    assert!(
+        notices[0]
+            .0
+            .ends_with(": 1 message withheld in the last hour"),
+        "{:?}",
+        notices[0]
+    );
+    assert!(notices[0].2.contains(&shipper_inst(&fx)));
+}
+
+/// A notice neither crowds out nor is crowded out by the incident messages: a pass that posts an
+/// incident message still sends its notice after it, in a class of its own; a pass with no time
+/// left (the send cut passed) claims neither, and a later pass sends both. The daily message,
+/// due on the pass that sends them (past 08:41), goes once, as before, after them, and on that
+/// pass whatever the send cut says.
+#[test]
+fn a_pass_that_sent_an_incident_message_still_sends_its_notice_and_one_with_no_time_left_sends_it_later()
+ {
+    for cut in [false, true] {
+        let mut fx = Fx::new();
+        fx.v2();
+        fx.private_topic(2400);
+        failed_shipper(&fx);
+        fx.pass(2400);
+        assert!(fx.posts().is_empty(), "{:?}", fx.sent());
+        fx.add_w(&[w_text(&stamp(2690), "push:z", "change", "0", "-", "pool")]);
+        if cut {
+            fx.setenv("PROPOLIS_WITNESS_SEND_CUT", "0");
+        }
+        fx.pass(2700);
+        if cut {
+            assert!(incident_titles(&fx).is_empty(), "{:?}", fx.sent());
+            assert!(fx.notices().is_empty());
+            assert!(fx.notice_lines().is_empty(), "nothing claimed past the cut");
+            assert_eq!(
+                fx.daily_lines().len(),
+                1,
+                "the daily message goes past the cut"
+            );
+            fx.unsetenv("PROPOLIS_WITNESS_SEND_CUT");
+            fx.pass(3000);
+        }
+        let sent = fx.sent();
+        let incident = sent
+            .iter()
+            .position(|(t, _, b)| t.starts_with("ACT host-") && !is_notice(t, b));
+        let notice = sent.iter().position(|(t, _, b)| is_notice(t, b));
+        assert!(
+            matches!((incident, notice), (Some(i), Some(n)) if i < n),
+            "cut {cut}: {sent:?}\n{}",
+            fx.log()
+        );
+        let classes: Vec<String> = fx
+            .read("var/lib/propolis/witness/send-ledger")
+            .lines()
+            .filter(|l| l.starts_with("L\t"))
+            .map(|l| l.split('\t').nth(2).unwrap().to_string())
+            .collect();
+        assert_eq!(
+            classes.iter().filter(|c| *c == "pool").count(),
+            1,
+            "{classes:?}"
+        );
+        assert_eq!(classes.iter().filter(|c| *c == "storm").count(), 1);
+        assert_eq!(fx.daily_lines().len(), 1, "cut {cut}");
+        let daily = sent.iter().position(|(t, _, _)| t.ends_with(": daily"));
+        if cut {
+            assert_eq!(daily, Some(0), "{sent:?}");
+        } else {
+            assert!(
+                matches!((notice, daily), (Some(n), Some(d)) if n < d),
+                "{sent:?}"
+            );
+        }
+    }
+}
+
+/// In pointer mode (the gate short of full: here no read check has answered) there is neither a
+/// storm notice nor a summary: nothing is rendered, claimed or posted, and no meta key is set.
+#[test]
+fn with_the_gate_short_of_full_no_notice_is_rendered_or_claimed() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.add_w(&[w_text(&before(60), "push:a", "open", "1", "-", "pool")]);
+    failed_shipper(&fx);
+    fx.pass(0);
+    fx.pass(300);
+    assert!(fx.posts().is_empty(), "{:?}", fx.sent());
+    assert!(fx.notice_lines().is_empty());
+    assert_eq!(
+        (fx.meta("storm_last"), fx.meta("summary_last")),
+        (None, None)
+    );
+}
+
+/// Under the legacy profile the witness reads no W line and sends no notice: with W lines and both
+/// meta keys on disk, the daily message is the one post, no notice is claimed, and the meta keys
+/// and the W lines are left as they were.
+#[test]
+fn under_legacy_no_notice_is_claimed_or_sent_and_its_meta_keys_are_left_as_they_were() {
+    let fx = Fx::new();
+    fx.private_topic(3300);
+    let w = w_text(&stamp(3240), "push:a", "open", "1", "-", "pool");
+    fx.add_w(std::slice::from_ref(&w));
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=1\nM\tstorm_last\t{}\nM\tsummary_last\t{}\n",
+            before(30000),
+            before(9000)
+        ),
+    );
+    failed_shipper(&fx);
+    // Past 08:41, so the daily message is the one post.
+    fx.pass(3300);
+    fx.pass(3600);
+    let titles = fx.titles();
+    assert_eq!(titles.len(), 1, "{titles:?}");
+    assert!(titles[0].ends_with(": daily"));
+    assert!(fx.notice_lines().is_empty());
+    assert_eq!(fx.meta("storm_last"), Some(before(30000)));
+    assert_eq!(fx.meta("summary_last"), Some(before(9000)));
+    let lines: Vec<String> = fx.w_lines().iter().map(|f| f.join("\t")).collect();
+    assert_eq!(lines, [w]);
+}
+
+/// Unknown never counts as good. Meta keys ahead of the clock or out of form are not taken for
+/// the last notice: the storm notice lists every W line, an old one and one with an empty field
+/// among them. A storm_last in form beside a summary_last ahead of the clock lists from
+/// storm_last.
+#[test]
+fn a_meta_key_out_of_form_or_ahead_of_the_clock_lists_every_w_line() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    fx.add_w(&[
+        w_text(&before(30000), "push:a", "remind", "0", "-", "pool"),
+        w_text(&before(60), "push:b", "remind", "0", "-", "pool"),
+        format!("W\t{}\t{}\tremind\t0\t\tpool", before(60), kh8("push:c")),
+    ]);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=1\nM\tstorm_last\t{}\nM\tsummary_last\tgarbage\n",
+            stamp(5000)
+        ),
+    );
+    fx.pass(0);
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+    assert!(
+        notices[0].2.starts_with("Withheld: 3 messages since "),
+        "{:?}",
+        notices[0]
+    );
+
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    fx.add_w(&[
+        w_text(&before(30000), "push:a", "remind", "0", "-", "pool"),
+        w_text(&before(60), "push:b", "remind", "0", "-", "pool"),
+    ]);
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!(
+            "#send-ledger v1 g=1\n{}\n",
+            notice_text(&before(20000), "storm", "ok", "light")
+        ),
+    );
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=1\nM\tstorm_last\t{}\nM\tsummary_last\t{}\n",
+            before(20000),
+            stamp(9000)
+        ),
+    );
+    fx.pass(0);
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+    assert!(
+        notices[0].2.starts_with("Withheld: 1 message since "),
+        "{:?}",
+        notices[0]
+    );
+    assert_eq!(fx.notice_lines()[1][2], "summary");
+
+    // Both keys in form: the notice lists from the later of the two, by uptime within one boot
+    // and, across boots, the one of this boot, whatever the wall clock says of the other, be it
+    // storm_last or summary_last.
+    let other_boot = format!("{}/0badb007/5", WALL - 100);
+    for (storm, summary) in [
+        (before(20000), before(1000)),
+        (other_boot.clone(), before(1000)),
+        (before(1000), other_boot.clone()),
+    ] {
+        let mut fx = Fx::new();
+        fx.v2();
+        fx.private_topic(0);
+        fx.add_w(&[
+            w_text(&before(2000), "push:a", "remind", "0", "-", "pool"),
+            w_text(&before(500), "push:b", "remind", "0", "-", "pool"),
+        ]);
+        fx.write(
+            "var/lib/propolis/witness/meta",
+            &format!("#meta v1 g=1\nM\tstorm_last\t{storm}\nM\tsummary_last\t{summary}\n"),
+        );
+        fx.pass(0);
+        let notices = fx.notices();
+        assert_eq!(notices.len(), 1, "{storm}: {:?}\n{}", fx.sent(), fx.log());
+        assert!(
+            notices[0].2.starts_with("Withheld: 1 message since "),
+            "{storm}: {:?}",
+            notices[0]
+        );
+    }
+}
+
+/// A send ledger no copy of which can be counted holds the notice on that pass, as it holds every
+/// message, and never for good: the next pass sends it.
+#[test]
+fn a_send_ledger_that_cannot_be_counted_holds_the_notice_for_that_pass_only() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    fx.add_w(&[w_text(&before(60), "push:a", "open", "1", "-", "pool")]);
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        "#send-ledger v9 g=1\nL\tdamaged\n",
+    );
+    fx.pass(0);
+    assert!(fx.notices().is_empty(), "{:?}", fx.sent());
+    fx.pass(300);
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+    assert!(notices[0].2.starts_with("Withheld: 1 message since "));
+}
+
+/// The hourly pass sends a notice only while it stands in for a stale light pass, and then with
+/// itself as the sender; while the light pass is fresh the light pass is the one that tells.
+#[test]
+fn the_hourly_pass_sends_a_notice_only_while_it_stands_in_for_a_stale_light_pass() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.curl_answers("403|text/plain");
+    fx.private_topic(0);
+    fx.add_w(&[w_text(&before(60), "push:a", "open", "1", "-", "pool")]);
+    fx.hourly(0);
+    assert!(fx.notices().is_empty(), "{:?}", fx.sent());
+    assert!(fx.notice_lines().is_empty());
+    fx.hourly_alone(3600);
+    let lines = fx.notice_lines();
+    assert_eq!(lines.len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+    assert_eq!(
+        (
+            lines[0][2].as_str(),
+            lines[0][6].as_str(),
+            lines[0][7].as_str()
+        ),
+        ("storm", "ok", "hourly")
+    );
+}
+
+/// The witness needs the library version that writes its W lines and closes its notices: one a
+/// version older is refused before anything is written, as any older library is, and the one it
+/// needs is taken.
+#[test]
+fn a_library_one_version_older_than_the_witness_needs_is_refused_and_the_one_it_needs_is_taken() {
+    let script = std::fs::read_to_string(SCRIPT).unwrap();
+    let need: u32 = script
+        .lines()
+        .find_map(|l| l.strip_prefix("# needs-alert-lib: "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let lib = std::fs::read_to_string(LIB).unwrap();
+    let version = lib
+        .lines()
+        .find_map(|l| l.strip_prefix("PA_LIB_VERSION="))
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        version,
+        need.to_string(),
+        "the witness needs the shipped library"
+    );
+    for (v, code) in [(need - 1, 3), (need, 0)] {
+        let fx = Fx::new();
+        fx.write(
+            "usr/local/sbin/propolis-alert-lib",
+            &lib.replace(
+                &format!("\nPA_LIB_VERSION={version}\n"),
+                &format!("\nPA_LIB_VERSION={v}\n"),
+            ),
+        );
+        let r = fx.run_args(&["light"], 0);
+        assert_eq!(r.code, code, "version {v}: {}", r.err);
+        if code == 3 {
+            assert!(
+                r.err.contains(&format!("older than version {need}")),
+                "{}",
+                r.err
+            );
+            assert!(fx.state_files().is_empty());
+        }
+    }
+}
+
+/// A script another writer runs (the curl stub's `curl.post.run`, the logger stub's `logger.run`),
+/// its argument the stubs' directory: under the state lock, through the installed library, it adds
+/// a W line for KEY (open, new) stamped `later` seconds after the clock the pass has exported, as
+/// the failure hook would, marks `hook.wrote`, and then runs EXTRA.
+fn hook_w_script(key: &str, later: u64, extra: &str) -> String {
+    format!(
+        "PA_TEST_WALL=$((PA_TEST_WALL + {later})) PA_TEST_UP=$((PA_TEST_UP + {later}))\n\
+         lib=\"$1/root/usr/local/sbin/propolis-alert-lib\"\n\
+         . \"$lib\" && pa_init \"$1/root\" && pa_lock 5 && pa_incident_load \\\n\
+         && pa_w_line {key} open 1 - stage1-cap && pa_incident_write \\\n\
+         && echo wrote > \"$1/hook.wrote\"\npa_unlock\n{extra}\n"
+    )
+}
+
+/// The stub `logger` that also runs `logger.run` (once, renamed `logger.ran`) when a line says a
+/// message was not delivered, as another writer acting between a failed post and what follows it.
+const LOGGER_RUN_STUB: &str = r#"#!/usr/bin/env bash
+printf 'logger %s\n' "$*" >> "$STUB_LOG"
+d="${UNITS%/units}"
+if [ -f "$d/logger.run" ] && [[ $* == *"not delivered"* ]]; then
+    mv -f "$d/logger.run" "$d/logger.ran"
+    bash "$d/logger.ran" "$d" < /dev/null > /dev/null 2>&1
+fi
+"#;
+
+/// Adds TEXT to the end of the installed library, as a library that differs in one function.
+fn lib_append(fx: &Fx, text: &str) {
+    let mut lib = fx.read("usr/local/sbin/propolis-alert-lib");
+    lib.push('\n');
+    lib.push_str(text);
+    lib.push('\n');
+    fx.write("usr/local/sbin/propolis-alert-lib", &lib);
+}
+
+/// The storm_last a notice that got ok keeps is the stamp of its claim, never one taken when its
+/// result is written: with the post counting two seconds on the test clock (the seam moves it on
+/// over the post as over each claim), a W line the hook writes one second after the claim is
+/// listed, once, by the next notice, and storm_last is the claim's stamp.
+#[test]
+fn a_w_line_written_after_the_claim_and_before_the_result_is_listed_once_by_the_next_notice() {
+    let mut fx = pool_full_shipper();
+    fx.setenv("PROPOLIS_WITNESS_POST_SECS", "2");
+    fx.pass(0);
+    fx.stub_file(
+        "curl.post.run",
+        &hook_w_script("unit:sensor-ftp.service", 1, "rm -f \"$1/curl.post.run\""),
+    );
+    fx.pass(300);
+    assert_eq!(fx.stub_text("hook.wrote"), "wrote\n", "{}", fx.log());
+    let lines = fx.notice_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}\n{}", fx.log());
+    let claim = lines[0][1].clone();
+    assert_eq!(
+        (claim.as_str(), lines[0][2].as_str(), lines[0][6].as_str()),
+        (stamp(302).as_str(), "storm", "ok")
+    );
+    let hook = fx
+        .w_lines()
+        .into_iter()
+        .find(|w| w[2] == kh8("unit:sensor-ftp.service"))
+        .unwrap();
+    assert_eq!(hook[1], stamp(303), "a second after the claim");
+    assert_eq!(fx.meta("storm_last").as_deref(), Some(claim.as_str()));
+    fx.pass(600);
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 2, "{:?}\n{}", fx.sent(), fx.log());
+    assert!(
+        notices[1].2.starts_with("Withheld: 1 message since ")
+            && notices[1].2.contains("; new incidents: 1 not named"),
+        "{:?}",
+        notices[1]
+    );
+    fx.pass(900);
+    assert_eq!(fx.notices().len(), 2, "{:?}", fx.sent());
+}
+
+/// The entry's case for the summary: with the storm notice spent for six hours, a W line the hook
+/// writes while the summary is posted (a second after its claim, the result two seconds after)
+/// is in the next summary, an hour later, once; summary_last is the summary's claim and storm_last
+/// stays as it was.
+#[test]
+fn a_w_line_the_hook_writes_while_a_summary_is_in_flight_is_in_the_next_summary() {
+    let mut fx = pool_full_shipper();
+    fx.setenv("PROPOLIS_WITNESS_POST_SECS", "2");
+    let mut ledger = String::from("#send-ledger v1 g=1\n");
+    for (i, k) in ["push:a", "push:b", "push:c", "push:d"].iter().enumerate() {
+        let id = format!("w#{}", 300 + i);
+        let s = stamp(0);
+        ledger.push_str(&inc_line(k, [&s, "pool", "open", "ok", "light", &id, &s]).join("\t"));
+        ledger.push('\n');
+    }
+    ledger.push_str(&notice_text(&before(3600), "storm", "ok", "light"));
+    ledger.push('\n');
+    fx.write("var/lib/propolis/witness/send-ledger", &ledger);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!("#meta v1 g=1\nM\tstorm_last\t{}\n", before(3600)),
+    );
+    fx.pass(0);
+    fx.stub_file(
+        "curl.post.run",
+        &hook_w_script("unit:sensor-ftp.service", 1, "rm -f \"$1/curl.post.run\""),
+    );
+    fx.pass(300);
+    assert_eq!(fx.stub_text("hook.wrote"), "wrote\n", "{}", fx.log());
+    let lines = fx.notice_lines();
+    assert_eq!(lines.len(), 2, "{lines:?}\n{}", fx.log());
+    let claim = lines[1][1].clone();
+    assert_eq!(
+        (claim.as_str(), lines[1][2].as_str(), lines[1][6].as_str()),
+        (stamp(302).as_str(), "summary", "ok")
+    );
+    let hook = fx
+        .w_lines()
+        .into_iter()
+        .find(|w| w[2] == kh8("unit:sensor-ftp.service"))
+        .unwrap();
+    assert_eq!(hook[1], stamp(303), "a second after the claim");
+    assert_eq!(fx.meta("summary_last").as_deref(), Some(claim.as_str()));
+    assert_eq!(
+        fx.meta("storm_last").as_deref(),
+        Some(before(3600).as_str())
+    );
+    // The summary's hour from its claim at 302 ends at 3902: the pass at 4200 sends the next one.
+    fx.pass(4200);
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 2, "{:?}\n{}", fx.sent(), fx.log());
+    assert!(
+        notices[1].2.starts_with("Withheld: 1 message since ")
+            && notices[1].2.contains("; new incidents: 1 not named"),
+        "{:?}",
+        notices[1]
+    );
+    assert_eq!(fx.notice_lines()[2][2], "summary");
+}
+
+/// The notice step reads the records afresh under its own lock: a W line another writer adds
+/// after the pass's last incident post wrote its result (here while the pass notes that the post
+/// failed) and before the notice is claimed is in that notice, and storm_last, taken from the
+/// claim, never passes over it unlisted.
+#[test]
+fn a_w_line_written_after_the_last_incident_post_and_before_the_notice_claim_is_in_that_notice() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(2400);
+    failed_shipper(&fx);
+    fx.pass(2400);
+    fx.add_w(&[w_text(&stamp(2690), "push:z", "change", "0", "-", "pool")]);
+    fx.stub_file("curl.post", "503");
+    write_exec(&fx.bin.join("logger"), LOGGER_RUN_STUB);
+    // After the incident post failed: the line, and the server answers again.
+    fx.stub_file(
+        "logger.run",
+        &hook_w_script("push:late", 0, "rm -f \"$1/curl.post\""),
+    );
+    fx.pass(2700);
+    assert_eq!(fx.stub_text("hook.wrote"), "wrote\n", "{}", fx.log());
+    assert!(
+        fx.log().contains("not delivered (transient:503)"),
+        "{}",
+        fx.log()
+    );
+    let notices = fx.notices();
+    assert_eq!(notices.len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+    assert!(
+        notices[0].2.starts_with("Withheld: 2 messages since "),
+        "{:?}",
+        notices[0]
+    );
+    let lines = fx.notice_lines();
+    assert_eq!(lines[0][6], "ok", "{lines:?}");
+    assert_eq!(fx.meta("storm_last").as_deref(), Some(lines[0][1].as_str()));
+}
+
+/// A storm notice's claim dated ahead of the clock (a later wall time from another boot, or a
+/// later uptime in this boot) is not taken as a post in flight: the pass still claims and sends
+/// its notice, which errs toward telling.
+#[test]
+fn a_notice_claim_dated_ahead_of_the_clock_does_not_hold_this_passs_notice() {
+    for ahead in [format!("{}/0badb007/5", WALL + 500), stamp(500)] {
+        let mut fx = Fx::new();
+        fx.v2();
+        fx.private_topic(0);
+        fx.add_w(&[w_text(&before(60), "push:a", "open", "1", "-", "pool")]);
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!(
+                "#send-ledger v1 g=1\n{}\n",
+                notice_text(&ahead, "storm", "sending", "light")
+            ),
+        );
+        fx.pass(0);
+        let notices = fx.notices();
+        assert_eq!(notices.len(), 1, "{ahead}: {:?}\n{}", fx.sent(), fx.log());
+        assert!(notices[0].2.starts_with("Withheld: 1 message since "));
+        assert_eq!(fx.notice_lines()[0][1], stamp(0), "{ahead}");
+    }
+}
+
+/// A notice that cannot be put together (a library whose check refuses every rendered notice) is
+/// neither claimed nor posted, with W lines there to tell: nothing is counted for a message that
+/// never went, and no summary takes its place.
+#[test]
+fn a_notice_that_cannot_be_rendered_is_neither_claimed_nor_posted() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    fx.add_w(&[w_text(&before(60), "push:a", "open", "1", "-", "pool")]);
+    lib_append(
+        &fx,
+        "_pa_render_check() { PA_TITLE=\"\" PA_PRIO=\"\" PA_BODY=\"\"; return 1; }",
+    );
+    fx.pass(0);
+    assert!(fx.notice_lines().is_empty(), "{}", fx.log());
+    assert!(fx.sent().is_empty(), "{:?}", fx.sent());
+    assert_eq!(
+        (fx.meta("storm_last"), fx.meta("summary_last")),
+        (None, None)
+    );
+}
+
+/// Without curl a notice could not leave the host whatever the server said: none is claimed or
+/// counted against its class, no meta key moves and no line says one was not delivered, so the
+/// notice is still owed once curl is back.
+#[test]
+fn without_curl_no_notice_is_claimed_or_counted() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    fx.add_w(&[w_text(&before(60), "push:a", "open", "1", "-", "pool")]);
+    let dir = path_without_curl(&fx);
+    fx.setenv("PATH", &dir.display().to_string());
+    fx.pass(0);
+    assert!(fx.notice_lines().is_empty(), "{}", fx.log());
+    assert_eq!(
+        (fx.meta("storm_last"), fx.meta("summary_last")),
+        (None, None)
+    );
+    assert!(!fx.log().contains("notice not delivered"), "{}", fx.log());
+    let path = format!("{}:{}", fx.bin.display(), std::env::var("PATH").unwrap());
+    fx.setenv("PATH", &path);
+    fx.pass(300);
+    assert_eq!(fx.notices().len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+}
+
+/// A pass whose state was kept nowhere (the incidents file refused in both directories) claims no
+/// notice, with W lines in memory to tell: with nothing to remember it by, the next pass would
+/// tell the same lines again.
+#[test]
+fn a_pass_whose_state_was_kept_nowhere_claims_no_notice() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    fx.incidents(&[hook_record(
+        "w#1",
+        "sensor-ssh.service",
+        "ACT",
+        "open",
+        0,
+        "0",
+    )]);
+    fx.add_w(&[w_text(&before(60), "push:a", "open", "1", "-", "pool")]);
+    fx.stub_file("disk.refuses", "*/incidents.tmp.*\n");
+    fx.pass(300);
+    assert_eq!(fx.meta("where").as_deref(), Some("none"), "{}", fx.log());
+    assert!(fx.notice_lines().is_empty(), "{}", fx.log());
+    assert!(fx.sent().is_empty(), "{:?}", fx.sent());
+    assert_eq!(
+        (fx.meta("storm_last"), fx.meta("summary_last")),
+        (None, None)
+    );
+}
+
+/// A storm notice whose claim cannot be written to the send ledger (the write refused once, after
+/// a read the budget could count) sends nothing on that pass: no summary stands in for a storm
+/// notice the ledger could not count. The next pass sends the storm notice.
+#[test]
+fn a_storm_notice_whose_claim_cannot_be_written_sends_no_summary_in_its_place() {
+    let mut fx = Fx::new();
+    fx.v2();
+    fx.private_topic(0);
+    fx.add_w(&[w_text(&before(60), "push:a", "open", "1", "-", "pool")]);
+    lib_append(
+        &fx,
+        "eval \"_fx_orig_$(declare -f pa_state_write)\"\n\
+         pa_state_write() {\n\
+         \x20   if [ \"${1:-}\" = send-ledger ] && [ -f \"${UNITS%/units}/ledger.refuse\" ]; then\n\
+         \x20       rm -f \"${UNITS%/units}/ledger.refuse\"\n\
+         \x20       cat > /dev/null\n\
+         \x20       return 1\n\
+         \x20   fi\n\
+         \x20   _fx_orig_pa_state_write \"$@\"\n\
+         }",
+    );
+    fx.stub_file("ledger.refuse", "");
+    fx.pass(0);
+    assert!(
+        !fx.dir.path().join("ledger.refuse").exists(),
+        "the write was refused: {}",
+        fx.log()
+    );
+    assert!(fx.notice_lines().is_empty(), "{}", fx.log());
+    assert!(fx.sent().is_empty(), "{:?}", fx.sent());
+    fx.pass(300);
+    let lines = fx.notice_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}\n{}", fx.log());
+    assert_eq!(lines[0][2], "storm");
+}
+
+/// The host's clock as the library reads it, as (wall seconds, the first 8 hex of the boot id,
+/// whole seconds of uptime).
+fn host_now() -> (u64, String, u64) {
+    let wall = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let boot: String = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .unwrap()
+        .trim()
+        .replace('-', "")
+        .chars()
+        .take(8)
+        .collect();
+    let up: u64 = std::fs::read_to_string("/proc/uptime")
+        .unwrap()
+        .split('.')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    (wall, boot, up)
+}
+
+/// On the host's own clock (no test clock), the notice step dates what it reads at its claim and
+/// not at the start of the pass: while an hourly pass that stands in for a stale light pass runs
+/// config-check, before it takes the lock, another pass claims a storm notice. Sent but with no
+/// result yet, that claim holds the hourly pass's notice; with its result ok and storm_last its
+/// claim, the hourly pass sends a summary of the lines from that key on alone.
+#[test]
+fn a_notice_another_pass_claims_while_the_hourly_pass_runs_is_read_on_the_clock_of_the_claim() {
+    for result in ["sending", "ok"] {
+        let mut fx = Fx::new();
+        fx.v2();
+        fx.unsetenv("PROPOLIS_WITNESS_NOW");
+        fx.install_cc();
+        fx.cc(&cc_tsv(&[], &[]), 0);
+        fx.curl_answers("403|text/plain");
+        let (wall, boot, up) = host_now();
+        assert!(boot.len() == 8 && up > 0, "{boot} {up}");
+        // Stamps of another boot, by the wall clock: the light pass's last 1000 s ago (stale
+        // past 900 s, not yet witness-stale at 1200 s), the last summary two hours ago, a daily
+        // message a minute ago (so none is due on this pass) and a withheld line ten minutes ago.
+        let other = |back: u64| format!("{}/0badb007/5", wall - back);
+        fx.write(
+            "var/lib/propolis/witness/readcheck",
+            &format!(
+                "#readcheck v1 g=1\nR\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\t-\t403\t403\tboth\t403\n",
+                s = other(60)
+            ),
+        );
+        fx.write(
+            "var/lib/propolis/witness/meta",
+            &format!(
+                "#meta v1 g=1\nM\tlight_last\t{}\nM\tsummary_last\t{}\n",
+                other(1000),
+                other(7200)
+            ),
+        );
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!(
+                "#send-ledger v1 g=1\nL\t{}\tdaily\t-\tdaily\tfull\tok\tlight\n",
+                other(60)
+            ),
+        );
+        fx.add_w(&[w_text(&other(600), "push:a", "open", "1", "-", "pool")]);
+        let root = fx.root.display().to_string();
+        let keep = if result == "ok" {
+            "pa_meta_put storm_last \"$PA_LEDGER_STAMP\" && pa_incident_load \\\n\
+             && pa_w_line push:b change 0 - pool && pa_incident_write \\\n&& "
+        } else {
+            ""
+        };
+        fx.cc_during(&format!(
+            "sleep 2\n. \"{root}/usr/local/sbin/propolis-alert-lib\" && pa_init \"{root}\" \\\n\
+             && pa_lock 10 && pa_ledger_add storm - storm full {result} light \\\n\
+             && {keep}echo \"$PA_LEDGER_STAMP\" > \"{d}/cc.claimed\"\npa_unlock\n",
+            d = fx.dir.path().display()
+        ));
+        fx.hourly_alone(0);
+        let claimed = fx.stub_text("cc.claimed").trim().to_string();
+        assert!(
+            claimed.contains(&format!("/{boot}/")),
+            "{result}: {claimed}\n{}",
+            fx.log()
+        );
+        let lines = fx.notice_lines();
+        assert_eq!(lines[0][1], claimed, "{result}: {lines:?}");
+        let notices = fx.notices();
+        if result == "sending" {
+            assert!(notices.is_empty(), "{:?}\n{}", fx.sent(), fx.log());
+            assert_eq!(lines.len(), 1, "{lines:?}");
+        } else {
+            assert_eq!(notices.len(), 1, "{:?}\n{}", fx.sent(), fx.log());
+            assert!(
+                notices[0].2.starts_with("Withheld: 1 message since "),
+                "{:?}",
+                notices[0]
+            );
+            assert_eq!(
+                (lines.len(), lines[1][2].as_str(), lines[1][7].as_str()),
+                (2, "summary", "hourly"),
+                "{lines:?}"
+            );
+        }
     }
 }

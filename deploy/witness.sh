@@ -102,9 +102,9 @@
 # send step, below): admitted under the lock in the send ledger and the record, claimed again
 # under the lock just before each post, posted with the lock released, retried after 120 s
 # while pending, withheld by the send budget with a W line. Each pass posts what it admitted
-# itself, the hourly pass its own kinds' transitions. The retries, the hook's records and the
-# daily message are the light pass's; while the light pass is stale the hourly pass stands in
-# for it and takes those too.
+# itself, the hourly pass its own kinds' transitions. The retries, the hook's records, the storm
+# notice and the summary of what was withheld (below) and the daily message are the light
+# pass's; while the light pass is stale the hourly pass stands in for it and takes those too.
 # Its other network requests are the read check's GETs and the heartbeat URL's
 # GET, which carry no message, the GET of the daemon's /ready on loopback, and the read-only
 # database probe and hourly state session.
@@ -157,11 +157,12 @@
 # PROPOLIS_WITNESS_SOFT_DEADLINE replaces the 160 s by which every optional probe must end;
 # PROPOLIS_WITNESS_SPOOL_MAX replaces the 1024 entries one spool listing reads;
 # PROPOLIS_WITNESS_SEND_CUT replaces the 200 s (light) or 720 s (hourly) after which no incident
-# message is posted; PROPOLIS_WITNESS_POST_SECS counts each claim of the send step as taking
-# that many seconds, on the test clock and against the send cut, as posts in a row take time.
+# message, storm notice or summary is claimed for its post; PROPOLIS_WITNESS_POST_SECS counts
+# each claim of the send step, and the post of a storm notice or a summary, as taking that many
+# seconds, on the test clock and against the send cut, as posts in a row take time.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 13
+# needs-alert-lib: 14
 
 umask 077
 WITNESS_SELF="${BASH_SOURCE[0]}"
@@ -318,7 +319,7 @@ pa_unit_name_ok pa_incident_fold pa_env_get pa_sensor_logs pa_readcheck_binding 
 pa_readcheck_merge pa_pg pa_heartbeat_get pa_journal_patterns pa_jcursor_ok pa_vol_project pa_vol_judge
 pa_vol_stores pa_gate pa_daily_due pa_budget_admit pa_render pa_ledger_add pa_ledger_result
 pa_cred_fp pa_send pa_incident_admit pa_retry_due pa_ledger_retry pa_incident_result pa_budget_class
-pa_ledger_charge"
+pa_ledger_charge pa_w_line pa_notice_admit pa_notice_close pa_meta_value"
 # shellcheck disable=SC2086 # the list is a fixed set of names
 unset -f $WITNESS_LIB_FUNCS
 # Loaded once in a subshell first: under set -u an unbound variable at the library's top level
@@ -375,13 +376,17 @@ LOCK_WAIT=60
 # After the pass, under profile v2 alone, come the incident messages (the send step, below): none
 # is claimed past WITNESS_SEND_CUT, 200 s, and a claim's wait for the lock (10 s at most) ends by
 # the cut; what is claimed is posted, and each post takes at most pa_send's 40 s, 10 s for the
-# lock to note its result and two notes, 10 s, so the last ends by 260 s. Then, once a day, the
+# lock to note its result and two notes, 10 s, so the last ends by 260 s. The storm notice or
+# summary after them is one more post on the same terms: none is claimed past the cut, its claim
+# waits 10 s at most and never past it, and its post, the lock for its result and its two notes
+# take the same 60 s, so it too ends by 260 s, and one that would start later waits for a later
+# pass. Then, once a day, the
 # daily message's post, 40 s, 30 s for the lock to note its result and a note, 5 s; then the
 # banner and the heartbeat URL's GET, 15 s, a note, 5 s, and 10 s for the lock to note its
 # result: 365 s at most, far inside the unit's 15 minutes (900 s). The hourly pass posts the
-# incident messages of its own kinds after its own 690 s, and the retries and the daily message
-# only while it stands in for a stale light pass: its incident messages (cut at 720 s) end by
-# 780 s, the daily message by 855 s, and its three notes by 870 s.
+# incident messages of its own kinds after its own 690 s, and the retries, the notice and the
+# daily message only while it stands in for a stale light pass: its incident messages and its
+# notice (cut at 720 s) end by 780 s, the daily message by 855 s, and its three notes by 870 s.
 WITNESS_DEADLINE=240
 if [ "$INSTANCE" = hourly ]; then
     # The programs an hourly pass always runs each have their own limit: config-check 300 s; the
@@ -440,8 +445,9 @@ WITNESS_SOFT_DEADLINE=160
 if [ -n "$ROOT" ] && [[ ${PROPOLIS_WITNESS_SOFT_DEADLINE:-} =~ ^[0-9]{1,3}$ ]]; then
     WITNESS_SOFT_DEADLINE="$((10#$PROPOLIS_WITNESS_SOFT_DEADLINE))"
 fi
-# No incident message is claimed for its post once this many seconds have gone (the sum is above
-# WITNESS_DEADLINE): what is left stays as it was admitted, and a later pass posts it.
+# No incident message, storm notice or summary is claimed for its post once this many seconds
+# have gone (the sum is above WITNESS_DEADLINE): what is left stays as it was admitted, and a
+# later pass posts it.
 WITNESS_SEND_CUT=200
 [ "$INSTANCE" != hourly ] || WITNESS_SEND_CUT=720
 if [ -n "$ROOT" ] && [[ ${PROPOLIS_WITNESS_SEND_CUT:-} =~ ^[0-9]{1,3}$ ]]; then
@@ -1699,11 +1705,11 @@ ledger_state() {
 }
 
 # w_line KEY TX NEW REASON: the withheld transition's line in incidents, `W stamp keyhash tx new
-# inst reason`, which names the key by its hash alone.
+# inst reason`, which names the key by its hash alone. The library writes it (pa_w_line), stamped
+# at the write and not at the start of the pass: a notice lists the lines stamped at or after its
+# claim, and one stamped earlier than it was written could fall before a claim made in between.
 w_line() {
-    local kh
-    kh="$(_pa_keyhash "$1")" || return 0
-    _PA_INC_REST+=("W"$'\t'"$PA_STAMP"$'\t'"$kh"$'\t'"$2"$'\t'"$3"$'\t'"${PA_INC[5]:--}"$'\t'"$4")
+    pa_w_line "$1" "$2" "$3" "${PA_INC[5]:--}" "$4" || return 0
     CHANGED=1
 }
 
@@ -1860,6 +1866,30 @@ send_time_left() {
     [ "$((SECONDS + SEND_SKEW))" -lt "$WITNESS_SEND_CUT" ]
 }
 
+# send_lock_wait: how long a claim may wait for the lock, 10 s and never past WITNESS_SEND_CUT,
+# printed; status 1 when no time is left for it.
+send_lock_wait() {
+    local wait
+    wait="$((WITNESS_SEND_CUT - SECONDS - SEND_SKEW))"
+    [ "$wait" -le 10 ] || wait=10
+    [ "$wait" -ge 1 ] || return 1
+    printf '%s' "$wait"
+}
+
+# send_step_clock: under the test seam PROPOLIS_WITNESS_POST_SECS, a claim (or a notice's post)
+# counts that many seconds against the send cut and moves the test clock on by as much, as posts
+# in a row take time.
+send_step_clock() {
+    [ "$SEND_STEP" -gt 0 ] || return 0
+    SEND_SKEW=$((SEND_SKEW + SEND_STEP))
+    # Only a clock this script took from PROPOLIS_WITNESS_NOW, whose parts are digits by its
+    # pattern, is moved on.
+    if [ "$TEST_CLOCK" = 1 ]; then
+        PA_TEST_WALL="$((10#$PA_TEST_WALL + SEND_STEP))" PA_TEST_UP="$((10#$PA_TEST_UP + SEND_STEP))"
+        pa_now
+    fi
+}
+
 # send_claim KEY TX STAMP KEYHASH NEW: under the lock, the transition TX admitted at STAMP is
 # this pass's to post: the record still holds it with that admission, and its ledger line is the
 # admission still untried (NEW 1: pending, its last attempt the admission) or is due for a retry
@@ -1871,19 +1901,9 @@ send_time_left() {
 # hour rule. Status 1 when it is not this pass's, no time is left or the lock was not had.
 send_claim() {
     local key="$1" tx="$2" stamp="$3" kh="$4" new="$5" st result tried ok=1 wait
-    wait="$((WITNESS_SEND_CUT - SECONDS - SEND_SKEW))"
-    [ "$wait" -le 10 ] || wait=10
-    [ "$wait" -ge 1 ] || return 1
+    wait="$(send_lock_wait)" || return 1
     pa_lock "$wait" || return 1
-    if [ "$SEND_STEP" -gt 0 ]; then
-        SEND_SKEW=$((SEND_SKEW + SEND_STEP))
-        # Only a clock this script took from PROPOLIS_WITNESS_NOW, whose parts are digits by
-        # its pattern, is moved on.
-        if [ "$TEST_CLOCK" = 1 ]; then
-            PA_TEST_WALL="$((10#$PA_TEST_WALL + SEND_STEP))" PA_TEST_UP="$((10#$PA_TEST_UP + SEND_STEP))"
-            pa_now
-        fi
-    fi
+    send_step_clock
     pa_incident_load
     if pa_incident_get "$key" && [ "${PA_INC[26]}" = "$tx" ] && [ "${PA_INC[27]}" = "$stamp" ] \
         && st="$(ledger_state "$stamp" "$kh" "$tx")"; then
@@ -1919,6 +1939,139 @@ send_post() {
         # The stored cause before a change is not kept: a retried change says it was not known.
         send_one "$key" "$tx" "$stamp" - "$kh" -
     done
+}
+
+# ---- the storm notice and the summary (profile v2) ------------------------------------------
+#
+# What the budget withheld is told by two notices, each in a budget class of its own that counts
+# against nothing else and nothing else against it: the storm notice at once, when none went in
+# 6 hours, else the summary, at most one an hour and twelve a day; at most one of them a pass. A
+# withheld open or reopen of a PAGE incident is named in the title at priority 5 (the renderer's
+# rule), so a listener the caps hold back is never one count in a message of priority 3, and a
+# summary that names one is held only by the hour, not by the twelve a day (notice_claim passes
+# the library the word `page`), so a spent day does not make it wait for the next storm notice.
+# The hour is measured at a pass: the summary goes on the first sending pass an hour or more
+# after the last one.
+#
+# Only a pass that sends for the host sends them: the light pass, or the hourly pass while it
+# stands in for a stale light pass (SEND_RETRY); only under profile v2, with the gate full (a
+# gate short of it is the pointer message's), after the pass's incident messages, so a notice
+# never takes a post's time from them, and within the same send cut. Under the lock
+# (notice_claim) the W lines are read afresh and the message is rendered first, so one that
+# cannot be put together is never counted; then it is admitted and claimed in the send ledger;
+# with the lock released it is posted; then its result is written, and, only when it got ok,
+# its class's meta key takes the claim's stamp in that same locked section (pa_notice_close).
+# A W line written after the claim, by the failure hook while the post is in flight among
+# others, is stamped at or after it and is listed by the next notice; a notice that failed, got
+# no answer, was cut short or whose result could not be written leaves the key as it was, so the
+# next one lists its lines again.
+
+NOTICE_GO=0 NOTICE_CLASS="" NOTICE_STAMP="" NOTICE_TITLE="" NOTICE_PRIO="" NOTICE_BODY=""
+
+# notice_since: the stamp a notice lists what was withheld since: the later of meta storm_last and
+# summary_last, each only in form and not ahead of the clock (pa_meta_value), nothing when neither
+# is, which lists every W line. A stamp of this boot is the later one beside a stamp of another,
+# whatever the wall clock says; two of other boots go by the wall clock.
+notice_since() {
+    local s m sb="" mb=""
+    s="$(pa_meta_value storm_last)" || s=""
+    m="$(pa_meta_value summary_last)" || m=""
+    if [ -z "$s" ] || [ -z "$m" ]; then
+        printf '%s' "${s:-$m}"
+        return 0
+    fi
+    _pa_stamp_split "$s" && sb="$_PA_B"
+    _pa_stamp_split "$m" && mb="$_PA_B"
+    if [ "$sb" != "$mb" ] && [ "$sb" = "${PA_BOOT:-}" ]; then
+        printf '%s' "$s"
+    elif [ "$sb" != "$mb" ] && [ "$mb" = "${PA_BOOT:-}" ]; then
+        printf '%s' "$m"
+    elif stamp_after "$m" "$s"; then
+        printf '%s' "$m"
+    else
+        printf '%s' "$s"
+    fi
+}
+
+# notice_in_flight: a storm notice or a summary another pass claimed under 120 s ago still has no
+# result: its post may be in flight, and a notice now would tell the same lines again. One older
+# than that was cut short (a post and the write of its result take at most 50 s); one dated ahead
+# of the clock is not taken as in flight, which errs toward telling.
+notice_in_flight() {
+    local t s c r a
+    while IFS=$'\t' read -r t s c _ _ _ r _; do
+        [ "$t" = L ] && [ "${r:-}" = sending ] || continue
+        case "${c:-}" in storm | summary) ;; *) continue ;; esac
+        a="$(pa_age "${s:-}")"
+        [ "$a" -ge 0 ] && [ "$a" -lt 120 ] && return 0
+    done < <(pa_state_read send-ledger)
+    return 1
+}
+
+# notice_claim: under the lock, with the records read afresh: the storm notice when its class
+# admits one, else the summary when its class does, rendered over the W lines since notice_since
+# and claimed (pa_notice_admit). Nothing withheld, or a message that cannot be rendered, claims
+# nothing; any verdict but its own cap stops the step, so a summary never stands in for a storm
+# notice the ledger could not count. NOTICE_GO is 1 when notice_step is to post it.
+notice_claim() {
+    local since class
+    NOTICE_GO=0
+    notice_in_flight && return 0
+    since="$(notice_since)"
+    for class in storm summary; do
+        pa_render full "$class" "$since" || return 0
+        # A notice that names a withheld PAGE incident says so: a summary's day cap then steps
+        # aside, and only its hour holds it.
+        pa_notice_admit "$class" "$SEND_SENDER" "${PA_WH_PAGE:+page}" > /dev/null
+        case "$PA_ADMIT_VERDICT" in
+            admit)
+                NOTICE_CLASS="$class" NOTICE_STAMP="$PA_NOTICE_STAMP"
+                NOTICE_TITLE="$PA_TITLE" NOTICE_PRIO="$PA_PRIO" NOTICE_BODY="$PA_BODY"
+                NOTICE_GO=1
+                return 0
+                ;;
+            "withhold:$class-cap") ;;
+            *) return 0 ;;
+        esac
+    done
+    return 0
+}
+
+# notice_step: the notice of a pass that sends for the host, after its incident messages. See the
+# section comment. The claim's wait for the lock is 10 s and never past WITNESS_SEND_CUT, as an
+# incident message's is, so what is claimed is posted inside the pass's time sums. The journal
+# line names the class and the result, never the target, the topic, the token, an instance or an
+# incident id.
+notice_step() {
+    local wait result rc=0
+    [ "$SEND_V2" = 1 ] || return 0
+    [ "$SEND_RETRY" = 1 ] && [ "$SEND_GATE" = full ] && [ "$SEND_LEDGER_BAD" = 0 ] || return 0
+    [ "${WHERE:-none}" != none ] || return 0
+    command -v curl > /dev/null 2>&1 || return 0
+    send_time_left || return 0
+    wait="$(send_lock_wait)" || return 0
+    pa_lock "$wait" || return 0
+    # The clock of the claim: the pass's own stamp is from its start or its last admission, and a
+    # notice line or key another pass wrote since would read as ahead of it, so as no claim in
+    # flight, outside every cap and no key at all.
+    pa_now
+    send_step_clock
+    pa_incident_load
+    notice_claim
+    pa_unlock
+    [ "$NOTICE_GO" = 1 ] || return 0
+    pa_send "$NOTICE_TITLE" "$NOTICE_PRIO" < <(printf '%s\n' "$NOTICE_BODY") || true
+    # Under the test seam the post takes time too, so the result is written later than the claim,
+    # as on a host.
+    send_step_clock
+    result="$PA_SEND_RESULT"
+    pa_notice_close "$NOTICE_STAMP" "$NOTICE_CLASS" "$result" "$SEND_SENDER" || rc=$?
+    case "$rc" in
+        2) note "the result of the $NOTICE_CLASS notice ($result) was not recorded: the state lock was busy" ;;
+        1) note "the result of the $NOTICE_CLASS notice ($result) was not recorded" ;;
+    esac
+    [ "$result" = ok ] || note "$NOTICE_CLASS notice not delivered ($result)"
+    return 0
 }
 
 # ---- config-check's findings ----------------------------------------------------------------
@@ -6349,6 +6502,7 @@ light_pass() {
         note "heartbeat URL not requested: PROPOLIS_WITNESS_HEARTBEAT_URL is not a valid https:// URL"
     fi
     send_post
+    notice_step
     daily_send
 
     PA_WHERE="$WHERE"
@@ -6514,6 +6668,7 @@ hourly_pass() {
     write_heartbeat "$status"
     pa_unlock
     send_post
+    notice_step
     daily_send
     [ "$CC_DONE" = 1 ] || note "config-check did not complete: ${CC_WHY:-exit $CC_RC}"
     [ "$CC_BAD" = 0 ] || note "config-check printed $CC_BAD finding lines that are not in its form; skipped, and no finding they could be is taken as gone"

@@ -745,12 +745,9 @@ restore() {
     for f in "$dir"/sbin/*; do
         name="$(basename "$f")"
         skipped "$name" && continue
-        # The library is sourced, never run: 0644, as the deploy scripts install it.
-        if [ "$name" = "$ALERT_LIB" ]; then
-            install -m 0644 "$f" "$ROOT/usr/local/sbin/$name"
-        else
-            install -m 0755 "$f" "$ROOT/usr/local/sbin/$name"
-        fi
+        # The library goes back last, below.
+        [ "$name" != "$ALERT_LIB" ] || continue
+        install -m 0755 "$f" "$ROOT/usr/local/sbin/$name"
     done
     for f in "$dir"/units/*; do
         name="$(basename "$f")"
@@ -769,6 +766,14 @@ restore() {
         fi
     done
     shopt -u nullglob
+    # The library last, once every script that sources it is the one that stays: the witness's
+    # timers keep running through a rollback, and a pass started between the two installs would
+    # run the current witness over an older library it refuses (it exits 3 and its unit
+    # fails). Until then each older script is served by the current library, as functions are only
+    # ever added to it. Sourced, never run: 0644, as the deploy scripts install it.
+    if [ -f "$dir/sbin/$ALERT_LIB" ] && ! skipped "$ALERT_LIB"; then
+        install -m 0644 "$dir/sbin/$ALERT_LIB" "$ROOT/usr/local/sbin/$ALERT_LIB"
+    fi
     [ -f "$dir/deploy-stamp.json" ] && install -m 0644 "$dir/deploy-stamp.json" "$ROOT/var/lib/propolis/deploy-stamp.json"
     [ -e "$dir/sbin/propolis-backup" ] || BACKUP_RUNS=0
     systemctl daemon-reload

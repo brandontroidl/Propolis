@@ -522,16 +522,13 @@ transition that adds to `would_push` in the default profile is sent as an incide
   (`deploy/alert-lib.sh#pa_incident_admit`): an admitted one gets its `pending` line in the send
   ledger and then its pending transition in the record, both written before anything is posted;
   a withheld one gets a `W` line in the incidents file naming the budget's reason (none for a
-  RESOLVED whose open never got through). No pass reads the `W` lines yet: the library holds the
-  storm notice and the hourly summary that will list them
-  (`deploy/alert-lib.sh#pa_withheld_since`, each counted against its own cap and never against
-  the pool, the listener caps or a key), which count every line since the last notice, name the
-  new incidents ten at most and count the rest, and, for a withheld open or reopen of a PAGE
-  incident, name it in the title at priority 5; a line or a record out of form is counted and
-  never named. The library also holds the pointer message for a topic not proven private, with a
-  ref and nothing else (`deploy/alert-lib.sh#pa_render`), and can admit and record it in its own
-  budget class (`deploy/alert-lib.sh#pa_notice_admit`). Nothing sends it yet: the rules for when
-  a pointer is sent come with its senders. A record that is not whole, a kind the tables do not
+  RESOLVED whose open never got through), stamped when it is written
+  (`deploy/alert-lib.sh#pa_w_line`, the one writer of a `W` line, the failure hook's included);
+  the storm notice and the summary below list them. The library also holds the pointer message
+  for a topic not proven private, with a ref and nothing else (`deploy/alert-lib.sh#pa_render`),
+  and can admit and record it in its own budget class (`deploy/alert-lib.sh#pa_notice_admit`).
+  Nothing sends it yet: the rules for when a pointer is sent come with its senders. A record
+  that is not whole, a kind the tables do not
   know and a send ledger no copy of which can be read are each withheld, never sent. A change or
   a reminder of an incident whose open or reopen is still pending is only recorded: the retry of
   that open renders the record as it then is. One message per incident and pass.
@@ -545,6 +542,42 @@ transition that adds to `would_push` in the default profile is sent as an incide
   delivered for an open, a reopen or a reminder, so a late open (the reminder of a withheld
   open) that gets through lets its RESOLVED follow; a change that gets through does not, so an
   incident whose open the operator never had sends no RESOLVED.
+- Then, on a pass that sends for the host (the light pass, or the hourly pass while it stands in
+  for a stale light pass) and only with the gate full, what the budget withheld is told
+  (`deploy/witness.sh#notice_step`). Under the lock the pass reads the `W` lines written since
+  the operator was last told, that is since the later of meta `storm_last` and `summary_last`
+  (each taken only in its form and not ahead of the clock; every line when neither is). When
+  there are any it sends a storm notice when none went in 6 hours, else a summary when the last
+  is at least an hour old and fewer than 12 went in a day; at most one of them a pass, each in a
+  budget class of its own that counts against nothing else and that nothing else counts
+  against. A summary that names a withheld open or reopen of a PAGE incident is held only by
+  the hour, not by the 12 a day, so a spent day does not make it wait for the next storm notice,
+  up to six hours on. What that does not give: such a summary counts toward the day's 12 like
+  any other, so it can use up the day of the ordinary ones; while a PAGE line stays listed and
+  the server fails every attempt, up to 24 attempts a day are made; a PAGE line that cannot be
+  named (its record gone or out of form) keeps the day's cap; and the hour is measured at a
+  pass, so the summary goes on the first sending pass an hour or more after the last one, which
+  under the hourly pass standing in for a stale light pass (its timer spreads each run over ten
+  minutes) can be just over two hours later. Each notice counts the lines, names up to ten new
+  incidents by their instance ids and counts the rest, and says when the next summary may go
+  (the time for an ordinary one: a summary that names a withheld PAGE incident can go sooner);
+  a line or a record out of form is counted and never named, so damage can make a notice say
+  more was withheld, never less. **A withheld open
+  or reopen of a PAGE incident is named in the title, `<alias>: PAGE withheld <inst>`, and on a
+  first line, at priority 5**, whatever else is counted, so a dead listener the caps hold back
+  (after eight listener opens in a day, a new one waits at most for the next hour's allowance)
+  is never one count in a message of priority 3. The message is rendered first, so one that
+  cannot be put together is never counted, then claimed in the send ledger under the same lock
+  (`deploy/alert-lib.sh#pa_notice_admit`), posted with the lock released, and its result written
+  under the lock (`deploy/alert-lib.sh#pa_notice_close`); only a notice that got `ok` moves its
+  meta key, to the stamp of its claim, so a line written while it was posted (by the failure
+  hook, say) is in the next notice, and a notice that failed, was refused, got no answer or whose
+  result could not be written leaves the key as it was and the next notice lists its lines
+  again. A line may be listed twice, never not at all. A notice another pass claimed under two
+  minutes ago and whose result is not yet written holds this pass's notice, so two passes at
+  once do not tell the same lines twice. No notice is claimed once the pass's send cut has
+  passed; a later pass sends it. With the gate short of full (pointer mode) there is neither a
+  storm notice nor a summary: pointers are not withheld by the pool or the listener caps.
 - `alert-path` opens on the next light pass when a server refused a message for good
   (`perm:<code>`, the cause the message names, such as `http.auth:403`) or when a transition has
   been undelivered for more than 15 minutes (the cause its last answer names: `http.server:<code>`
@@ -559,7 +592,9 @@ transition that adds to `would_push` in the default profile is sent as an incide
   opens no `alert-path`. In the default profile none of this runs, and a pending transition is
   left as the previous release leaves it.
 - No claim starts once the pass has run 200 s, and its wait for the lock ends by then; what is
-  claimed is posted, and what is left stays as it was admitted for a later pass. Each post is
+  claimed is posted, and what is left stays as it was admitted for a later pass. The storm
+  notice or summary is claimed by the same rule, after the incident messages, so it adds no time
+  past the last post the cut allows. Each post is
   bounded by the sender's 40 s, each lock wait by 10 s and each journal line by 5 s, so a light
   pass ends by 365 s with the daily message and the heartbeat URL, inside the unit's 15 minutes.
 - A message the failure hook sent without the lock is charged to the send ledger once, when the
@@ -581,8 +616,8 @@ transition that adds to `would_push` in the default profile is sent as an incide
   the hook's records and its own kinds: it samples the units when the whole sample (43 s) fits
   before its soft deadline, takes in the hook's spool files, judges the first sightings the hook
   left pending by the light pass's rule, sends the reminders that fall due on the hook's records
-  and its own kinds, posts what it admitted and retries what is pending; its sends stop at 720 s
-  and it ends by 870 s.
+  and its own kinds, posts what it admitted, retries what is pending and sends the storm notice
+  or summary; its sends stop at 720 s and it ends by 870 s.
 
 **The heartbeat URL.** `PROPOLIS_WITNESS_HEARTBEAT_URL` is the ping URL of an external dead-man
 check, such as a private healthchecks.io check with no public status page. Put it in

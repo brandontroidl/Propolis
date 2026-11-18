@@ -2255,11 +2255,13 @@ fn shipped_lib_version() -> u32 {
 }
 
 /// The shell code sends the test page, the witness's daily message and, under profile v2 alone,
-/// the failure hook's and the witness's new-format messages: pa_send is called from exactly four
+/// the failure hook's and the witness's new-format messages: pa_send is called from exactly five
 /// places in deploy/, the hook's test-page function, the witness's daily_send, which only its two
 /// passes call, the v2 path's one post (_pa_hv2_post), which only the v2 path's own functions
-/// call, and the witness's send_one, which only its send_post calls, which only its two passes
-/// call and which posts nothing unless profile v2 is in force
+/// call, the witness's send_one, which only its send_post calls, which only its two passes
+/// call and which posts nothing unless profile v2 is in force, and the witness's notice_step (the
+/// storm notice and the summary), which only its two passes call and which posts nothing unless
+/// profile v2 is in force
 /// (only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code). The test-page
 /// function is run only from the failure hook's test-page path, and the v2 path only from the
 /// hook's v2 child, which follows a decision no run without a test root passes
@@ -2274,6 +2276,7 @@ fn pa_send_is_called_only_by_the_test_page_path_the_daily_message_and_the_two_v2
     let mut v2 = Vec::new();
     let mut one = Vec::new();
     let mut step = Vec::new();
+    let mut notices = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|e| e != "sh") {
@@ -2314,6 +2317,9 @@ fn pa_send_is_called_only_by_the_test_page_path_the_daily_message_and_the_two_v2
             if t.contains("send_post") && !t.starts_with("send_post()") {
                 step.push(format!("{name}:{function}"));
             }
+            if t.contains("notice_step") && !t.starts_with("notice_step()") {
+                notices.push(format!("{name}:{function}"));
+            }
             if t.contains("pa_hook_test_page") && !t.starts_with("pa_hook_test_page()") {
                 runs.push(name.clone());
             }
@@ -2336,9 +2342,16 @@ fn pa_send_is_called_only_by_the_test_page_path_the_daily_message_and_the_two_v2
             "alert-lib.sh:_pa_hv2_post",
             "alert-lib.sh:pa_hook_test_page",
             "witness.sh:daily_send",
+            "witness.sh:notice_step",
             "witness.sh:send_one"
         ],
         "pa_send call sites"
+    );
+    notices.sort();
+    assert_eq!(
+        notices,
+        ["witness.sh:hourly_pass", "witness.sh:light_pass"],
+        "notice_step call sites"
     );
     assert!(!one.is_empty());
     assert!(

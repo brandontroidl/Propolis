@@ -1291,6 +1291,87 @@ fn a_kept_library_that_every_consumer_in_place_accepts_is_restored() {
     );
 }
 
+/// `install`, logging its argv as `install ...` before the real one runs, so a case can see in
+/// what order files went back.
+const INSTALL_LOG_STUB: &str = r#"#!/usr/bin/env bash
+printf 'install %s\n' "$*" >> "$STUB_LOG"
+exec /usr/bin/install "$@"
+"#;
+
+/// The kept library goes back after every script that sources it: the witness's timers keep
+/// running through a rollback, and a pass started between the two installs would run the current
+/// witness over the older library it refuses, exit 3 and page through the failure hook for a fault
+/// the rollback made. With the library last, every script in place while it is still the current
+/// one is served by it, a newer library serving an older script.
+#[test]
+fn a_kept_library_goes_back_after_the_witness_the_hook_the_status_command_and_config_check() {
+    let fx = Fixture::new();
+    let sbin = fx.root.join("usr/local/sbin");
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(2)).unwrap();
+    for name in ["propolis-alert", "propolis-witness", "propolis-status"] {
+        write_exec(&sbin.join(name), &consumer_needing(2));
+    }
+    install_config_check(&fx, &consumer_needing(2), "propolis\n", "/opt/propolis\n");
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(3)).unwrap();
+    for name in ["propolis-alert", "propolis-witness", "propolis-status"] {
+        write_exec(&sbin.join(name), &consumer_needing(3));
+    }
+    install_config_check(&fx, &consumer_needing(3), "propolis\n", "/opt/propolis\n");
+    write_exec(&fx.bin.join("install"), INSTALL_LOG_STUB);
+    let output = fx.run(&["--yes"], &[], None);
+    assert_ok(&output);
+    assert_eq!(installed_lib_version(&fx), "PA_LIB_VERSION=2");
+    let targets: Vec<String> = fx
+        .log()
+        .lines()
+        .filter_map(|l| l.strip_prefix("install "))
+        .filter_map(|l| l.split_whitespace().last())
+        .map(|t| t.rsplit('/').next().unwrap().to_string())
+        .collect();
+    let at = |name: &str| {
+        targets
+            .iter()
+            .position(|t| t == name)
+            .unwrap_or_else(|| panic!("{name} was not installed: {targets:?}"))
+    };
+    let lib = at("propolis-alert-lib");
+    assert_eq!(
+        targets
+            .iter()
+            .filter(|t| *t == "propolis-alert-lib")
+            .count(),
+        1,
+        "{targets:?}"
+    );
+    for consumer in [
+        "propolis-alert",
+        "propolis-witness",
+        "propolis-status",
+        "config-check.sh",
+    ] {
+        assert!(
+            at(consumer) < lib,
+            "{consumer} before the library: {targets:?}"
+        );
+        assert!(
+            read(&if consumer == "config-check.sh" {
+                fx.root.join("usr/local/lib/propolis").join(consumer)
+            } else {
+                sbin.join(consumer)
+            })
+            .contains("needs-alert-lib: 2")
+        );
+    }
+    let mode = std::fs::metadata(sbin.join("propolis-alert-lib"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(mode, 0o644, "the library goes back 0644, got {mode:o}");
+}
+
 /// A release kept before the library was installed holds none, and the one in place stays. A
 /// consumer that stays and needs a version must not make the run report a kept library at
 /// version 0, which does not exist.
@@ -1753,6 +1834,53 @@ fn a_rollback_onto_a_root_without_the_config_check_directory_makes_it() {
     assert_eq!(mode_of(&lib.join("listeners-lib.sh")), 0o644);
     assert_eq!(mode_of(&lib.join("install-bins")), 0o644);
     assert!(!lib.join("repo-dir").exists());
+}
+
+/// The library version the shipped witness states it needs.
+fn shipped_witness_needs() -> u32 {
+    shipped("witness.sh")
+        .lines()
+        .find_map(|l| l.strip_prefix("# needs-alert-lib: "))
+        .and_then(|v| v.parse().ok())
+        .expect("deploy/witness.sh carries `# needs-alert-lib: <n>`")
+}
+
+/// The library version rule with the shipped witness, which writes its W lines and closes its
+/// notices through functions only the library it needs has, in both directions: a kept library
+/// one version older is not restored under the shipped witness that stays, and says why; a kept
+/// library of the version it needs is restored over a newer current one.
+#[test]
+fn the_shipped_witness_keeps_a_library_it_needs_and_refuses_one_a_version_older() {
+    let needs = shipped_witness_needs();
+    assert_eq!(
+        needs,
+        shipped_lib_version(),
+        "the witness needs the shipped library"
+    );
+    for (kept, current, restored) in [(needs - 1, needs, false), (needs, needs + 1, true)] {
+        let fx = Fixture::new();
+        let sbin = fx.root.join("usr/local/sbin");
+        std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(kept)).unwrap();
+        assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+        fx.upgrade();
+        std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(current)).unwrap();
+        // Installed after the save, so the kept release holds none and the shipped one stays.
+        write_exec(&sbin.join("propolis-witness"), &shipped("witness.sh"));
+        let output = fx.run(&["--yes"], &[], None);
+        assert_ok(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let want = if restored { kept } else { current };
+        assert_eq!(
+            installed_lib_version(&fx),
+            format!("PA_LIB_VERSION={want}"),
+            "kept {kept}: {stdout}"
+        );
+        let said = format!(
+            "kept the current alert library: the kept one is version {kept}, and propolis-witness needs {needs}"
+        );
+        assert_eq!(stdout.contains(&said), !restored, "kept {kept}: {stdout}");
+        assert_eq!(read(&sbin.join("propolis-witness")), shipped("witness.sh"));
+    }
 }
 
 /// The library version the shipped config-check states it needs.

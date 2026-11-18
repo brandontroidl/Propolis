@@ -377,7 +377,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "13");
+    assert_eq!(version, "14");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);
@@ -11402,11 +11402,15 @@ fn a_role_out_of_its_list_reads_unknown() {
 /// send_init sets, from the profile in force, which is legacy without a test root; its part that
 /// decides whether a pending transition is due or dropped (send_expire) asks pa_retry_due and no
 /// other guarded function. The witness's list of the library functions it needs is the one line
-/// of names this test passes over. The storm notice, the summary, the switch summary and the
-/// pointer message (their renderers, the W-line reader, their admission and result, and the
-/// helpers of their meta keys) are called by no script at all: no
-/// script renders one (pa_render with a class other than the test page's and the daily
-/// message's), asks the budget about its class, or names one of their functions.
+/// of names this test passes over. The storm notice and the summary have one caller outside the
+/// library, the witness's notice step: notice_since reads their meta keys (pa_meta_value),
+/// notice_claim renders and admits them (pa_render, pa_notice_admit), notice_step writes the
+/// result and the key (pa_notice_close), and notice_step does nothing unless SEND_V2 is 1, the
+/// pass retries (sends for the host) and the gate is full. The switch summary and the pointer
+/// message (their renderers, the W-line reader, the result written alone, the meta key writer)
+/// are called by no script at all: no other function renders a notice (pa_render with a class
+/// other than the test page's and the daily message's), asks the budget about its class, or names
+/// one of their functions.
 #[test]
 fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
@@ -11425,13 +11429,17 @@ fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
                 | "pa_incident_result"
                 | "_pa_render_withheld"
                 | "pa_notice_admit"
+                | "pa_notice_close"
         ) || f.starts_with("_pa_hv2_")
     };
     // Which of the guarded names each part of the witness's send step may use: send_expire, which
-    // only decides whether a pending transition is due, dropped or left, asks pa_retry_due alone.
+    // only decides whether a pending transition is due, dropped or left, asks pa_retry_due alone;
+    // notice_claim renders. The notices' admission, result and key reader are checked against a
+    // table of their own (notice_calls_out_of_place), which no send-step function is in.
     let allowed_in_witness = |f: &str, name: &str| match f {
         "send_expire" => name == "pa_retry_due",
         "send_admit" | "send_claim" | "send_one" | "send_post" => true,
+        "notice_claim" => name == "pa_render",
         _ => false,
     };
     let witness = std::fs::read_to_string(format!("{dir}/witness.sh")).unwrap();
@@ -11455,6 +11463,24 @@ fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
     assert!(
         admit.contains("if [ \"$SEND_V2\" != 1 ] || [ \"$SEND_GATE\" != full ]; then"),
         "send_admit admits nothing under legacy"
+    );
+    let notice: Vec<&str> = witness
+        .split("\nnotice_step() {\n")
+        .nth(1)
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("local "))
+        .take(2)
+        .collect();
+    assert_eq!(
+        notice,
+        [
+            "[ \"$SEND_V2\" = 1 ] || return 0",
+            "[ \"$SEND_RETRY\" = 1 ] && [ \"$SEND_GATE\" = full ] && [ \"$SEND_LEDGER_BAD\" = 0 ] || return 0"
+        ],
+        "the notice step does nothing under legacy, on a pass that does not send for the host, \
+         or with the gate short of full"
     );
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -11513,19 +11539,25 @@ fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
                     found.push(format!("{name}: {t}"));
                 }
             }
-            // The notices, the pointer message and their meta keys have no caller at all outside
-            // the library, the witness's send step included.
+            // The switch summary, the pointer message and the meta key writer have no caller at
+            // all outside the library; the admission, the result with its key and the key reader
+            // of the storm notice and the summary only the witness's notice step.
             for f in [
                 "_pa_render_withheld",
                 "_pa_render_switch",
                 "pa_withheld_since",
-                "pa_notice_admit",
                 "pa_notice_result",
-                "pa_meta_value",
                 "pa_meta_put",
             ] {
                 if t.contains(f) {
                     found.push(format!("{name}: {t}"));
+                }
+            }
+            if name != "witness.sh" {
+                for f in NOTICE_STEP_NAMES {
+                    if t.contains(f) {
+                        found.push(format!("{name}: {t}"));
+                    }
                 }
             }
             // Each use of a function, wherever it stands on the line (after `$(`, `if`, `!` or
@@ -11564,6 +11596,7 @@ fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
         }
     }
     assert!(seen >= 6, "the scripts in deploy/");
+    found.extend(notice_calls_out_of_place(&witness));
     assert!(found.is_empty(), "calls of the new code: {found:#?}");
     // In the hook: the decision first, then the v2 child, once each.
     let profile: Vec<usize> = hook_lines
@@ -11581,6 +11614,86 @@ fn only_the_hooks_v2_path_and_the_witness_send_step_call_the_incident_code() {
         profile[0] < v2[0],
         "the decision comes first: {hook_lines:#?}"
     );
+}
+
+/// The library functions of the storm notice and the summary that only the witness's notice step
+/// may name, each in one function of it.
+const NOTICE_STEP_NAMES: [&str; 3] = ["pa_notice_admit", "pa_notice_close", "pa_meta_value"];
+
+/// Every line of the witness TEXT that names one of NOTICE_STEP_NAMES outside its one function:
+/// notice_since reads the keys (pa_meta_value), notice_claim admits (pa_notice_admit) and
+/// notice_step writes the result and the key (pa_notice_close). The send step's functions, which
+/// may use the incident code, are refused these like every other function. The list of the
+/// library functions the witness needs is passed over, as it calls nothing.
+fn notice_calls_out_of_place(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut function = String::new();
+    let mut in_list = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(f) = t.strip_suffix("() {")
+            && !line.starts_with(' ')
+        {
+            function = f.to_string();
+            continue;
+        }
+        if t.starts_with('#') {
+            continue;
+        }
+        if in_list || t.starts_with("WITNESS_LIB_FUNCS=\"") {
+            in_list = !t.ends_with('"');
+            continue;
+        }
+        for f in NOTICE_STEP_NAMES {
+            let own = match f {
+                "pa_meta_value" => "notice_since",
+                "pa_notice_admit" => "notice_claim",
+                _ => "notice_step",
+            };
+            if t.contains(f) && function != own {
+                found.push(format!("{function}: {t}"));
+            }
+        }
+    }
+    found
+}
+
+/// The notices' admission, result and key reader are refused in each function of the incident
+/// send step, which may call the incident code: a copy of the witness with one of them planted in
+/// send_admit, send_claim, send_one or send_post fails the check, and the shipped witness passes.
+#[test]
+fn the_notice_functions_are_refused_in_the_send_step_and_in_every_function_but_their_own() {
+    let witness = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/witness.sh"
+    ))
+    .unwrap();
+    assert_eq!(
+        notice_calls_out_of_place(&witness),
+        Vec::<String>::new(),
+        "the shipped witness"
+    );
+    for host in ["send_admit", "send_claim", "send_one", "send_post"] {
+        let head = format!("\n{host}() {{\n");
+        assert!(witness.contains(&head), "{host}");
+        for f in NOTICE_STEP_NAMES {
+            let planted = witness.replacen(
+                &head,
+                &format!("{head}    {f} storm \"$SEND_SENDER\" > /dev/null || true\n"),
+                1,
+            );
+            let found = notice_calls_out_of_place(&planted);
+            assert_eq!(found.len(), 1, "{f} in {host}: {found:#?}");
+            assert!(found[0].starts_with(&format!("{host}: {f} ")), "{found:#?}");
+        }
+    }
+    // In a notice function that is not its own, too.
+    let planted = witness.replacen(
+        "\nnotice_since() {\n",
+        "\nnotice_since() {\n    pa_notice_close x storm ok light || true\n",
+        1,
+    );
+    assert_eq!(notice_calls_out_of_place(&planted).len(), 1);
 }
 
 /// The decision child of the failure hook: pa_hook_profile ends 0 only when profile v2 is in
@@ -12939,6 +13052,66 @@ fn ledger_body(fx: &Fx) -> Vec<String> {
         .collect()
 }
 
+/// A summary that names a withheld open or reopen of a PAGE incident is held back only by the
+/// hour: the day's twelve summaries, which a storm that lasts or a server that fails can spend,
+/// must not leave a dead listener unnamed until the next storm notice, up to six hours on. One
+/// that names none keeps the day's cap, the hour's cap holds either way, and the word changes
+/// nothing for any other class.
+#[test]
+fn a_summary_that_names_a_withheld_page_is_held_only_by_the_hour() {
+    let fx = Fx::salted(SALT);
+    let line = |class: &str, mode: &str, ago: u64| {
+        format!(
+            "L\t{}\t{class}\t-\t{class}\t{mode}\tok\tlight\n",
+            lib_at(ago)
+        )
+    };
+    let admit = |ledger: &str, args: &str| {
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!("#send-ledger v1 g=1\n{ledger}"),
+        );
+        fx.run_env(
+            &format!("pa_lock 5\npa_notice_admit {args} > /dev/null\necho \"v=$PA_ADMIT_VERDICT\""),
+            &NOW,
+        )
+        .get("v")
+    };
+    // Twelve summaries in the last day, the newest 61 minutes old.
+    let spent: String = (0..12)
+        .map(|i| line("summary", "full", 3660 + i * 6000))
+        .collect();
+    assert_eq!(admit(&spent, "summary light"), "withhold:summary-cap");
+    assert_eq!(admit(&spent, "summary light page"), "admit");
+    assert_eq!(
+        admit(&spent, "summary light planted"),
+        "withhold:summary-cap"
+    );
+    // Inside the hour the cap holds, PAGE or not.
+    let recent = format!("{spent}{}", line("summary", "full", 3540));
+    assert_eq!(admit(&recent, "summary light page"), "withhold:summary-cap");
+    // No other class takes the word.
+    assert_eq!(
+        admit(&line("storm", "full", 600), "storm light page"),
+        "withhold:storm-cap"
+    );
+    // 48 pointer messages in the last day and none inside the hour: the day's cap alone holds
+    // the next one, and the word must not lift it.
+    let pointers: String = (0..48)
+        .map(|i| line("pointer", "pointer", 3660 + i * 1500))
+        .collect();
+    assert_eq!(admit(&pointers, "pointer light"), "withhold:pointer-cap");
+    assert_eq!(
+        admit(&pointers, "pointer light page"),
+        "withhold:pointer-cap"
+    );
+    // One switch summary two hours ago, the time of the switch not known: one a day.
+    assert_eq!(
+        admit(&line("switch", "full", 7200), "switch light page"),
+        "withhold:switch-cap"
+    );
+}
+
 /// Each exempt class is admitted by its own cap alone, with one ledger line written under the lock
 /// before the post, claimed (`sending`) as the daily message's is, in mode full for the notices
 /// and pointer for the pointer message, and its result written after the post. A second message
@@ -13391,15 +13564,50 @@ fn a_summary_over_more_than_an_hour_names_the_time_it_counts_from_in_its_title()
 /// is written, and the failure hook's path writes its withheld transitions through it: a line
 /// added anywhere else would carry the stamp its caller took when it began, which can fall
 /// before a notice claimed in between and so never be listed. Beside it only the reader of the
-/// file adds a line it does not judge. (The witness still builds its own line: its send step
-/// moves to this function with the notices it will send.)
+/// file adds a line it does not judge. The witness builds no line of its own either: its one
+/// writer of a W line, w_line, writes through pa_w_line, and nothing else in it adds to the lines
+/// in memory or names a W line's fields.
 #[test]
-fn the_library_adds_a_w_line_in_one_place_and_the_hooks_path_writes_through_it() {
-    let lib = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../deploy/alert-lib.sh"
-    ))
-    .unwrap();
+fn the_library_and_the_witness_add_a_w_line_in_one_place_and_both_senders_write_through_it() {
+    let deploy = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
+    let lib = std::fs::read_to_string(format!("{deploy}/alert-lib.sh")).unwrap();
+    let witness = std::fs::read_to_string(format!("{deploy}/witness.sh")).unwrap();
+    let mut function = String::new();
+    let mut witness_calls = Vec::new();
+    let mut witness_adders = Vec::new();
+    for line in witness.lines() {
+        let t = line.trim_start();
+        if let Some(f) = t.strip_suffix("() {")
+            && !line.starts_with(' ')
+        {
+            function = f.to_string();
+            continue;
+        }
+        if t.starts_with('#') {
+            continue;
+        }
+        if t.contains("_PA_INC_REST+=")
+            || t.contains("_PA_INC_REST=(")
+            || t.contains("\"W\"")
+            || t.contains("'W'")
+        {
+            witness_adders.push(format!("{function}: {t}"));
+        }
+        // A call stands first on its line; the witness's list of the library functions it needs
+        // names it among others.
+        if t.starts_with("pa_w_line ") {
+            witness_calls.push(function.clone());
+        }
+    }
+    assert!(
+        witness_adders.is_empty(),
+        "the witness adds no W line itself: {witness_adders:#?}"
+    );
+    assert_eq!(
+        witness_calls,
+        ["w_line"],
+        "the witness's w_line writes through pa_w_line"
+    );
     let mut function = String::new();
     let mut adders = Vec::new();
     let mut hook_calls = 0;
@@ -13536,6 +13744,113 @@ fn a_notice_result_without_the_lock_leaves_its_line_claimed_and_counted() {
         &NOW,
     );
     assert_eq!(r.get("v"), "withhold:storm-cap", "{}", r.err);
+}
+
+/// A storm notice or a summary that got ok moves its meta key (storm_last, summary_last) to the
+/// stamp of its claim, in the locked section that writes its result and under one lock: the
+/// next notice lists what was withheld from that claim on, a line written while the post was in
+/// flight among it. Any other result, a claimed line that is gone and a lock not had leave the key
+/// as it was, so the next notice lists those lines again. The switch summary and the pointer
+/// message keep no key here: their results are written as pa_notice_result writes them. The claim
+/// is fifty seconds before the clock at the close, as a post takes time: the key is the claim's
+/// stamp, never one taken when the result is written, which would pass over a line written while
+/// the post was in flight.
+#[test]
+fn a_notice_that_got_ok_keeps_its_claim_as_its_meta_key_and_any_other_result_keeps_the_old_one() {
+    let fx = Fx::salted(SALT);
+    let claim = "999950/abcdef01/4950";
+    let old = "999000/abcdef01/4000";
+    let counted = "orig_pa_lock() { :; }\neval \"orig_$(declare -f pa_lock)\"\n\
+                   pa_lock() { echo x >> \"$D/locks\"; orig_pa_lock \"$@\"; }\nrm -f \"$D/locks\"\n";
+    for (class, result, want_rc, keeps) in [
+        ("storm", "ok", "0", true),
+        ("summary", "ok", "0", true),
+        ("storm", "transient:503", "0", false),
+        ("summary", "perm:403", "0", false),
+        ("storm", "transient:000", "0", false),
+        ("switch", "ok", "0", false),
+        ("pointer", "ok", "0", false),
+    ] {
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!(
+                "#send-ledger v1 g=1\nL\t{claim}\t{class}\t-\t{class}\tfull\tsending\tlight\n"
+            ),
+        );
+        fx.write(
+            "var/lib/propolis/witness/meta",
+            &format!("#meta v1 g=1\nM\tstorm_last\t{old}\nM\tsummary_last\t{old}\n"),
+        );
+        let r = fx.run_env(
+            &format!(
+                "{counted}rc=0; pa_notice_close {claim} {class} {result} light || rc=$?\n\
+                 echo \"rc=$rc\"\necho \"locks=$(wc -l < \"$D/locks\")\"\n\
+                 echo \"storm=$(_pa_meta_get storm_last)\"\necho \"summary=$(_pa_meta_get summary_last)\"\n\
+                 echo \"pointer=$(_pa_meta_get pointer_last)\""
+            ),
+            &NOW,
+        );
+        assert_eq!(r.get("rc"), want_rc, "{class} {result}: {}", r.err);
+        assert_eq!(r.get("locks").trim(), "1", "{class} {result}: one lock");
+        assert_eq!(
+            ledger_body(&fx),
+            [format!(
+                "L\t{claim}\t{class}\t-\t{class}\tfull\t{result}\tlight"
+            )],
+            "{class} {result}"
+        );
+        let want = |k: &str| {
+            if keeps && k == class { claim } else { old }
+        };
+        assert_eq!(r.get("storm"), want("storm"), "{class} {result}");
+        assert_eq!(r.get("summary"), want("summary"), "{class} {result}");
+        assert_eq!(r.get("pointer"), "", "{class} {result}");
+    }
+    // An ok whose claimed line is gone (a damaged ledger replaced by an empty one): the result
+    // cannot be written, so the key stays and the lines are listed again.
+    fx.write("var/lib/propolis/witness/send-ledger", EMPTY_LEDGER);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!("#meta v1 g=1\nM\tstorm_last\t{old}\n"),
+    );
+    let r = fx.run_env(
+        &format!(
+            "rc=0; pa_notice_close {claim} storm ok light || rc=$?\necho \"rc=$rc\"\n\
+             echo \"storm=$(_pa_meta_get storm_last)\""
+        ),
+        &NOW,
+    );
+    assert_eq!(
+        (r.get("rc"), r.get("storm")),
+        ("1".into(), old.into()),
+        "{}",
+        r.err
+    );
+    // Without the lock nothing is written: the line stays claimed and the key as it was.
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!("#send-ledger v1 g=1\nL\t{claim}\tstorm\t-\tstorm\tfull\tsending\tlight\n"),
+    );
+    let r = fx.run_env(
+        &format!(
+            "pa_lock() {{ return 1; }}\nrc=0; pa_notice_close {claim} storm ok light || rc=$?\n\
+             echo \"rc=$rc\"\necho \"storm=$(_pa_meta_get storm_last)\""
+        ),
+        &NOW,
+    );
+    assert_eq!(
+        (r.get("rc"), r.get("storm")),
+        ("2".into(), old.into()),
+        "{}",
+        r.err
+    );
+    assert!(ledger_body(&fx)[0].ends_with("\tsending\tlight"));
+    // A class that is not one of the four writes nothing.
+    let r = fx.run_env(
+        &format!("rc=0; pa_notice_close {claim} daily ok light || rc=$?\necho \"rc=$rc\""),
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "2");
 }
 
 /// Two withheld opens of one PAGE incident are two messages and one name.

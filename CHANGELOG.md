@@ -820,6 +820,15 @@
 
 ### Added
 
+- **The witness can send the storm notice and the hourly summary of withheld messages, under a
+  profile no host can set yet** - under `v2` alone, with the gate full, a pass that sends for the
+  host follows its incident messages with at most one notice of what the budget withheld since
+  the last one that got through, a withheld PAGE open or reopen named in its title at priority 5
+  (a summary that names one is held only by its hourly cap, not by the day's);
+  its `W` lines are written through the library's one writer (`pa_w_line`, library version 14,
+  which the witness now needs). Nothing new is sent: the profile is still forced to `legacy`
+  ([health](docs/operations/health-and-observability.md),
+  [paths](docs/reference/filesystem-paths.md#alerting-state-and-runtime-directories)).
 - **The witness can send, retry and record withheld messages in the new format, under a profile
   no host can set yet** - under `v2` alone each pass admits every transition it would send in the
   send ledger and the record, claims it again under the state lock just before the post, posts
@@ -1436,6 +1445,12 @@
 
 ### Fixed
 
+- **A rollback puts the alert library back after the scripts that source it** - the restore
+  installed `propolis-alert-lib` before `propolis-witness`, in name order, while the witness's
+  timers keep running; a pass started between the two ran the current witness over the older
+  library it refuses and exited 3, a failed unit that the rollback itself made. The library now
+  goes back last, after the hook, the witness, the status command and the configuration check
+  ([rollback](docs/operations/upgrade-rollback-and-dr.md#rollback)).
 - **A lost acknowledgement no longer costs a collector's lines** - when the gateway stored a
   batch and the shipper never saw the answer (a reset connection, the 60 s batch timeout, a
   restart in between), the shipper built the next batch under the same number from whatever its

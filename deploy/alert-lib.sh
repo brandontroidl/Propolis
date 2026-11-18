@@ -45,7 +45,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=13
+PA_LIB_VERSION=14
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -3723,7 +3723,8 @@ _pa_ledger_countable() {
 # test (the test page) admits at most 3 in 24 h and daily (the daily message) none while a line
 # it counts is under 20 h old (the witness also holds it to one a local date), each of the lines
 # _pa_budget_ages counts. storm, summary, switch and pointer have only their own caps
-# (_pa_exempt_caps, _pa_budget_exempt). For an incident message (CLASS incident, or reserve, pool
+# (_pa_exempt_caps, _pa_budget_exempt, which takes KEY as its word `page`: a summary that names a
+# withheld PAGE incident). For an incident message (CLASS incident, or reserve, pool
 # or stage1, which mean the same: the class is decided here, never taken from the caller) see
 # _pa_budget_incident.
 pa_budget_admit() {
@@ -3744,7 +3745,7 @@ pa_budget_admit() {
     fi
     case "$class" in
         storm | summary | switch | pointer)
-            _pa_budget_exempt "$class"
+            _pa_budget_exempt "$class" "${2:-}"
             return
             ;;
         incident | reserve | pool | stage1)
@@ -3839,10 +3840,14 @@ _pa_switch_held() {
     return 1
 }
 
-# _pa_budget_exempt CLASS: the verdict of an exempt class from its own caps alone: it never counts
-# against the pool, the stage-1 sub-cap or a key, and nothing else counts against it.
+# _pa_budget_exempt CLASS [page]: the verdict of an exempt class from its own caps alone: it never
+# counts against the pool, the stage-1 sub-cap or a key, and nothing else counts against it. With
+# `page` (a summary that names a withheld open or reopen of a PAGE incident) a summary is held
+# only by its hour: the day's twelve, which a storm that lasts or a server that fails can spend,
+# must not leave a dead listener unnamed until the next storm notice, up to six hours on. The
+# word changes nothing for another class.
 _pa_budget_exempt() {
-    local class="$1" w l n c a rc=2
+    local class="$1" page="${2:-}" w l n c a rc=2
     local -a caps=()
     if [ "$class" = switch ]; then
         _pa_switch_held && rc=0 || rc=$?
@@ -3863,6 +3868,7 @@ _pa_budget_exempt() {
     while [ "${#caps[@]}" -ge 2 ]; do
         w="${caps[0]}" l="${caps[1]}" n=0
         caps=("${caps[@]:2}")
+        if [ "$class" = summary ] && [ "$page" = page ] && [ "$w" -gt 3600 ]; then continue; fi
         while read -r c _ a; do
             [ -n "${c:-}" ] && [ "$a" -lt "$w" ] || continue
             n=$((n + 1))
@@ -5641,8 +5647,9 @@ _pa_notice_mode() {
     esac
 }
 
-# pa_notice_admit CLASS SENDER: a storm notice, a summary, a switch summary or a pointer message
-# admitted by its class's own caps (pa_budget_admit) and, when admitted, claimed before its post:
+# pa_notice_admit CLASS SENDER [page]: a storm notice, a summary, a switch summary or a pointer
+# message admitted by its class's own caps (pa_budget_admit; `page` for a summary that names a
+# withheld PAGE incident, which only its hour then holds) and, when admitted, claimed before its post:
 # one ledger line, `L stamp CLASS - CLASS MODE sending SENDER`, claimed from the start as the
 # daily message's is. A claimed line counts in every window of its class's caps whatever becomes
 # of the post, so one whose result is never written counts as sent, which errs toward fewer
@@ -5659,7 +5666,7 @@ pa_notice_admit() {
     else
         case "$sender" in hook | light | hourly | status) PA_ADMIT_VERDICT="" ;; *) PA_ADMIT_VERDICT=withhold:unknown ;; esac
     fi
-    if [ -n "$PA_ADMIT_VERDICT" ] || ! pa_budget_admit "$class" > /dev/null; then
+    if [ -n "$PA_ADMIT_VERDICT" ] || ! pa_budget_admit "$class" "${3:-}" > /dev/null; then
         printf '%s' "$PA_ADMIT_VERDICT"
         return 1
     fi
@@ -5681,6 +5688,29 @@ pa_notice_result() {
     _pa_notice_mode "${2:-}" > /dev/null || return 2
     pa_lock 10 || return 2
     pa_ledger_result "${1:-}" "$2" "${3:-}" "${4:-}" || rc=1
+    pa_unlock
+    return "$rc"
+}
+
+# pa_notice_close STAMP CLASS RESULT SENDER: pa_notice_result's write, and, for a storm notice or
+# a summary that got ok and whose result was written, its meta key (storm_last, summary_last) set
+# to STAMP, the claim's, in the same locked section: what the notice listed was read under the
+# lock that claimed it, so every W line written after it is stamped at or after STAMP and the next
+# notice lists it, one written in the same second twice rather than never. A key moved under a
+# lock of its own could fall to another writer in between; and a post that failed, a result that
+# was not written or a lock not had leaves the key as it was, so those lines are listed again.
+# The switch summary and the pointer message keep no key here. Statuses as pa_notice_result's.
+pa_notice_close() {
+    local rc=0
+    _pa_notice_mode "${2:-}" > /dev/null || return 2
+    pa_lock 10 || return 2
+    if pa_ledger_result "${1:-}" "$2" "${3:-}" "${4:-}"; then
+        case "$2:${3:-}" in
+            storm:ok | summary:ok) pa_meta_put "$2_last" "$1" || true ;;
+        esac
+    else
+        rc=1
+    fi
     pa_unlock
     return "$rc"
 }

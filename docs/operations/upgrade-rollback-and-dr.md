@@ -520,11 +520,18 @@ to it, and prints `kept the current alert library: the kept one is version <k>, 
 needs <n>`. Blanks around the number and a CRLF ending do not hide a line
 (`deploy/rollback.sh#number_line`), so a hand-edited copy is still weighed; a missing line counts
 as 0. A kept release from before the library was installed holds none, and the current one
-stays. The scripts weighed today are the installed configuration check and the failure hook
-(`/usr/local/sbin/propolis-alert`, whose record step sources the library); a kept release from
-before either holds no copy of it, so the current copy, which stays, is weighed, and a host
-without one weighs nothing for it. The restored library is installed 0644, as the deploy scripts
-install it.
+stays. The scripts weighed are the four `deploy/rollback.sh#ALERT_LIB_CONSUMERS` lists, in its
+order: the failure hook (`/usr/local/sbin/propolis-alert`, whose record step sources the
+library), the witness (`/usr/local/sbin/propolis-witness`), the status command
+(`/usr/local/sbin/propolis-status`) and the installed configuration check. The witness needs the
+newest library (the version `deploy/alert-lib.sh#PA_LIB_VERSION` states), so it is usually the
+script the message names: `... and propolis-witness needs <n>`. A kept release from before one
+of them holds no copy of it, so the current copy, which stays, is weighed, and a host without
+one weighs nothing for it. The
+restored library is installed 0644, as the deploy scripts install it, and last, after every
+script that sources it: the witness's timers keep running through a rollback, and a pass that
+started between the two installs would run the current witness over the older library, which it
+refuses, while every older script is served by the current library until then.
 
 **The failure hook goes back only when its contract is not older.** The hook states a contract
 number on a `# hook-contract: <n>` line; a kept release without a hook, or a hook without the
